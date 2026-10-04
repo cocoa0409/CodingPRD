@@ -1,0 +1,78 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+# Logical clock default (before any set call): 2026-09-01T00:00:00Z
+DEFAULT_CLOCK_ISO = "2026-09-01T00:00:00Z"
+
+THRESHOLDS = {
+    # container-class provisional tare table (pounds)
+    "TARE_BAG_50_LBS": 2,
+    "TARE_DRUM_LBS": 20,
+    "TARE_TOTE_LBS": 60,
+    "TARE_CYLINDER_20_LBS": 17,
+    # feed marginal tiers
+    "FEED_TIER1_LIMIT_LBS": 50,
+    "FEED_TIER1_RATE_CENTS": 40,
+    "FEED_TIER2_LIMIT_LBS": 150,
+    "FEED_TIER2_RATE_CENTS": 35,
+    "FEED_TIER3_RATE_CENTS": 30,
+    # propane
+    "PROPANE_LBS_PER_GAL": 4.24,
+    "PROPANE_CYLINDER_MAX_GAL": 20.0,
+    "PROPANE_EXCHANGE_FLAT_CENTS": 1999,
+    "PROPANE_PER_GAL_CENTS": 349,
+    "HAZMAT_DAILY_CAP_GAL": 40,
+    # chick volume discount
+    "VOLUME_TIER2_MIN_QTY": 25,
+    "VOLUME_TIER2_DISCOUNT": 0.10,
+    "VOLUME_TIER3_MIN_QTY": 50,
+    "VOLUME_TIER3_DISCOUNT": 0.15,
+    # loyalty tiers and multipliers
+    "TIER_RANCH_HAND_THRESHOLD": 2500,
+    "TIER_HOMESTEAD_THRESHOLD": 7500,
+    "TIER_MULT_NEIGHBOR": 1.0,
+    "TIER_MULT_RANCH_HAND": 1.25,
+    "TIER_MULT_HOMESTEAD": 1.5,
+    "POSTURE_MULT_FALL_FEED": 2.0,
+    "TIER_WINDOW_DAYS": 365,
+    # offers
+    "FUEL_POINTS_STEP": 500,
+    "FUEL_CENTS_PER_STEP": 5,
+    "FUEL_MAX_CENTS_PER_GAL": 50,
+    "FEED_COUPON_CENTS": 1000,
+    # livestock care
+    "MORTALITY_QUARANTINE_RATE": 0.05,
+    "QUARANTINE_GOODWILL_POINTS": 500,
+    # schedules
+    "SANITIZATION_GAP_DAYS": 7,
+    # freshness / windows
+    "BROODER_VERIFICATION_FRESH_HOURS": 72,
+    "CARE_LOG_FRESH_HOURS": 12,
+    "SALE_WINDOW_GRACE_HOURS": 48,
+    "CLAIM_WINDOW_HOURS": 48,
+    "PICKUP_DEADLINE_DAYS": 5,
+    "CHECKIN_EARLY_MINUTES": 15,
+}
+
+TEST_DEFAULTS = {
+    "STORE_NAME": "Test Farm & Ranch",
+    "REGION_CODE": "TX-CENTRAL",
+    "PLANOGRAM_MAP": "planogram-v1",
+    "AISLE_COUNT": 1,
+    "SPECIES": "CHICKEN_LAYER",
+    "BREED": "Rhode Island Red",
+    "HATCH_DATE": "2026-02-25T00:00:00Z",
+    "SALE_WINDOW_START": "2026-03-01T00:00:00Z",
+    "SALE_WINDOW_END": "2026-04-30T23:59:59Z",
+    "DAILY_CAPACITY": 500,
+    "MIN_PURCHASE_QTY": 6,
+    "BASE_PRICE_CENTS_PER_BIRD": 349,
+    "QUANTITY_RECEIVED": 100,
+    "RECEIVED_AT": "2026-03-02T08:00:00Z",
+    "PICKUP_DATE": "2026-03-12T10:00:00Z",
+    "ORDER_QUANTITY": 6,
+}
+
+# Distinctive timestamp used by most spring setups.
+SPRING_NOW = "2026-03-10T10:00:00Z"
+FALL_NOW = "2026-09-20T10:00:00Z"
+FLOOR_NOW = "2026-09-10T09:00:00Z"

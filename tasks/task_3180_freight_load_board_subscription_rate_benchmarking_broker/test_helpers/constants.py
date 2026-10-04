@@ -1,0 +1,33 @@
+"""Domain thresholds and numeric constants from PRD calculation rules."""
+
+# Logical clock startup default (PRD §2.4)
+DEFAULT_CLOCK = "2026-09-01T00:00:00Z"
+TEST_CLOCK = "2026-08-01T00:00:00Z"
+
+# Subscription period pricing (PRD §3.2)
+PLAN_BASE_CENTS = {"BASIC": 9900, "PRO": 24900, "ENTERPRISE": 49900}
+OVERAGE_TIER1_RATE_CENTS = 150
+OVERAGE_TIER2_RATE_CENTS = 300
+ANALYTICS_ADDON_CENTS = {"NONE": 0, "LANE_LEVEL": 2000, "FULL": 5000}
+
+# Data contribution (PRD §3.6)
+CONTRIBUTION_MIN = 10
+CONTRIBUTION_WINDOW_DAYS = 30
+
+# Fuel surcharge (PRD §3.5)
+BASE_FUEL_CENTS = 300
+STEP_CENTS = 25
+STEP_PCT = 0.01
+MAX_FSC_PCT = 0.20
+
+# Lane benchmark (PRD §3.5)
+BENCHMARK_MIN_SAMPLES = 5
+BENCHMARK_WINDOW_DAYS = 30
+
+# Broker credit (PRD §3.7)
+CREDIT_WINDOW_DAYS = 365
+DISPUTE_WINDOW_DAYS = 90
+REBUTTAL_MAX = 2
+
+# Withdrawal refund window (PRD §3.3)
+WITHDRAW_REFUND_HOURS = 24

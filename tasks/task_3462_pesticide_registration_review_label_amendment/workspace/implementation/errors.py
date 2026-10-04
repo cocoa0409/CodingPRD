@@ -1,0 +1,75 @@
+"""Error registry: every error_id -> HTTP status, exactly per PRD section 5."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = ERRORS[error_id]
+        self.message = message or error_id
+        super().__init__(self.message)
+
+
+ERRORS = {
+    # Authn/Authz/ownership
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    # Existence
+    "ERR_NOT_FOUND": 404,
+    "ERR_PRODUCT_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_STATE_REGISTRATION_NOT_FOUND": 404,
+    # Request schema
+    "ERR_INVALID_REQUEST": 400,
+    # Concurrency
+    "ERR_STALE_PRODUCT_VERSION": 412,
+    # State
+    "ERR_APPLICATION_NOT_SUBMITTABLE": 409,
+    "ERR_APPLICATION_NOT_IN_REVIEW": 409,
+    "ERR_APPLICATION_ALREADY_DECIDED": 409,
+    "ERR_PRODUCT_NOT_UNREGISTERED": 409,
+    "ERR_PRODUCT_NOT_REGISTERED": 409,
+    "ERR_PRODUCT_TERMINAL": 409,
+    "ERR_PRODUCT_NOT_SUSPENDED": 409,
+    "ERR_REINSTATEMENT_BLOCKED": 409,
+    "ERR_STUDY_NOT_DECIDABLE": 409,
+    "ERR_AMENDMENT_NOT_PENDING": 409,
+    "ERR_CASE_NOT_OPEN": 409,
+    "ERR_CASE_NOT_COMPLETABLE": 409,
+    "ERR_DCI_OUTSTANDING": 409,
+    "ERR_DCI_NOT_RESPONDABLE": 409,
+    "ERR_PROCEEDING_INVALID_STEP": 409,
+    "ERR_STATE_REG_NOT_DECIDABLE": 409,
+    "ERR_BULLETIN_NOT_LIFTABLE": 409,
+    # Business safety
+    "ERR_RATE_EXCEEDS_SAFETY_CAP": 422,
+    "ERR_ESA_PROHIBITION_CONFLICT": 422,
+    "ERR_NO_VALID_APPLICATOR_CERTIFICATION": 422,
+    "ERR_MISSING_REQUIRED_STUDIES": 422,
+    "ERR_NO_RISK_ASSESSMENT": 422,
+    "ERR_LOC_EXCEEDED": 422,
+    "ERR_NO_PROPOSED_TOLERANCE": 422,
+    # Business constraint
+    "ERR_DUPLICATE_OPEN_APPLICATION": 409,
+    "ERR_DUPLICATE_TOLERANCE": 409,
+    "ERR_BULLETIN_WINDOW_OVERLAP": 409,
+    "ERR_REVIEW_CASE_WINDOW_OVERLAP": 409,
+    "ERR_DUPLICATE_STATE_REGISTRATION": 409,
+    "ERR_DUPLICATE_OPEN_PROCEEDING": 409,
+    "ERR_SEGREGATION_OF_DUTIES_VIOLATION": 403,
+    "ERR_EXISTING_STOCKS_QUANTITY_EXCEEDED": 422,
+    # Business referential
+    "ERR_STUDY_PARENT_MISMATCH": 400,
+    "ERR_USE_SITE_PRODUCT_MISMATCH": 400,
+    "ERR_UNKNOWN_COMMODITY": 422,
+    # Business temporal
+    "ERR_EXISTING_STOCKS_WINDOW_CLOSED": 422,
+    "ERR_CERTIFICATION_RENEWAL_INVALID": 400,
+    # Business fiscal
+    "ERR_INCORRECT_FEE_PAYMENT": 402,
+}
+
+
+def err(error_id, message):
+    """Raise an ApiError with the catalog-consistent HTTP status."""
+    raise ApiError(error_id, message)

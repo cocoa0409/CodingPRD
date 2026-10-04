@@ -1,0 +1,313 @@
+# Foundry Seasoning Ops API — Product Requirements Document
+
+## 1. Introduction
+
+A cast-iron cookware foundry runs on a rhythm that most manufacturing software never models: sand molds are packed against a pattern, iron is melted in booked furnace windows, chemistry is certified by a quality authority who must not be the operator who recorded the readings, castings are poured until the ladle runs dry, and finished pieces pass through a seasoning line whose oil lots and cure profiles carry food-safety obligations. This document specifies the API that orchestrates that rhythm — from product definition through melting, molding, pouring, inspection, rework, seasoning, environmental compliance, and out to seasonal retail allocation and the factory outlet store at the plant site.
+
+The business pressure behind the design is twofold. Domestically cast cookware competes against imported product on brand rather than on cost, so the system pins a brand-positioning price floor at product creation and computes per-unit production cost — provisional while the order runs, final at completion — against that floor. At the same time the plant operates under environmental permits for air emissions, sand reclamation, and dust control; a permit breach must freeze affected production immediately, hold in-flight melts, and route remediation through a segregated chain of custody. Every rule in this document is stated so that an engineer reading only this PRD can reproduce the intended behavior exactly, including all rounding, thresholds, and boundary inclusivity.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID` and `X-User-Role`. A request missing either header, or presenting a role value outside the declared role set, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A request whose authenticated role is not listed among the roles authorized for the target endpoint is rejected with `ERR_UNAUTHORIZED_ROLE` (HTTP 403).
+
+Seven roles are declared, spelled exactly as follows: `FoundryManager`, `MeltOperator`, `QualityInspector`, `SeasoningLead`, `EnvironmentalOfficer`, `RetailPlanner`, `OutletManager`.
+
+The `FoundryManager` is the plant manager: this role owns product creation and discontinuation, production-order creation, release, completion and cancellation, mold preparation, breach acknowledgment, and the logical clock. The `MeltOperator` runs the furnace and the floor: melt-batch creation, charges, chemistry readings, taps, pours, shakeout, and rework completion. The `QualityInspector` is the quality authority: chemistry certification, casting inspection, defect disposition, and seasoning release. The `SeasoningLead` runs the seasoning line: seasoning-batch creation and bake start. The `EnvironmentalOfficer` owns environmental compliance: permits, emissions readings, sand reclamation, and remediation certification. The `RetailPlanner` plans demand: retail-allocation creation, confirmation, cancellation, and shipping. The `OutletManager` runs the factory outlet and museum store: recording on-site sales. All seven roles may call every read (list and get) endpoint.
+
+For every one of the seven roles — `FoundryManager`, `MeltOperator`, `QualityInspector`, `SeasoningLead`, `EnvironmentalOfficer`, `RetailPlanner`, and `OutletManager` — `X-User-ID` is an opaque operator identifier not tied to the `id` of any persisted entity, and the server never compares `X-User-ID` against any entity's `id`. The server does, however, record `X-User-ID` onto resources where a workflow demands provenance: the operator who records melt chemistry is stored in `chemistry_recorded_by`, the inspector who certifies it in `certified_by`, the lead who starts a bake in `bake_recorded_by`, the inspector who releases or fails a seasoning batch in `released_by`, the officer who records an emissions reading in `recorded_by`, the officer whose reading or reclamation entry pushes a permit into breach in `last_breach_reading_recorded_by`, the inspector who dispositions a defect report in `dispositioned_by`, and the outlet manager who records an on-site sale in `recorded_by`.
+
+Segregation of duties is enforced on four operations by comparing the caller's `X-User-ID` to the recorded provenance field: chemistry certification requires the caller to differ from the batch's `chemistry_recorded_by`; seasoning release requires the caller to differ from the batch's `bake_recorded_by`; breach acknowledgment and remediation certification each require the caller to differ from the permit's `last_breach_reading_recorded_by`. A violation is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters, `limit` and `offset`. The `limit` parameter defaults to 10 when omitted, accepts a minimum of 1 and a maximum of 100. The `offset` parameter defaults to 0. List responses carry the pagination fields `limit`, `offset`, `total_count`, and `has_more` inside the `meta` object. Unless a more specific ordering is stated for a particular endpoint, list endpoints return items sorted by `created_at` in ascending order.
+
+### 2.4. The Logical Clock and Calendar-Month Compliance Periods
+
+All timestamps the system assigns — creation timestamps, confirmation timestamps, and the calendar month a reading or reclamation counts against — come from a server-side logical clock, never from wall-clock time. Before any clock-advance call has been made, the logical clock reads exactly 2026-09-01T00:00:00Z. A `FoundryManager` may advance the clock through a test-driving capability that takes a `to_iso8601` instant; the supplied instant must be strictly after the current logical time, and the capability responds with the resulting `current_utc`.
+
+Advancing the clock across a calendar-month boundary triggers period-rollover processing: every permit's `over_limit_reading_count_current_period` resets to 0, a permit sitting in `WARNING` returns to `ACTIVE`, and the sand-reclamation month-to-date sums reset so that `current_sand_rate` becomes null until the next reclamation entry of the new month. A permit in `BREACH` or `REMEDIATION` is deliberately not cleared by rollover — those postures persist until the acknowledge-then-remediate path is executed.
+
+### 2.5. Resource Identity, Timestamps and Versions
+
+Every persisted resource carries an `id` that is a server-minted UUID with no type prefix. Most resources additionally carry `created_at` and `updated_at` timestamps — ISO 8601 UTC with three fractional digits — and an integer `version`. A resource's `version` starts at 1 upon creation and increments by exactly 1 on every mutation of that resource, including mutations caused by cascades from another resource's transition; `updated_at` refreshes to the logical clock at the same instant.
+
+Two resource kinds are exceptions to the common-field rule. An `EmissionsReading` and an `OutletSale` each carry only `id` and `created_at` — both `updated_at` and `version` are absent on these two resources, and any attempt to reason about their versions is meaningless by design.
+
+### 2.6. Optimistic Concurrency Control
+
+Two write endpoints pin their work to a parent resource's observed `version`, and both are non-optional input requirements.
+
+Creating a melt batch requires the request to carry `expected_production_order_version`, holding the `version` of the target production order as the client last observed it. If the order's current `version` has advanced since that observation — because another writer created a melt batch, released the order, or otherwise mutated it — the create is rejected with `ERR_STALE_ORDER_VERSION` (HTTP 412), preventing the client from booking a furnace window against an order it has not observed.
+
+Creating a retail allocation likewise requires `expected_inventory_version`, holding the `version` of the target inventory record as the client last observed it. A mismatch with the inventory record's current `version` is rejected with `ERR_STALE_INVENTORY_VERSION` (HTTP 412), so a planner never reserves units against availability that no longer exists.
+
+No endpoint other than these two creation operations accepts or requires a version field.
+
+### 2.7. Numeric Precision, Rounding and Money
+
+All monetary amounts are integer cents; prices, costs, and price floors are never fractional. Rounding, wherever this document or a workflow specifies it, is round-half-up, and each computation states its own rounding point explicitly — rounding earlier or later than stated, or collapsing two stated rounding steps into one, produces different cents and is non-compliant. Percentages carried on entities are numbers (for example, 12.5 means twelve and a half percent), and ratios such as `scrap_index` and `current_sand_rate` are carried to 4 decimal places with round-half-up. The melt chemistry value `carbon_equivalent` and the iron-ledger values `slag_loss_lbs` and `returns_credit_lbs` are carried to 2 decimal places with round-half-up. The seasoning `cure_score` is an integer from 0 to 100 produced by round-half-up of its weighted sum.
+
+### 2.8. Derived Order Posture and Scrap Tiering
+
+A production order carries two derived indicators that gate downstream work, and neither is ever set directly by a client. The `scrap_tier` summarizes defect-driven scrap: it is `GREEN` while the order's `scrap_index` is below 0.04, `WATCH` once `scrap_index` is at least 0.04 and still below 0.08, and `RED` once `scrap_index` reaches 0.08. Both band lower bounds are inclusive — a `scrap_index` of exactly 0.0400 is `WATCH`, not `GREEN`, and exactly 0.0800 is `RED`.
+
+The `posture` is the operational gate. It is `FROZEN` whenever any melt batch linked to the order is in `HELD`; otherwise it is `RESTRICTED` when the order's `scrap_tier` is `RED` (equivalently, when `scrap_index` is at least 0.08); otherwise it is `OPEN`. Posture is recomputed on the same triggers that recompute scrap tiering — every defect-disposition scrap and every pour — and additionally whenever a melt batch enters `HELD` or resumes from it. The posture gates themselves are enforced per operation in §3: melt-batch creation, mold creation, and pouring require a posture other than `FROZEN` and reject a `FROZEN` order with `ERR_ORDER_FROZEN` (HTTP 409); seasoning-batch creation requires the posture to be exactly `OPEN`, rejecting `FROZEN` with `ERR_ORDER_FROZEN` and `RESTRICTED` with `ERR_ORDER_RESTRICTED` (HTTP 409); order completion requires a posture other than `FROZEN`, with `RESTRICTED` explicitly allowed.
+
+### 2.9. Validation Order and Error Precedence
+
+When several checks could reject the same request, the server applies them in a fixed priority order so that the earliest applicable failure surfaces and later checks never mask it. The order is: first, authentication of the `X-User-ID` and `X-User-Role` headers (`ERR_UNAUTHENTICATED`); second, role authorization for the endpoint (`ERR_UNAUTHORIZED_ROLE`); third, segregation-of-duties comparison where the endpoint has one (`ERR_SEGREGATION_OF_DUTIES`); fourth, request-body well-formedness — required fields present, no undeclared fields, enum values in range, planned percentage sums, window end strictly after start, quantities at least 1, week numbers within 1 through 53 (`ERR_INVALID_REQUEST`); fifth, existence of every path and body identifier (`ERR_RESOURCE_NOT_FOUND`); sixth, state-transition legality, including terminal-state lockdown and repeated triggers (`ERR_INVALID_STATE_TRANSITION`); seventh, the optimistic-concurrency comparison where the endpoint declares one (`ERR_STALE_ORDER_VERSION` or `ERR_STALE_INVENTORY_VERSION`); eighth, production-order posture gates (`ERR_ORDER_FROZEN`, then `ERR_ORDER_RESTRICTED`); ninth through twelfth, the business-safety checks in the order chemistry specification (`ERR_CHEMISTRY_OUT_OF_SPEC`), environmental permit breach gates (`ERR_EMISSIONS_PERMIT_BREACH`), food-safety attestation (`ERR_FOOD_SAFETY_INCOMPLETE`), and cure-score threshold (`ERR_CURE_PROFILE_VIOLATION`); then the business-constraint checks — furnace-window overlap (`ERR_FURNACE_WINDOW_OVERLAP`), oven capacity (`ERR_OVEN_CAPACITY_EXCEEDED`), the three defect-disposition rules in the order critical-must-scrap (`ERR_CRITICAL_DEFECT_MUST_SCRAP`), rework limit (`ERR_REWORK_LIMIT_EXCEEDED`), use-as-is-minor-only (`ERR_USE_AS_IS_MINOR_ONLY`), inspection tolerances (`ERR_TOLERANCE_EXCEEDED`), sand mix (`ERR_SAND_MIX_VIOLATION`), sand loss (`ERR_SAND_LOSS_EXCEEDED`), mold-order matching (`ERR_MOLD_ORDER_MISMATCH`), and seasoning-batch unit composition (`ERR_UNITS_NOT_SAME_ORDER`); then the temporal checks — ship week in the future (`ERR_SHIP_WEEK_INVALID`) and the peak-window cancellation freeze (`ERR_ALLOCATION_FROZEN`); then product-activeness (`ERR_PRODUCT_DISCONTINUED`); and finally the fiscal checks — brand price floor (`ERR_PRICE_BELOW_BRAND_FLOOR`), outlet price floor (`ERR_OUTLET_PRICE_BELOW_FLOOR`), inventory sufficiency (`ERR_INSUFFICIENT_INVENTORY`), iron sufficiency (`ERR_INSUFFICIENT_IRON`), and completion yield (`ERR_YIELD_BELOW_MINIMUM`).
+
+### 2.10. Nested Resources and Existence
+
+Identifiers arrive at the server in two places: as the `id` path parameter of a resource URL, and as foreign-key fields inside request bodies such as `production_order_id`, `mold_id`, `inventory_record_id`, `product_id`, a permit's id, or each element of `unit_ids`. Path parameters are validated left to right, and every identifier — path or body — must resolve to an existing resource; the first identifier that does not resolve rejects the request with `ERR_RESOURCE_NOT_FOUND` (HTTP 404). List endpoints scoped under a parent path, and the filtered list queries named in §3, provide reverse reachability for every foreign key the workflows create.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Product Catalog and Brand-Positioned Pricing
+
+Everything begins with the product catalog. A `FoundryManager` registers a cookware product by supplying a `sku_code` that is unique across all products (for example, a classic skillet code), a display `name`, and a `category` that is one of `SKILLET`, `DUTCH_OVEN`, `GRIDDLE`, `GRILL_PAN`, or `BAKEWARE`. The physical specification travels with the product because inspection later enforces it per casting: a nominal `target_weight_oz` with an allowed absolute deviation `weight_tolerance_oz`, a nominal `target_diameter_in` with an allowed absolute deviation `diameter_tolerance_in`, and a `min_wall_thickness_in` below which no casting may pass — all four tolerances and targets strictly greater than zero.
+
+Pricing carries the brand strategy. The `import_landed_cost_cents` records the landed cost of the comparable imported competitor item and must be greater than zero. The `wholesale_price_cents` charged to retail chains must be at least the import landed cost multiplied by 1.15 and rounded half-up — equality with that rounded floor is allowed — and a wholesale price below it is rejected with `ERR_PRICE_BELOW_BRAND_FLOOR` (HTTP 422). The `msrp_cents` must be at least the `wholesale_price_cents`. The seasonal shape of demand is captured by `peak_season_start_week` and `peak_season_end_week`, both ISO week numbers in the range 1 through 53, with the start week not after the end week; the allocation freeze in §3.8 reads this window.
+
+A product is born with `status` `ACTIVE`. When the `FoundryManager` discontinues it, the `status` moves from `ACTIVE` to `DISCONTINUED` and the product's `version` increments by 1. Discontinuation blocks four operations with `ERR_PRODUCT_DISCONTINUED` (HTTP 422): creating a production order for the product, creating a retail allocation against its inventory, confirming a proposed allocation, and recording an outlet sale. Work already in flight — released orders, running melts, existing confirmed allocations — continues to completion.
+
+Creating a product also auto-creates its `InventoryRecord` in the same act: one record per product, unique per product, with `on_hand_units` 0, `reserved_units` 0, `shipped_units` 0, `outlet_sold_units` 0, and `version` 1. The record's `available_units` is a derived value, always equal to `on_hand_units` minus `reserved_units`.
+
+### 3.2. Production Orders: Release, Yield, Completion and Cancellation
+
+A `FoundryManager` opens a production order against an `ACTIVE` product by supplying the `product_id`, a `planned_quantity` of at least 1, and a `scheduled_week` in the ISO week range 1 through 53. The new order starts in state `PLANNED` with `posture` `OPEN`, `scrap_tier` `GREEN`, and all counters at zero: `poured_units`, `good_units`, `scrapped_units`, `defect_scrapped_units`, and `scrap_weighted_units` are 0, `scrap_index` is 0, and `labor_hours_actual`, `energy_kwh_actual`, and `unit_cost_final_cents` remain null until completion, while `margin_flag` reads false until it is computed at completion.
+
+Releasing the order moves it from `PLANNED` to `MOLDING`; the gate requires the order to still be `PLANNED` and the product still `ACTIVE`, and the release increments the order's `version` by 1. From there the floor drives the order forward without further management action: the first successful pour for the order moves it from `MOLDING` to `POURING`; the first casting unit of the order reaching `FINISHED` moves it from `POURING` to `FINISHING`; and the first seasoning batch created for the order moves it from `POURING` or `FINISHING` into `SEASONING`. Each of these system-driven moves increments the order's `version` by 1.
+
+While the order runs, its provisional economics are recomputed on every read. The `unit_cost_provisional_cents` is the sum of `actual_charge_cost_cents` over all of the order's melt batches whose state is not `CANCELLED`, divided by `planned_quantity`, rounded half-up to integer cents, plus a flat standard conversion allowance of 1450 cents per unit. The provisional figure deliberately ignores labor and energy actuals and amortizes material over the planned, not the actual, quantity.
+
+Completion is the `FoundryManager`'s act and moves a `SEASONING` order to `COMPLETE`. Two gates guard it, evaluated after the state gate: the order's `posture` must not be `FROZEN` — a `RESTRICTED` order may complete — otherwise the completion is rejected with `ERR_ORDER_FROZEN`; and the yield gate requires `good_units` to be at least the ceiling of 0.85 times `planned_quantity`, otherwise the completion is rejected with `ERR_YIELD_BELOW_MINIMUM` (HTTP 422). A completing request supplies the actuals `labor_hours_actual` and `energy_kwh_actual`, and completion computes `unit_cost_final_cents` as follows: take the same non-`CANCELLED` material sum used by the provisional figure, add labor computed as `labor_hours_actual` multiplied by 3200 cents per hour rounded half-up, add energy computed as `energy_kwh_actual` multiplied by 14 cents per kilowatt-hour rounded half-up, add overhead computed as 185 cents multiplied by `poured_units`, divide the total by `good_units`, and round half-up to integer cents. At the same moment the order's `margin_flag` is set to true when the wholesale margin — the difference between the product's `wholesale_price_cents` and `unit_cost_final_cents`, divided by `wholesale_price_cents` — falls below 0.30, and false otherwise.
+
+Both completion and cancellation run the same closure cascade. Cancellation is available from any of `PLANNED`, `MOLDING`, `POURING`, `FINISHING`, or `SEASONING` and moves the order to `CANCELLED`; attempting it on a terminal order — or repeating a completed order's completion — is rejected with `ERR_INVALID_STATE_TRANSITION` (HTTP 409). The cascade itself scraps every casting unit still in a non-terminal state with `scrap_reason` `ORDER_CANCEL` and increments `scrapped_units` by 1 per unit, deliberately leaving `scrap_weighted_units` and `scrap_index` unchanged because the scrap is not defect-driven; a unit sitting in `DEFECT_REVIEW` additionally has its still-`OPEN` defect report moved to `DISPOSITIONED` with `disposition` `SCRAP` and `dispositioned_by` recorded as the system. Every melt batch of the order in `CHARGING`, `MELTING`, `CHEMISTRY_CHECK`, `ADJUSTMENT`, `CERTIFIED`, or `HELD` is moved to `CANCELLED`. Every seasoning batch of the order in `COATING` or `BAKING` is moved to `FAILED`, and its `SEASONING_QUEUED` units are then scrapped by the unit cascade with `scrap_reason` `ORDER_CANCEL`. Every mold still in `PREPARED` is moved to `CANCELLED`. The order's own `version` increments by 1 on completion or cancellation, on top of the child-resource version increments the cascade causes.
+
+### 3.3. Melting: Furnace Booking, Charge Composition and Chemistry Certification
+
+A `MeltOperator` creates a melt batch against a production order that is in `MOLDING` or `POURING` with a `posture` other than `FROZEN`; a frozen order rejects the create with `ERR_ORDER_FROZEN`, and any other wrong state rejects with `ERR_INVALID_STATE_TRANSITION`. The request must also carry `expected_production_order_version` per the concurrency rule in §2.6, and if the `AIR_EMISSIONS` permit exists and is in `BREACH`, the create is rejected with `ERR_EMISSIONS_PERMIT_BREACH` (HTTP 409). The operator names the `production_order_id`, books a `furnace_id` of either `FURNACE_A` or `FURNACE_B` for the half-open tap window from `planned_tap_start` to `planned_tap_end` — the end strictly after the start — and declares the `planned_iron_lbs` greater than zero plus the planned charge mix: `planned_pig_iron_pct`, `planned_scrap_steel_pct`, `planned_returns_pct`, and `planned_alloy_pct`, which must sum to 100.0 within a tolerance of 0.01. Furnace booking is exclusive: the new batch's half-open window must not overlap any other melt batch on the same `furnace_id` whose state is neither `EXHAUSTED` nor `CANCELLED`, and a violation is rejected with `ERR_FURNACE_WINDOW_OVERLAP` (HTTP 409); adjacency, where one window starts exactly as another ends, is allowed. A successful create increments the production order's `version` by 1.
+
+At creation the system computes `planned_charge_cost_cents` with a single rounding over the whole planned mix: multiply `planned_iron_lbs` by the weighted percentage-price sum — `planned_pig_iron_pct` times 38 cents per pound, `planned_scrap_steel_pct` times 12, `planned_returns_pct` times 6, and `planned_alloy_pct` times 145 — divide by 100, and round half-up once to integer cents.
+
+Charging the furnace accumulates the actual mix. The initial charge moves the batch from `CHARGING` to `MELTING`; a supplemental charge moves a batch in `ADJUSTMENT` back to `MELTING`. Each charge call supplies `pig_iron_lbs`, `scrap_steel_lbs`, `returns_lbs`, and `alloy_lbs`, which add onto the accumulated component totals of the same names. The charge cost is accumulated into `actual_charge_cost_cents` with a pinned rounding order: for the single call, each component line is first rounded half-up to integer cents — the pig-iron pounds times 38, the scrap-steel pounds times 12, the returns pounds times 6, and the alloy pounds times 145 — and only then are the four integer lines summed and added to the accumulator. Summing the raw products and rounding once at the end is a different, forbidden order.
+
+When the melt is homogeneous, the operator records spectrometer readings, moving the batch from `MELTING` to `CHEMISTRY_CHECK`. The call stores `carbon_pct`, `silicon_pct`, `manganese_pct`, `sulfur_pct`, `phosphorus_pct`, and `bath_temp_f`, stamps `chemistry_recorded_by` with the caller's `X-User-ID`, and computes `carbon_equivalent` as `carbon_pct` plus one third of the sum of `silicon_pct` and `phosphorus_pct`, rounded half-up to 2 decimal places.
+
+Certification belongs to the `QualityInspector`, and the inspector's `X-User-ID` must differ from `chemistry_recorded_by`, otherwise the decision is rejected with `ERR_SEGREGATION_OF_DUTIES`. A decision of `CERTIFY` accepts the chemistry only when `carbon_equivalent` lies within the inclusive band from 3.90 to 4.30 — a value of exactly 4.30 passes while 4.31 fails — and `sulfur_pct` is at most 0.060, `phosphorus_pct` is at most 0.080, and `bath_temp_f` is at least 2650 degrees Fahrenheit; any failure is rejected with `ERR_CHEMISTRY_OUT_OF_SPEC` (HTTP 422). A certified batch moves to `CERTIFIED` and records `certified_by`. A decision of `ORDER_ADJUSTMENT` instead moves the batch to `ADJUSTMENT` and increments `adjustment_count` by 1, with no further spec evaluation; the adjustment cycle then loops — `ADJUSTMENT` accepts only a supplemental charge, which returns the batch to `MELTING`, from which new readings re-enter `CHEMISTRY_CHECK` — and there is no cap on the number of cycles.
+
+Tapping moves a `CERTIFIED` batch to `TAPPED` and initializes the iron mass ledger. The operator supplies `tapped_temp_f` and `tapped_lbs`; if the `AIR_EMISSIONS` permit exists and is in `BREACH`, the tap is rejected with `ERR_EMISSIONS_PERMIT_BREACH`. The tap computes `slag_loss_lbs` as `tapped_lbs` multiplied by 0.03, rounded half-up to 2 decimal places, and sets `remaining_iron_lbs` to `tapped_lbs` minus `slag_loss_lbs` (poured pounds start at 0). From that instant the ledger conserves mass: at every observable moment, `tapped_lbs` equals `poured_lbs` plus `slag_loss_lbs` plus `remaining_iron_lbs`. A pour that leaves `remaining_iron_lbs` at exactly 0 moves the batch to `EXHAUSTED`, and §3.4 covers the pour itself. When a unit poured from this batch is later scrapped by defect disposition, the batch's `returns_credit_lbs` accumulates that unit's `pour_weight_oz` divided by 16.0 and rounded half-up to 2 decimal places — the scrapped iron returns to the ledger as credit for future charge mixes, so a pour followed by a defect-scrap of one of its units conserves accounted iron mass.
+
+An emissions breach interrupts the melt wherever it stands. When the `AIR_EMISSIONS` permit enters `BREACH`, every melt batch in `CHARGING`, `MELTING`, `CHEMISTRY_CHECK`, `ADJUSTMENT`, or `CERTIFIED` moves to `HELD` with `state_before_hold` recording exactly which of those five states it came from, and every production order linked to a held batch recomputes its `posture` to `FROZEN`. When remediation is certified and the permit returns to `ACTIVE`, each `HELD` batch resumes to its `state_before_hold`, clears that field, and the linked orders recompute posture again — the freeze lifts only when no `HELD` batch remains. Separately, whenever the linked production order is cancelled or completed, a melt batch in any of `CHARGING`, `MELTING`, `CHEMISTRY_CHECK`, `ADJUSTMENT`, `CERTIFIED`, or `HELD` is moved to `CANCELLED`. Every melt-batch transition described above increments the batch's `version` by 1.
+
+### 3.4. Molding, Pouring, Shakeout and Sand Reclamation
+
+A `FoundryManager` prepares a sand mold for an order in `MOLDING` or `POURING` whose `posture` is not `FROZEN`; if the `SAND_RECLAMATION` permit exists and is in `BREACH`, mold creation is rejected with `ERR_EMISSIONS_PERMIT_BREACH`. The mold request names the `production_order_id` and the sand recipe: `new_sand_pct` and `reclaimed_sand_pct` must sum to exactly 100.0 within a tolerance of 0.01, `reclaimed_sand_pct` may not exceed 85.0, `moisture_pct` must lie within the inclusive range 3.0 to 4.5, `clay_pct` must lie within the inclusive range 8.0 to 12.0, and `sand_weight_lbs` must be greater than zero; any violation is rejected with `ERR_SAND_MIX_VIOLATION` (HTTP 422). A new mold starts in `PREPARED`, with `reclaimed_sand_lbs`, `dust_collected_lbs`, and `reclaim_loss_lbs` null until reclamation.
+
+Pouring is the `MeltOperator`'s act against a `TAPPED` batch, and it joins three resources: the operator names a `mold_id`, a `unit_count` between 1 and 48, and a `pour_weight_per_unit_oz`. The mold must belong to the same production order as the melt batch — if the mold's `production_order_id` differs from the batch's, the pour is rejected with `ERR_MOLD_ORDER_MISMATCH` (HTTP 422) — the mold must be `PREPARED`, the order's `posture` must not be `FROZEN`, and the pour's total weight, computed as `unit_count` times `pour_weight_per_unit_oz` divided by 16.0 pounds, must not exceed the batch's `remaining_iron_lbs`; equality is allowed and leaves the batch empty, while a shortfall is rejected with `ERR_INSUFFICIENT_IRON` (HTTP 422). A successful pour creates `unit_count` casting units in state `POURED`, each stamped with the order, batch, and mold identifiers and a `pour_weight_oz` equal to the per-unit pour weight; moves the mold from `PREPARED` to `POURED`; adds the pour total to the batch's `poured_lbs` and subtracts it from `remaining_iron_lbs`, driving the batch to `EXHAUSTED` when the remainder is exactly zero; adds `unit_count` to the order's `poured_units` and recomputes the order's `scrap_index` and `scrap_tier`; moves the order from `MOLDING` to `POURING` on its first pour; and increments both the melt batch's and the production order's `version` by 1.
+
+Shakeout releases the castings from the sand. A `MeltOperator` shakes out a mold in `POURED`, moving it to `SHAKEOUT_DONE`; if the `DUST_CONTROL` permit exists and is in `BREACH`, the shakeout is rejected with `ERR_EMISSIONS_PERMIT_BREACH`. Every casting unit of that mold still in `POURED` moves to `SHAKEOUT_DONE` in the same act, each unit's `version` incrementing along with the mold's.
+
+Reclamation closes the sand loop and reports to the environmental permit. An `EnvironmentalOfficer` reclaims a mold in `SHAKEOUT_DONE` by supplying `reclaimed_sand_lbs` and `dust_collected_lbs`. Two bounds guard the entry: the reclaimed sand plus the baghouse dust must not exceed `sand_weight_lbs`, and the implied `reclaim_loss_lbs` — the `sand_weight_lbs` minus the reclaimed sand minus the collected dust — must not exceed 12 percent of `sand_weight_lbs`, with a loss of exactly 12 percent allowed; a violation is rejected with `ERR_SAND_LOSS_EXCEEDED` (HTTP 422). The reclaim stores all three values on the mold, moves it to `SAND_RECLAIMED`, and recomputes the month-to-date reclamation rate on the `SAND_RECLAMATION` permit: `current_sand_rate` is the sum of `reclaimed_sand_lbs` over all molds reclaimed in the current calendar month of the logical clock divided by the sum of their `sand_weight_lbs`, rounded half-up to 4 decimal places, and null when no mold has been reclaimed this month. A rate at or above the permit's `limit_value` leaves the permit unchanged; a rate below `limit_value` but still within 0.05 of it moves an `ACTIVE` permit to `WARNING`; a rate more than 0.05 below `limit_value` drives the permit to `BREACH` from any non-terminal status and records the reclaiming officer's `X-User-ID` in `last_breach_reading_recorded_by`, triggering the hold cascade described in §3.7. A mold still in `PREPARED` when its order is cancelled or completed moves to `CANCELLED` instead.
+
+### 3.5. Casting Inspection, Defects, Rework and Scrap Accounting
+
+Inspection is the quality gate between shakeout and finishing. A `QualityInspector` inspects a unit in `SHAKEOUT_DONE`, always supplying the three measurements `measured_weight_oz`, `measured_diameter_in`, and `measured_wall_thickness_in`, which are stored on the unit regardless of outcome. An `outcome` of `PASS` enforces the product's physical specification, with every bound inclusive: the absolute difference between `measured_weight_oz` and the product's `target_weight_oz` must not exceed `weight_tolerance_oz`, the absolute difference between `measured_diameter_in` and `target_diameter_in` must not exceed `diameter_tolerance_in`, and `measured_wall_thickness_in` must be at least `min_wall_thickness_in`; any breach is rejected with `ERR_TOLERANCE_EXCEEDED` (HTTP 422). A passing unit moves to `FINISHED`, and the order's first `FINISHED` unit moves the order from `POURING` to `FINISHING`. An `outcome` of `DEFECT` requires `defect_type` — one of `POROSITY`, `COLD_SHUT`, `MISRUN`, `SAND_INCLUSION`, `DIMENSIONAL`, or `CRACK` — and `severity` — one of `MINOR`, `MAJOR`, or `CRITICAL` — and creates a `DefectReport` in `status` `OPEN` whose `casting_unit_id` references the defective unit and which carries the defect type, severity, and any free-text `notes`; the unit moves to `DEFECT_REVIEW`.
+
+Disposition turns an `OPEN` report into a decision. A `QualityInspector` dispositions the report belonging to the unit — the report whose `casting_unit_id` equals that unit's `id` and whose `status` is still `OPEN` — by naming a `disposition`, and the report's `status` moves from `OPEN` to `DISPOSITIONED` with `dispositioned_by` set to the inspector's `X-User-ID` in every branch. Three branches exist, and the disposition rules are evaluated in the order given here. A `disposition` of `REWORK` requires the report's `severity` to be anything other than `CRITICAL` — a critical defect must be scrapped, and requesting rework on one is rejected with `ERR_CRITICAL_DEFECT_MUST_SCRAP` (HTTP 422) — and requires the unit's `rework_count` to be below 2, because a unit may carry at most two completed rework dispositions; a third rework attempt is rejected with `ERR_REWORK_LIMIT_EXCEEDED` (HTTP 422). A successful rework disposition increments the unit's `rework_count` by 1 and moves it to `REWORK`, from which a `MeltOperator` completes the rework to return the unit to `SHAKEOUT_DONE` for a completely fresh inspection. A `disposition` of `USE_AS_IS` requires `severity` `MINOR` and is otherwise rejected with `ERR_USE_AS_IS_MINOR_ONLY` (HTTP 422); it moves the unit straight to `FINISHED`, triggering the same first-finished order transition as a passing inspection. A `disposition` of `SCRAP` has no severity precondition and moves the unit to `SCRAPPED`.
+
+Scrap by defect is the most consequential disposition. The unit's `scrap_reason` is set to `DEFECT`, and its `scrapped_after_rework` flag records whether `rework_count` was at least 1 at scrap time. The order's `scrapped_units` and `defect_scrapped_units` each increment by 1, and the order's `scrap_weighted_units` accumulates 1.5 for a unit scrapped after rework but 1.0 for a unit never reworked. The order's `scrap_index` is then recomputed as `scrap_weighted_units` divided by `poured_units`, rounded half-up to 4 decimal places — and defined as 0 while `poured_units` is 0 — with the `scrap_tier` re-derived per §2.8; if the recomputed `scrap_index` has reached 0.08 and the order's `posture` was `OPEN`, the posture becomes `RESTRICTED`. The melt batch that formed the unit receives the iron credit described in §3.3 into `returns_credit_lbs`. The disposition increments both the casting unit's and the production order's `version` by 1, and the defect report's `version` by 1 as it closes.
+
+Units queue for seasoning and emerge seasoned. When a seasoning batch is created including a `FINISHED` unit, the unit moves to `SEASONING_QUEUED` and its `seasoning_batch_id` is set. When that batch is released at quality release, the unit moves to `SEASONED`, the order's `good_units` increments by 1, and the product's `InventoryRecord` gains 1 `on_hand_units`, incrementing the inventory record's `version`. When the batch fails instead, the unit returns from `SEASONING_QUEUED` to `FINISHED` and its `seasoning_batch_id` is cleared, with no inventory change. `SEASONED` and `SCRAPPED` are the unit's terminal states.
+
+Order cancellation and completion cut across all of this, per the cascade in §3.2: a unit in `POURED`, `SHAKEOUT_DONE`, `REWORK`, or `FINISHED` moves straight to `SCRAPPED` with `scrap_reason` `ORDER_CANCEL` and increments the order's `scrapped_units` by 1 without touching `scrap_weighted_units` or `scrap_index`; a unit in `DEFECT_REVIEW` additionally sees its `OPEN` report closed to `DISPOSITIONED` with `disposition` `SCRAP` and `dispositioned_by` recorded as the system; and a unit in `SEASONING_QUEUED` is scrapped only after its seasoning batch has been failed by the batch cascade, clearing `seasoning_batch_id` in the same act. Defect reports list in `created_at` ascending order, both per-unit and globally, and a unit carries at most one report per inspection.
+
+### 3.6. The Seasoning Line: Oil Cure Profiles and Food-Safety Release
+
+A `SeasoningLead` creates a seasoning batch that pulls finished units of one order onto the line. The order must be in `POURING`, `FINISHING`, or `SEASONING`, and the posture gate here is the strictest in the plant: creation requires `posture` exactly `OPEN`, so a `FROZEN` order is rejected with `ERR_ORDER_FROZEN` and a `RESTRICTED` one with `ERR_ORDER_RESTRICTED`. The request names the `production_order_id`, an `oil_type` of `SOYBEAN`, `CANOLA`, or `FLAXSEED` — the oil selects the cure profile — a `coating_count` between 1 and 3, the planned bake window from `planned_bake_start` to `planned_bake_end` with the end strictly after the start, and the `unit_ids` to season. The unit list must be non-empty, contain at most 12 units, and every listed unit must currently be `FINISHED` and belong to the named order; an empty list, an oversized batch, or a foreign unit is rejected with `ERR_UNITS_NOT_SAME_ORDER` (HTTP 422). The batch's `unit_count` is the length of `unit_ids` and drives oven accounting.
+
+The plant has a single seasoning oven, and every batch's `oven_id` is the constant `OVEN_1`, holding at most 12 units at once; batches whose bake windows overlap share that aggregate capacity: a new batch's `unit_count` plus the summed `unit_count` of every other seasoning batch in `COATING` or `BAKING` whose half-open window from `planned_bake_start` to `planned_bake_end` overlaps the new window must not exceed 12, otherwise the create is rejected with `ERR_OVEN_CAPACITY_EXCEEDED` (HTTP 409). A created batch starts in `COATING`; each included unit moves from `FINISHED` to `SEASONING_QUEUED` with its `seasoning_batch_id` set; the order's first seasoning batch moves it from `POURING` or `FINISHING` to `SEASONING`; and the order's `version` increments by 1.
+
+Starting the bake moves the batch from `COATING` to `BAKING` and is the food-safety documentation point: the `SeasoningLead` must supply the `oil_lot_number` and the `coa_reference` — the certificate-of-analysis reference for the lot — along with the `actual_bake_temp_f`; the call stamps `bake_recorded_by` with the caller's `X-User-ID`. Without both traceability identifiers the bake cannot start, and the request fails well-formedness validation with `ERR_INVALID_REQUEST`.
+
+Quality release belongs to the `QualityInspector`, whose `X-User-ID` must differ from `bake_recorded_by`, else `ERR_SEGREGATION_OF_DUTIES`. The release call supplies `bake_duration_min`, the attestation `food_safety_verified`, and a `decision`, and it always computes the batch's `cure_score`. The cure profile depends on the oil: `SOYBEAN` cures in a band from 450 to 500 degrees Fahrenheit with a minimum bake of 60 minutes, `CANOLA` in a band from 425 to 475 degrees with 75 minutes, and `FLAXSEED` in a band from 400 to 450 degrees with 90 minutes. The temperature factor is 1 minus the absolute distance of `actual_bake_temp_f` from the band midpoint, divided by the band's half-width — the midpoint and half-width being the average and half the span of the band's two bounds — when the actual temperature lies within the band inclusive, and 0 when it lies outside. The duration factor is `bake_duration_min` divided by the profile's minimum minutes, capped at 1.5, then divided by 1.5, so a bake at exactly the minimum minutes contributes two thirds of the duration component and a bake at one and a half times the minimum or longer saturates it. The `cure_score` is 60 times the temperature factor plus 40 times the duration factor, rounded half-up to an integer between 0 and 100.
+
+A `decision` of `RELEASE` requires `food_safety_verified` to be true — the inspector attests that the oil lot and COA documentation match the batch — otherwise the release is rejected with `ERR_FOOD_SAFETY_INCOMPLETE` (HTTP 422); and it requires a `cure_score` of at least 70, otherwise the release is rejected with `ERR_CURE_PROFILE_VIOLATION` (HTTP 422). A released batch moves from `BAKING` to `RELEASED`, sets `released_by`, moves every unit in the batch from `SEASONING_QUEUED` to `SEASONED`, adds `unit_count` to the order's `good_units`, and adds `unit_count` to the product inventory record's `on_hand_units`, incrementing the inventory record's `version`. A `decision` of `FAIL` moves the batch from `BAKING` to `FAILED`, still computes and stores the `cure_score`, sets `released_by`, returns every unit from `SEASONING_QUEUED` to `FINISHED` with its `seasoning_batch_id` cleared, and changes no inventory. `RELEASED` and `FAILED` are terminal. When the linked order is cancelled or completed, a batch still in `COATING` or `BAKING` moves to `FAILED` by cascade, and its units remain `SEASONING_QUEUED` only until the order's unit cascade scraps them with `scrap_reason` `ORDER_CANCEL`.
+
+### 3.7. Environmental Permits, Emissions Accounting and Remediation
+
+An `EnvironmentalOfficer` registers an `EnvironmentalPermit` by naming a `permit_type` of `AIR_EMISSIONS`, `SAND_RECLAMATION`, or `DUST_CONTROL`; a `limit_value` greater than zero; a `measurement_unit` label such as a concentration or rate unit; and a `compliance_period` of `MONTHLY`, meaning the calendar month of the logical clock. For `AIR_EMISSIONS` and `DUST_CONTROL` the limit is an instantaneous reading limit; for `SAND_RECLAMATION` it is the minimum acceptable monthly reclamation rate, such as 0.90. A new permit starts in `status` `ACTIVE` with `over_limit_reading_count_current_period` at 0, `current_sand_rate` null, and `last_breach_reading_recorded_by` null.
+
+Emissions readings are taken against `AIR_EMISSIONS` and `DUST_CONTROL` permits only; posting a reading to a `SAND_RECLAMATION` permit — which is rate-driven through mold reclamation instead — is rejected with `ERR_INVALID_REQUEST` (HTTP 400). The officer supplies a `reading_value` greater than zero and a `source` of `MELT_FURNACE`, `SHAKEOUT_LINE`, `SAND_PLANT`, or `SEASONING_OVEN`; the reading is timestamped by the logical clock, counts against the calendar month of its timestamp, and stamps `recorded_by`. A reading below `limit_value` leaves the permit unchanged. A reading at or above `limit_value` increments `over_limit_reading_count_current_period` by 1: the first such reading in the month moves an `ACTIVE` permit to `WARNING`, and a second over-limit reading in the same calendar month — a count of 2 or more — moves the permit to `BREACH`. Independently of the counting path, a single reading at or above 1.5 times `limit_value` breaches the permit immediately, from `ACTIVE` or directly from `WARNING`, bypassing the counter entirely.
+
+Entering `BREACH` is a plant-wide event. The permit records the responsible officer's `X-User-ID` in `last_breach_reading_recorded_by`; for an `AIR_EMISSIONS` breach, every melt batch in `CHARGING`, `MELTING`, `CHEMISTRY_CHECK`, `ADJUSTMENT`, or `CERTIFIED` moves to `HELD` with `state_before_hold` preserved, and every production order linked to a held batch recomputes its `posture` to `FROZEN`, which in turn blocks new melts, molds, pours, seasoning batches, and completion through the posture gates of §2.8. A sand-reclamation breach arises from the reclamation rate check of §3.4 rather than from readings, and carries the same `last_breach_reading_recorded_by` bookkeeping.
+
+Recovery runs a two-person chain. A `FoundryManager` acknowledges the breach, moving the permit from `BREACH` to `REMEDIATION`, and the acknowledging manager's `X-User-ID` must differ from `last_breach_reading_recorded_by`, otherwise the call is rejected with `ERR_SEGREGATION_OF_DUTIES`. An `EnvironmentalOfficer` then certifies remediation, moving the permit from `REMEDIATION` back to `ACTIVE` under the same segregation rule; certification resets `over_limit_reading_count_current_period` to 0, resumes every `HELD` melt batch to its `state_before_hold` and clears that field, and recomputes the posture of every affected production order, lifting `FROZEN` once no held batch remains. Calendar-month rollover from the clock capability of §2.4 resets the counting fields and returns `WARNING` permits to `ACTIVE`, but never clears `BREACH` or `REMEDIATION` — only the acknowledge-then-remediate path does. The reading-list endpoint per permit provides reverse reachability for every reading's `permit_id`.
+
+### 3.8. Seasonal Inventory, Retail Allocation and Outlet Sales
+
+Finished seasoned units accumulate in the plant warehouse as the product's `InventoryRecord`, whose availability semantics are a conservation invariant. The `reserved_units` are the sum of `allocated_qty` over the record's retail allocations in `PROPOSED` or `CONFIRMED` status, and `available_units` is always `on_hand_units` minus `reserved_units`. Only three acts change `on_hand_units`: a seasoning release adds its `unit_count`, an allocation ship subtracts its `allocated_qty`, and an outlet sale subtracts its `qty`. Only three acts change `reserved_units`: an allocation create adds its `allocated_qty`, an allocation cancel subtracts it, and an allocation ship subtracts it. Consequently a create followed by a cancel of the same allocation leaves both `on_hand_units` and `reserved_units` exactly as before the pair.
+
+For seasonal build planning, the inventory record offers a computed read that, given an integer `build_qty` of at least 1, suggests the channel split for the build. The split is a waterfall evaluated in exactly this pinned order, each line rounded half-up to integer units and clamped by what remains: first the museum store receives the smaller of `build_qty` times 0.02 rounded half-up and the remaining pool; then the factory outlet receives the smaller of `build_qty` times 0.08 rounded half-up and what remains; then ecommerce receives the smaller of `build_qty` times 0.15 rounded half-up and what remains; and the retail chain absorbs whatever is left. Computing a single rounding over the total, or reordering the channels, is forbidden. The response carries the four suggested counts as `museum_store_units`, `factory_outlet_units`, `ecommerce_units`, and `retail_chain_units`.
+
+A `RetailPlanner` reserves finished units by creating a retail allocation against an `inventory_record_id`, naming a `channel` of `RETAIL_CHAIN`, `ECOMMERCE`, `FACTORY_OUTLET`, or `MUSEUM_STORE`, an `allocated_qty` of at least 1 and at most the record's `available_units` — equality allowed, otherwise `ERR_INSUFFICIENT_INVENTORY` (HTTP 422) — and a `ship_week`, the ISO 8601 date in year-month-day form of the Monday of the intended ship week, which must be strictly after the current logical date, otherwise `ERR_SHIP_WEEK_INVALID` (HTTP 422). The product must be `ACTIVE`, else `ERR_PRODUCT_DISCONTINUED`, and the request must carry `expected_inventory_version` per §2.6, with a stale version rejected as `ERR_STALE_INVENTORY_VERSION`. A created allocation starts in `PROPOSED` and immediately adds its `allocated_qty` to the record's `reserved_units`, incrementing the inventory record's `version` by 1.
+
+Confirmation moves an allocation from `PROPOSED` to `CONFIRMED` and re-verifies the world at confirm time: the product must still be `ACTIVE`, else `ERR_PRODUCT_DISCONTINUED`, and the `ship_week` must still be strictly after the current logical date, else `ERR_SHIP_WEEK_INVALID`. A confirmed allocation stamps `confirmed_at` with the logical clock.
+
+Cancellation releases the reservation, subtracting `allocated_qty` from `reserved_units` and incrementing the inventory record's `version`. Cancelling a `PROPOSED` allocation is always permitted. Cancelling a `CONFIRMED` allocation is subject to the peak-window freeze: when the ISO week of the `ship_week` falls within the product's inclusive window from `peak_season_start_week` to `peak_season_end_week`, the cancellation is permitted only while the current logical date is strictly before the date 42 days before the `ship_week` — the freeze boundary itself is already frozen — and otherwise the cancel is rejected with `ERR_ALLOCATION_FROZEN` (HTTP 409); when the ship week lies outside the peak window, no freeze applies at any time. Cancellation from either source status moves the allocation to `CANCELLED`.
+
+Shipping moves a `CONFIRMED` allocation to `SHIPPED` and settles the reservation into a physical movement: the record's `on_hand_units` decreases by `allocated_qty`, `reserved_units` decreases by `allocated_qty`, `shipped_units` increases by `allocated_qty`, and the inventory record's `version` increments by 1.
+
+On-site sales at the plant are the `OutletManager`'s domain. Recording an outlet sale names the `product_id` — which must be `ACTIVE`, else `ERR_PRODUCT_DISCONTINUED` — a `channel` of `FACTORY_OUTLET` or `MUSEUM_STORE`, a `qty` of at least 1 and at most the product inventory record's `available_units`, else `ERR_INSUFFICIENT_INVENTORY`, and a `unit_price_cents`. The channel sets the enforced price floor, stored on the sale as `floor_price_cents`: at the factory outlet the floor is the product's `msrp_cents` multiplied by 0.55 and rounded half-up, while at the museum store the floor is the full `msrp_cents`; a price below the applicable floor — equality is allowed — is rejected with `ERR_OUTLET_PRICE_BELOW_FLOOR` (HTTP 422). A recorded sale stamps `recorded_by` with the manager's `X-User-ID`, subtracts `qty` from `on_hand_units`, adds `qty` to `outlet_sold_units`, and increments the inventory record's `version`. A product's on-site sales are listed per product, newest entries following `created_at` ascending like every other list.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted under the `/foundry` prefix. Creating a new resource returns HTTP 201 with the created resource in `data`; reads, modifications, and action transitions return HTTP 200 with the affected resource in `data`. The table is a summary only: request fields, side effects, and the exact gates and error conditions for each operation are specified by the narratives in §2 and §3, which are the authoritative source an implementation must follow.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | /foundry/products | Create a cookware product (SKU); auto-creates its inventory record | FoundryManager |
+| GET | /foundry/products | List products; filters `category`, `status` | FoundryManager, MeltOperator, QualityInspector, SeasoningLead, EnvironmentalOfficer, RetailPlanner, OutletManager |
+| GET | /foundry/products/{id} | Read one product | FoundryManager, MeltOperator, QualityInspector, SeasoningLead, EnvironmentalOfficer, RetailPlanner, OutletManager |
+| POST | /foundry/products/{id}/discontinue | Discontinue a product (ACTIVE to DISCONTINUED); in-flight work continues | FoundryManager |
+| GET | /foundry/products/{id}/outlet-sales | List this product's on-site outlet and museum sales | FoundryManager, OutletManager, RetailPlanner |
+| POST | /foundry/production-orders | Create a production order for an ACTIVE product | FoundryManager |
+| GET | /foundry/production-orders | List production orders; filters `product_id`, `state`, `posture` | FoundryManager, MeltOperator, QualityInspector, SeasoningLead, EnvironmentalOfficer, RetailPlanner, OutletManager |
+| GET | /foundry/production-orders/{id} | Read one production order; posture, scrap index and unit costs recomputed on read | FoundryManager, MeltOperator, QualityInspector, SeasoningLead, EnvironmentalOfficer, RetailPlanner, OutletManager |
+| POST | /foundry/production-orders/{id}/release | Release a PLANNED order to the molding floor | FoundryManager |
+| POST | /foundry/production-orders/{id}/complete | Complete a SEASONING order; records labor/energy actuals, final unit cost, margin flag, and closure cascades | FoundryManager |
+| POST | /foundry/production-orders/{id}/cancel | Cancel a non-terminal order with the closure cascade | FoundryManager |
+| GET | /foundry/production-orders/{id}/molds | List molds of an order | FoundryManager, MeltOperator, QualityInspector, EnvironmentalOfficer |
+| POST | /foundry/melt-batches | Create a melt batch; books the furnace window and OCC-pins the order | MeltOperator |
+| GET | /foundry/melt-batches | List melt batches; filters `production_order_id`, `state` | FoundryManager, MeltOperator, QualityInspector, EnvironmentalOfficer |
+| GET | /foundry/melt-batches/{id} | Read one melt batch | FoundryManager, MeltOperator, QualityInspector, EnvironmentalOfficer |
+| POST | /foundry/melt-batches/{id}/charge | Record an initial or supplemental charge; accumulates component pounds and charge cost | MeltOperator |
+| POST | /foundry/melt-batches/{id}/chemistry-readings | Record spectrometer chemistry readings; computes carbon equivalent | MeltOperator |
+| POST | /foundry/melt-batches/{id}/certify-chemistry | Certification decision: CERTIFY or ORDER_ADJUSTMENT | QualityInspector |
+| POST | /foundry/melt-batches/{id}/tap | Tap the certified melt; initializes the iron mass ledger | MeltOperator |
+| POST | /foundry/melt-batches/{id}/pour | Pour castings from a TAPPED batch into a PREPARED mold of the same order | MeltOperator |
+| POST | /foundry/molds | Prepare a sand mold for an order | FoundryManager |
+| POST | /foundry/molds/{id}/shakeout | Shake out a POURED mold; its units move to SHAKEOUT_DONE | MeltOperator |
+| POST | /foundry/molds/{id}/reclaim | Reclaim shakeout sand; enforces the loss tolerance and recomputes the reclamation rate | EnvironmentalOfficer |
+| GET | /foundry/casting-units | List casting units; filters `production_order_id`, `melt_batch_id`, `mold_id`, `seasoning_batch_id`, `state` | FoundryManager, MeltOperator, QualityInspector, SeasoningLead |
+| GET | /foundry/casting-units/{id} | Read one casting unit | FoundryManager, MeltOperator, QualityInspector, SeasoningLead |
+| POST | /foundry/casting-units/{id}/inspect | Inspect a SHAKEOUT_DONE unit; PASS enforces tolerances, DEFECT opens a report | QualityInspector |
+| POST | /foundry/casting-units/{id}/complete-rework | Finish a rework operation so the unit can be re-inspected | MeltOperator |
+| GET | /foundry/casting-units/{id}/defect-reports | List defect reports of a unit in created_at ascending order | FoundryManager, MeltOperator, QualityInspector |
+| GET | /foundry/defect-reports | List defect reports; filter `status`; created_at ascending | FoundryManager, QualityInspector |
+| POST | /foundry/defect-reports/{id}/disposition | Disposition an OPEN report: REWORK, SCRAP, or USE_AS_IS | QualityInspector |
+| POST | /foundry/seasoning-batches | Create a seasoning batch; queues FINISHED units and books oven capacity | SeasoningLead |
+| GET | /foundry/seasoning-batches | List seasoning batches; filters `production_order_id`, `state` | FoundryManager, SeasoningLead, QualityInspector |
+| GET | /foundry/seasoning-batches/{id} | Read one seasoning batch, including the cure score after release | FoundryManager, SeasoningLead, QualityInspector |
+| POST | /foundry/seasoning-batches/{id}/start-bake | Start the bake; records oven temperature and oil lot / COA references | SeasoningLead |
+| POST | /foundry/seasoning-batches/{id}/qa-release | Quality release decision: RELEASE or FAIL; computes cure score | QualityInspector |
+| POST | /foundry/environmental-permits | Create an environmental permit | EnvironmentalOfficer |
+| GET | /foundry/environmental-permits | List environmental permits; filters `permit_type`, `status` | FoundryManager, EnvironmentalOfficer, MeltOperator |
+| GET | /foundry/environmental-permits/{id} | Read one environmental permit | FoundryManager, EnvironmentalOfficer, MeltOperator |
+| POST | /foundry/environmental-permits/{id}/readings | Record an emissions reading against an AIR_EMISSIONS or DUST_CONTROL permit | EnvironmentalOfficer |
+| GET | /foundry/environmental-permits/{id}/readings | List readings of a permit | FoundryManager, EnvironmentalOfficer |
+| POST | /foundry/environmental-permits/{id}/acknowledge-breach | Acknowledge a BREACH, moving the permit to REMEDIATION | FoundryManager |
+| POST | /foundry/environmental-permits/{id}/certify-remediation | Certify remediation, returning the permit to ACTIVE and resuming held melts | EnvironmentalOfficer |
+| GET | /foundry/inventory-records | List inventory records; filter `product_id` | FoundryManager, RetailPlanner, OutletManager, SeasoningLead |
+| GET | /foundry/inventory-records/{id} | Read one inventory record | FoundryManager, RetailPlanner, OutletManager, SeasoningLead |
+| GET | /foundry/inventory-records/{id}/allocation-plan | Computed seasonal channel split for a `build_qty` | FoundryManager, RetailPlanner |
+| POST | /foundry/retail-allocations | Create a retail allocation reserving units; OCC-pins the inventory record | RetailPlanner |
+| GET | /foundry/retail-allocations | List retail allocations; filters `inventory_record_id`, `channel`, `status` | FoundryManager, RetailPlanner |
+| GET | /foundry/retail-allocations/{id} | Read one retail allocation | FoundryManager, RetailPlanner |
+| POST | /foundry/retail-allocations/{id}/confirm | Confirm a PROPOSED allocation; re-checks product and ship week | RetailPlanner |
+| POST | /foundry/retail-allocations/{id}/cancel | Cancel a PROPOSED or CONFIRMED allocation; peak-window freeze applies | RetailPlanner |
+| POST | /foundry/retail-allocations/{id}/ship | Ship a CONFIRMED allocation; settles reserved into shipped | RetailPlanner |
+| POST | /foundry/outlet-sales | Record a factory-outlet or museum-store sale; enforces the channel price floor | OutletManager |
+| POST | /foundry/_clock/set_current_utc | Advance the logical clock; processes calendar-month rollover | FoundryManager |
+
+## 5. Error Code Catalogue
+
+The catalogue below lists every error identifier and its HTTP status. The conditions under which each error is raised are specified in the narratives of §2 and §3, not here.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| ERR_UNAUTHENTICATED | 401 |
+| ERR_UNAUTHORIZED_ROLE | 403 |
+| ERR_SEGREGATION_OF_DUTIES | 403 |
+| ERR_INVALID_REQUEST | 400 |
+| ERR_RESOURCE_NOT_FOUND | 404 |
+| ERR_INVALID_STATE_TRANSITION | 409 |
+| ERR_STALE_ORDER_VERSION | 412 |
+| ERR_STALE_INVENTORY_VERSION | 412 |
+| ERR_ORDER_FROZEN | 409 |
+| ERR_ORDER_RESTRICTED | 409 |
+| ERR_CHEMISTRY_OUT_OF_SPEC | 422 |
+| ERR_EMISSIONS_PERMIT_BREACH | 409 |
+| ERR_FOOD_SAFETY_INCOMPLETE | 422 |
+| ERR_CURE_PROFILE_VIOLATION | 422 |
+| ERR_FURNACE_WINDOW_OVERLAP | 409 |
+| ERR_OVEN_CAPACITY_EXCEEDED | 409 |
+| ERR_CRITICAL_DEFECT_MUST_SCRAP | 422 |
+| ERR_REWORK_LIMIT_EXCEEDED | 422 |
+| ERR_USE_AS_IS_MINOR_ONLY | 422 |
+| ERR_TOLERANCE_EXCEEDED | 422 |
+| ERR_SAND_MIX_VIOLATION | 422 |
+| ERR_SAND_LOSS_EXCEEDED | 422 |
+| ERR_MOLD_ORDER_MISMATCH | 422 |
+| ERR_UNITS_NOT_SAME_ORDER | 422 |
+| ERR_SHIP_WEEK_INVALID | 422 |
+| ERR_ALLOCATION_FROZEN | 409 |
+| ERR_PRODUCT_DISCONTINUED | 422 |
+| ERR_PRICE_BELOW_BRAND_FLOOR | 422 |
+| ERR_OUTLET_PRICE_BELOW_FLOOR | 422 |
+| ERR_INSUFFICIENT_INVENTORY | 422 |
+| ERR_INSUFFICIENT_IRON | 422 |
+| ERR_YIELD_BELOW_MINIMUM | 422 |

@@ -1,0 +1,42 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+DEFAULT_CLOCK_ISO = "2026-09-01T00:00:00Z"
+
+CRASH = {
+    "SCORE_THRESHOLD": 35,
+    "DELTA_V_CAP_KPH": 80,
+    "WEIGHT_DELTA_V": 0.6,
+    "WEIGHT_AIRBAG": 25,
+    "WEIGHT_ROLLOVER": 20,
+    "BAND_SEVERE_AT": 60,
+    "BAND_MODERATE_AT": 35,
+}
+
+BILLING = {
+    "LATE_CONVERSION_FEE_PCT": 0.20,
+    "TRIAL_DAYS": 30,
+    "RETRY_WINDOW_DAYS": 10,
+    "RETENTION_WINDOW_DAYS": 30,
+    "PERIOD_DAYS": 30,
+}
+
+REMOTE_COMMAND_CAP = {
+    "EMERGENCY_ONLY": 0,
+    "SAFETY": 0,
+    "SAFETY_REMOTE": 10,
+    "PREMIUM": 50,
+    "EMERGENCY_RETAINED_LOCATE_CAP": 2,
+    "EXPIRY_MINUTES": 10,
+}
+
+HEALTH = {
+    "DTC_COST": 8,
+    "OIL_WEAR_STEP_PCT": 5,
+    "FLOOR": 0,
+    "CEILING": 100,
+}
+
+INSURANCE = {
+    "WINDOW_DAYS": 90,
+    "EMPTY_BASELINE": 50.00,
+}

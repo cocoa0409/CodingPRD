@@ -1,0 +1,57 @@
+"""Error type and the full 39-id error catalog with HTTP statuses (PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.status = status
+        self.message = message
+
+
+ERROR_CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN": 403,
+    "ERR_RETAILER_SCOPE_MISMATCH": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_GROWTH_TARGET_OUT_OF_RANGE": 400,
+    "ERR_RETAILER_NOT_FOUND": 404,
+    "ERR_CATEGORY_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_NOT_YOUR_MOVE": 403,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_PLAN_NOT_ACTIVATED": 409,
+    "ERR_ANALYSIS_NOT_ACCEPTED": 409,
+    "ERR_PHASE_GATES_INCOMPLETE": 409,
+    "ERR_PHASE_LOCKED": 409,
+    "ERR_FORECAST_NOT_PUBLISHED": 409,
+    "ERR_IMPLEMENTATION_STALLED": 409,
+    "ERR_IMPLEMENTATION_INCOMPLETE": 422,
+    "ERR_GOVERNANCE_BOUNDARY": 422,
+    "ERR_PLAN_ALREADY_EXISTS": 409,
+    "ERR_REVIEW_ALREADY_EXISTS": 409,
+    "ERR_DUPLICATE_CLAIM": 409,
+    "ERR_DUPLICATE_ACCRUAL_PERIOD": 409,
+    "ERR_DISTRIBUTION_SUM_EXCEEDED": 422,
+    "ERR_PHASE_BUDGET_EXCEEDED": 422,
+    "ERR_CLUB_PACK_TOO_SMALL": 422,
+    "ERR_CHANNEL_CONFLICT": 422,
+    "ERR_ECOMMERCE_UNDERCUT": 422,
+    "ERR_PROMO_OVERLAP": 409,
+    "ERR_WEEK_NOT_ALIGNED": 422,
+    "ERR_LAUNCH_OUTSIDE_FISCAL_YEAR": 422,
+    "ERR_LAUNCH_TOO_CLOSE": 422,
+    "ERR_LAUNCH_DATE_NOT_REACHED": 422,
+    "ERR_REVIEW_TOO_EARLY": 422,
+    "ERR_INSUFFICIENT_FUNDS": 422,
+    "ERR_EVENT_SPLIT_TOO_LOW": 422,
+}
+
+
+def err(error_id, message):
+    """Raise an ApiError using the catalogued HTTP status."""
+    raise ApiError(error_id, ERROR_CATALOG[error_id], message)

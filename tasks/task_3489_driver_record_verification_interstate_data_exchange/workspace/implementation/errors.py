@@ -1,0 +1,57 @@
+"""Error catalog for the Driver Record Exchange API (PRD section 5).
+
+Every error raised by the server carries one of the 36 catalogued ids and its
+pinned HTTP status.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERROR_STATUS = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_JURISDICTION_OWNERSHIP_MISMATCH": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_VERSION": 412,
+    "ERR_JURISDICTION_NOT_FOUND": 404,
+    "ERR_PARTICIPATION_NOT_FOUND": 404,
+    "ERR_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_DRIVER_NOT_FOUND": 404,
+    "ERR_RECORD_NOT_FOUND": 404,
+    "ERR_LICENSE_NOT_FOUND": 404,
+    "ERR_TRANSFER_NOT_FOUND": 404,
+    "ERR_DISQUALIFICATION_NOT_FOUND": 404,
+    "ERR_TITLE_NOT_FOUND": 404,
+    "ERR_TITLE_TRANSFER_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_JURISDICTION_NOT_ACTIVE": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_PARTICIPATION_NOT_CERTIFIED": 409,
+    "ERR_RECORD_NOT_ACTIVE": 409,
+    "ERR_LICENSE_NOT_ACTIVE": 409,
+    "ERR_GRANT_REQUIRES_PASSED_CERTIFICATION": 409,
+    "ERR_ACTIVE_DISQUALIFICATION": 409,
+    "ERR_BRAND_DISCLOSURE_MISMATCH": 409,
+    "ERR_RECORD_ALREADY_HELD": 409,
+    "ERR_RECORD_HELD_BY_OTHER_JURISDICTION": 409,
+    "ERR_TRANSFER_ALREADY_IN_FLIGHT": 409,
+    "ERR_VIN_ALREADY_TITLED": 409,
+    "ERR_PARTICIPATION_ALREADY_EXISTS": 409,
+    "ERR_JURISDICTION_CODE_TAKEN": 409,
+    "ERR_INVALID_WINDOW": 400,
+    "ERR_CERT_WINDOW_OVERLAP": 409,
+    "ERR_OUTSIDE_TEST_WINDOW": 422,
+    "ERR_DISQUALIFICATION_OVERLAP": 409,
+    "ERR_SAME_JURISDICTION_TRANSFER": 422,
+    "ERR_FEE_AMOUNT_MISMATCH": 402,
+}
+
+
+def err(error_id, message):
+    return ApiError(error_id, ERROR_STATUS[error_id], message)

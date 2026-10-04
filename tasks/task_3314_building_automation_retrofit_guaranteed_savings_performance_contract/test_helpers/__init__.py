@@ -1,0 +1,96 @@
+"""Barrel export: framework generics + PRD-specific code."""
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+from .api_client import ApiClient, api_client
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES
+from .assertions import (
+    assert_adjustment,
+    assert_baseline,
+    assert_bundle,
+    assert_contract,
+    assert_contract_ledger_invariants,
+    assert_dispute,
+    assert_disruption,
+    assert_draw,
+    assert_facility,
+    assert_measure,
+    assert_phase,
+    assert_report,
+)
+from .constants import (
+    CALC_CONSTANTS,
+    FLAT_RATE_SCHEDULE,
+    LOGICAL_CLOCK_DEFAULT,
+    TEST_DEFAULTS,
+    TIERED_RATE_SCHEDULE,
+)
+from .factories import (
+    create_adjustment_payload,
+    create_baseline_payload,
+    create_bundle_payload,
+    create_contract_payload,
+    create_dispute_payload,
+    create_disruption_payload,
+    create_draw_payload,
+    create_esco_engineer_payload,
+    create_facility_payload,
+    create_measure_payload,
+    create_owner_rep_payload,
+    create_phase_payload,
+    create_report_payload,
+)
+from .fixtures import (
+    add_approved_baseline,
+    add_bundle_with_measures,
+    add_facility,
+    attested_report,
+    construction_contract,
+    create_and_submit_report,
+    create_contract,
+    eng_headers,
+    executed_contract,
+    lender_headers,
+    make_actor_ids,
+    own_headers,
+    performance_contract,
+    reset_clock,
+    scoped_contract,
+    set_clock,
+)
+from .test_users import (
+    TEST_USERS,
+    make_esco_engineer_headers,
+    make_lender_officer_headers,
+    make_owner_rep_headers,
+    make_platform_admin_headers,
+)
+from .types import (
+    AdjustmentStatus,
+    BaselineStatus,
+    BundleStatus,
+    ContractStatus,
+    DisputeStatus,
+    DrawStatus,
+    FacilityStatus,
+    MeasureStatus,
+    PhaseStatus,
+    ReportStatus,
+    UserRole,
+)

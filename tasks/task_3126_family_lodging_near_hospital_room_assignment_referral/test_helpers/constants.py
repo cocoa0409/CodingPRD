@@ -1,0 +1,36 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+THRESHOLDS = {
+    "DISTANCE_ELIGIBILITY_MILES": 50,
+    "STAY_FACTOR_CAP_NIGHTS": 30,
+    "STAY_FACTOR_WEIGHT": 20.0,
+    "SCORE_CAP": 100.0,
+    "OFFER_TTL_HOURS": 48,
+    "FEVER_THRESHOLD_TENTHS_C": 380,
+    "NEAR_CAPACITY_THRESHOLD": 0.9,
+    "REVIEW_THRESHOLD_NIGHTS": 21,
+    "CLEANING_BUFFER_MINUTES": 30,
+    "REFERRAL_VALIDITY_DAYS": 30,
+    "MAX_APPROVED_EXTENSIONS": 2,
+}
+
+TEST_DEFAULTS = {
+    "HOSPITAL_NAME": "County Children's",
+    "HOSPITAL_CITY": "Springfield",
+    "HOUSE_NAME": "Oak House",
+    "HOUSE_CITY": "Springfield",
+    "FAMILY_NAME": "Alvarez",
+    "PRIMARY_CONTACT": "Maria Alvarez",
+    "HOME_CITY": "Riverton",
+    "DISTANCE_MILES": 120,
+    "CHILD_PATIENT_NAME": "Nico Alvarez",
+    "TREATING_UNIT": "Oncology",
+    "CARE_TYPE": "INPATIENT",
+    "ACUITY_LEVEL": "MODERATE",
+    "ATTENDING_CLINICIAN": "Dr. Patel",
+    "EXPECTED_NIGHTS": 3,
+    "SELF_REPORTED_ACUITY": "MODERATE",
+    "ROOM_NUMBER": "101",
+    "BED_COUNT": 2,
+    "OCCUPANCY_LIMIT": 2,
+    "DEFAULT_CLOCK": "2026-09-01T00:00:00Z",
+}

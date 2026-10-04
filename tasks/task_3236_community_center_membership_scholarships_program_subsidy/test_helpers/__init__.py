@@ -1,0 +1,87 @@
+"""Test infrastructure for the Community Center Membership API.
+
+Re-exports the pieces test modules reach for most often: the endpoint client,
+the error catalog, the domain constants and assertions, the payload factories,
+the role headers and the composite fixtures.
+"""
+
+from .api_client import ApiClient, api_client
+from .api_errors import HTTP_STATUS_CODES, ApiErrorId
+from .assertions import (
+    APPLICATION_STATUSES,
+    CAMPAIGN_STATUSES,
+    DONATION_STATUSES,
+    DRAFT_KINDS,
+    DRAFT_ROW_STATUSES,
+    DRAFT_STATUSES,
+    MEMBERSHIP_STATUSES,
+    REGISTRANT_CLASSES,
+    REGISTRATION_STATUSES,
+    RESERVATION_STATUSES,
+    SESSION_STATUSES,
+    assert_branch_pool_invariants,
+    assert_cents,
+    assert_common_fields,
+    assert_draft,
+    assert_envelope_meta,
+    assert_fraction,
+    assert_instant_format,
+    assert_list_page,
+    assert_membership,
+    assert_ratio,
+)
+from .constants import (
+    ALL_ROLES,
+    ANNIVERSARY_DAY_CAP,
+    AWARD_PCTS,
+    AWARD_TERM_DAYS,
+    BUFFER_MINUTES_BY_TYPE,
+    CLOCK_STARTUP_DEFAULT,
+    DEFAULT_LIMIT,
+    DEFAULT_MAX_AGE,
+    DEFAULT_MIN_AGE,
+    DEFAULT_NON_MEMBER_MULTIPLIER,
+    DEFAULT_OFFSET,
+    DELINQUENT_LAPSE_DAYS,
+    DOCUMENTATION_KINDS,
+    DRAFT_MAX_ATTEMPTS,
+    HOLD_ALLOWANCE_DAYS,
+    HOLD_MAX_DAYS,
+    HOLD_MIN_DAYS,
+    HOLD_TRAILING_WINDOW_DAYS,
+    LATE_CANCEL_FORFEIT_HOURS,
+    MATCH_PCT_HIGH,
+    MATCH_PCT_LOW,
+    MATCH_PCT_MID,
+    MATCH_TIER1_ATTAINMENT,
+    MATCH_TIER2_ATTAINMENT,
+    PUBLIC_WINDOW_LEAD_DAYS,
+    RECIPROCITY_SURCHARGE,
+    REINSTATE_WINDOW_DAYS,
+    REJOIN_FEE_WAIVER_DAYS,
+    ROLE_ASSOCIATION_ADMIN,
+    ROLE_BOARD_MEMBER,
+    ROLE_BRANCH_DIRECTOR,
+    ROLE_FRONT_DESK,
+    ROLE_MEMBER,
+    ROLE_PROGRAM_COORDINATOR,
+    TIER1_CEILING,
+    TIER2_CEILING,
+    TIER3_CEILING,
+)
+from . import factories, fixtures
+from .test_users import (
+    ASSOCIATION_ADMIN_HEADERS,
+    BOARD_MEMBER_HEADERS,
+    BRANCH_DIRECTOR_HEADERS,
+    FRONT_DESK_HEADERS,
+    PROGRAM_COORDINATOR_HEADERS,
+    TEST_USERS,
+    UNDECLARED_ROLE,
+    headers_with_undeclared_role,
+    headers_without_role,
+    headers_without_user_id,
+    make_member_headers,
+)
+
+__all__ = [name for name in dir() if not name.startswith("_")]

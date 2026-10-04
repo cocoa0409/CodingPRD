@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+# Install only when the framework is missing — start.sh is re-invoked before
+# every per-test reboot (several rounds run concurrently), so an unconditional
+# pip install here would contend on the wheel cache and show up as flaky
+# "could not be restarted" timeouts.
+if ! python3 -c "import flask" >/dev/null 2>&1; then
+  python3 -m pip install -q -r requirements.txt
+fi
+exec python3 app.py

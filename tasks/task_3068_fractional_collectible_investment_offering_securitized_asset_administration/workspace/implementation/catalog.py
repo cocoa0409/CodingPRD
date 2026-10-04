@@ -1,0 +1,84 @@
+"""Error catalogue, enum memberships and role constants (from §1.6/§1.1/§1.7)."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_ROUTE_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVESTOR_INELIGIBLE": 400,
+    "ERR_OFFERING_NOT_AVAILABLE_IN_JURISDICTION": 422,
+    "ERR_OFFERING_FULL": 409,
+    "ERR_LIQUIDITY_WINDOW_LOCKED": 409,
+    "ERR_HOLD_PERIOD_ACTIVE": 409,
+    "ERR_MINIMUM_NOT_MET": 422,
+    "ERR_QUALIFICATION_LAPSED": 409,
+    "ERR_APPRAISAL_CADENCE": 409,
+    "ERR_APPRAISAL_STALE": 409,
+    "ERR_APPRAISAL_MISSING": 409,
+    "ERR_INSUFFICIENT_COVERAGE": 422,
+    "ERR_COVERAGE_EXCEEDS_VALUE": 422,
+    "ERR_ACCOUNT_UNDERFUNDED": 409,
+    "ERR_SOLE_POLICY_CANNOT_LAPSE": 409,
+    "ERR_POLICY_INTERVAL_OVERLAP": 409,
+    "ERR_CUSTODY_INTERVAL_OVERLAP": 409,
+    "ERR_WAITLIST_EMPTY": 409,
+    "ERR_REPORT_WINDOW_FORECLOSED": 409,
+    "ERR_ACCRUAL_TYPE_UNSUPPORTED": 422,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_VALUE_REJECTED": 400,
+    "ERR_CASCADE_REJECTED": 409,
+}
+
+ERROR_IDS = list(ERROR_STATUS.keys())
+
+ROLES = ["Anonymous", "Investor", "IssuerOps", "ComplianceOfficer",
+         "TransferAgent", "PlatformAdmin", "System"]
+
+ENUMS = {
+    "attribution_status": ["CONFIRMED", "DISPUTED", "UNKNOWN"],
+    "medium": ["PAINTING", "SCULPTURE", "WORK_ON_PAPER", "PHOTOGRAPH", "MIXED_MEDIA"],
+    "condition_grade": ["EXCELLENT", "GOOD", "FAIR", "POOR"],
+    "artist_condition_grade": ["PENDING", "EXCELLENT", "GOOD", "FAIR", "POOR"],
+    "artwork_status": ["APPRAISED", "AUTHENTICATED", "OFFERING_PENDING",
+                       "UNDER_OFFERING", "HELD", "SALE_PENDING", "SOLD"],
+    "report_type": ["AUTHENTICATION", "PROVENANCE", "CONDITION_SURVEY"],
+    "asset_report_outcome": ["VERIFIED", "DISPUTED", "REJECTED"],
+    "appraisal_method": ["AUCTION_COMPARABLE", "MARKET_INDEX", "PRIVATE_SALE"],
+    "exemption_type": ["REG_D_506C", "REG_A_TIER2", "EXEMPT_REG_D"],
+    "offering_status": ["DRAFT", "QUALIFICATION_FILED", "ALLOCATED", "HELD",
+                        "SALE_PENDING", "CLOSED", "WITHDRAWN", "OFFERING_ABANDONED"],
+    "subscription_status": ["RECEIVED", "SUITABILITY_SCREENED", "SUBSCRIBED",
+                            "WAITLISTED", "REALLOCATED", "REJECTED", "EXPIRED",
+                            "WITHDRAWN"],
+    "custody_status": ["PENDING", "IN_CUSTODY", "RELEASED"],
+    "decision_type": ["HOLD", "SELL"],
+    "decision_status": ["PENDING", "APPROVED", "REJECTED", "EXECUTED", "FAILED"],
+    "transfer_order_status": ["OPEN", "MATCHED", "EXECUTED", "LAPSED", "CANCELLED"],
+    "lot_type": ["STORAGE", "INSURANCE", "CONSERVATION"],
+    "policy_status": ["PENDING", "FORCE", "LAPSED"],
+    "report_kind": ["QUARTERLY", "APPRAISAL", "SALE"],
+    "accrual_type": ["MANAGEMENT", "PROFIT_PARTICIPATION"],
+    "distribution_status": ["CALCULATED", "PAID"],
+    "suitability_status": ["PENDING", "APPROVED", "EXPIRED", "REVOKED"],
+    "screen_outcome": ["VERIFIED", "DISPUTED"],
+}
+
+# Constants pinned by the scaffold
+APPRAISAL_CADENCE_DAYS = 90
+APPRAISAL_STALE_DAYS = 180
+CADENCE_DUE_DAYS = 90
+CADENCE_REQUIRED_DAYS = 180
+DAYS_PER_YEAR = 365
+FEE_BPS_BASE = 10000
+QUALIFICATION_DEADLINE_DAYS = 30
+RESCISSION_WINDOW_DAYS = 3
+SUITABILITY_DAYS = 365
+HOLD_LAPSE_DAYS = 30
+COVERAGE_MAX_PCT = 120
+ACCREDITED_INCOME_CENTS = 20000000
+ACCREDITED_NET_WORTH_CENTS = 100000000
+MAX_LIMIT = 100
+DEFAULT_LIMIT = 10

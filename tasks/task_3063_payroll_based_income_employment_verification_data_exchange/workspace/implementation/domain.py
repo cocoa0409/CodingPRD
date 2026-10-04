@@ -1,0 +1,110 @@
+"""Domain constants, enumerations and the immutable frozen default dataset."""
+
+MAX_BATCH_RECORD_COUNT = 50000
+REQUIRED_CANONICAL_FIELDS = [
+    "worker_ssn_last4", "worker_date_of_birth", "hire_date",
+    "employment_status", "pay_rate", "pay_rate_basis",
+]
+AUTHORIZATION_VALIDITY_DAYS = 365
+AUTHORIZATION_RESOLVE_DAYS = 7
+REVIEW_WINDOW_BUFFER_DAYS = 3
+DISPUTE_RESPONSE_WINDOW_DAYS = 45
+DISPUTE_REOPEN_GRACE_DAYS = 14
+SETTLEMENT_VOID_GRACE_DAYS = 30
+RESTORE_MIN_ESCROW_CENTS = 5000
+DISCLOSURE_WINDOW_DAYS = 3650
+
+WEEKS_PER_YEAR = 52
+MAX_HOURS_PER_WEEK = 60
+DEFAULT_HOURS_PER_WEEK = 40
+
+CONTRIBUTOR_TIER1_RATE = 12
+CONTRIBUTOR_TIER2_RATE = 10
+CONTRIBUTOR_TIER3_RATE = 8
+CONTRIBUTOR_TIER2_MIN = 1000
+CONTRIBUTOR_TIER3_MIN = 10000
+
+VOLUME_STEP1_MIN = 2
+VOLUME_STEP2_MIN = 5
+TIER_DEPTH_SURCHARGE = {"EMPLOYMENT_ONLY": 0, "EMPLOYMENT_INCOME": 350, "FULL_INCOME_HISTORY": 900}
+
+FEED_STALLED_MULTIPLIER = 3
+FEED_BASE_WEIGHT = 250
+FEED_RECENCY_WEIGHT = 200
+FEED_RESPONSIVENESS_WEIGHT = 150
+FEED_DECAY_PER_DAY = 3
+FEED_SCORE_FLOOR = 0
+FEED_SCORE_CEILING = 600
+STALL_STRIKE_THRESHOLD = 300
+
+DISPUTE_ESCALATION_PENALTY = 25
+FEED_STALL_PENALTY = 40
+REVERSAL_PENALTY = 30
+VERIFIER_CONTAGION_FACTOR = 1.5
+VERIFIER_SCORE_CEILING = 1000
+VERIFIER_RESTRICT_SCORE = 100
+
+CADENCE_INTERVAL_DAYS = {"WEEKLY": 7, "BIWEEKLY": 14, "SEMIMONTHLY": 15, "MONTHLY": 30}
+PERIODS_PER_YEAR = {"WEEKLY": 52, "BIWEEKLY": 26, "SEMIMONTHLY": 24, "MONTHLY": 12}
+EMPLOYMENT_STATUS_RANK = {
+    "ACTIVE": 0, "LEAVE_OF_ABSENCE": 1, "FURLOUGH": 2, "TERMINATED": 3, "RETIRED": 4,
+}
+TIER_HISTORY_DEPTH = {"EMPLOYMENT_ONLY": 0, "EMPLOYMENT_INCOME": 12, "FULL_INCOME_HISTORY": 24}
+ALWAYS_RENDERED = ["employer_legal_name", "hire_date", "employer_feed_status", "records_matched_count"]
+BUCKET_ORDER = ["BUCKET_BASE", "BUCKET_ADJUSTMENT", "BUCKET_WAIVER"]
+
+VERIFIER_CLASS_TO_PRODUCT_CLASS = {
+    "DEPARTMENT_OF_SOCIAL_SERVICES": "SOCIAL_SERVICE",
+    "GOVERNMENT_AGENCY": "SOCIAL_SERVICE",
+    "MORTGAGE_LENDER": "MORTGAGE",
+    "BACKGROUND_CHECKER": "BACKGROUND",
+    "LANDLORD": "TENANT",
+    "INSURER": "INSURANCE",
+}
+
+ROLES = {"PlatformAdmin", "Employer", "CoveredWorker", "Verifier"}
+
+PURPOSES = {
+    "PUBLIC_BENEFIT_DETERMINATION", "MORTGAGE_CREDIT_DECISION",
+    "EMPLOYMENT_SCREENING", "TENANT_SCREENING", "INSURANCE_UNDERWRITING",
+}
+
+OPEN_DISPUTE_STATES = {"AWAITING_EMPLOYER", "NOTICE_SENT", "EMPLOYER_RESPONDED", "ESCALATED"}
+# A freeze is "live" while it is pending or in force; a released or lapsed employer
+# is an unfrozen employer whose reverse cascade has already run (PRD §2.7).
+FREEZE_LIVE_STATES = {"REQUESTED", "ACTIVE"}
+CANDIDATE_RECORD_STATES = {"PENDING_VERIFICATION", "VERIFIED", "CORRECTED"}
+DISPUTABLE_RECORD_STATES = {"VERIFIED"}
+INCLUDED_RECORD_STATES = {"PENDING_VERIFICATION", "VERIFIED", "DISPUTED"}
+
+PURPOSE_TO_CLASSES = {
+    "PUBLIC_BENEFIT_DETERMINATION": ["SOCIAL_SERVICE"],
+    "MORTGAGE_CREDIT_DECISION": ["MORTGAGE"],
+    "EMPLOYMENT_SCREENING": ["BACKGROUND"],
+    "TENANT_SCREENING": ["TENANT"],
+    "INSURANCE_UNDERWRITING": ["INSURANCE"],
+}
+CLASSES_TO_PURPOSE = {
+    "SOCIAL_SERVICE": ["PUBLIC_BENEFIT_DETERMINATION"],
+    "MORTGAGE": ["MORTGAGE_CREDIT_DECISION"],
+    "BACKGROUND": ["EMPLOYMENT_SCREENING"],
+    "TENANT": ["TENANT_SCREENING"],
+    "INSURANCE": ["INSURANCE_UNDERWRITING"],
+}
+
+
+def product_rendered_field_set(tier, history_months_included, includes_employment_status):
+    """Projected at product creation; sorted lexicographically ascending."""
+    fields = set(ALWAYS_RENDERED)
+    if includes_employment_status:
+        fields.add("employment_status")
+        fields.add("tenure_months")
+    if history_months_included > 0:
+        fields.add("income_history")
+    if history_months_included >= 12:
+        fields.add("pay_rate")
+        fields.add("pay_rate_basis")
+    if history_months_included >= 24:
+        fields.add("separation_date")
+        fields.add("final_pay_period_income_cents")
+    return sorted(fields)

@@ -1,0 +1,85 @@
+"""Domain thresholds and pinned evaluation constants named by the contract."""
+
+THRESHOLDS = {
+    # Protection / diffusion index weights and floor.
+    "PROTECTION_BASE": 100,
+    "CERT_WEIGHT": 12,
+    "FISCAL_WEIGHT": 6,
+    "SLICER_WEIGHT": 4,
+    "PROTECTION_FLOOR": 0,
+    # The restrictive side of the protection predicate is inclusive.
+    "PROTECTION_RESTRICTED_AT_OR_BELOW": 30,
+    # Bucket catcher.
+    "BUCKET_HEADCOUNT_LIMIT": 40,
+    # Sanitation dueness.
+    "TIMED_MULTIPLIER": 3,
+    "ROUTINE_DEFAULT_LIMIT": 25,
+    "DEFAULT_CYCLE_MINUTES": 10,
+    "DEFAULT_BUFFER_MINUTES": 5,
+    # Sub queue.
+    "QUEUE_DEPTH_LIMIT": 8,
+    "HALF_LB_UNIT": 0.5,
+    "MINUTES_PER_REQUIRED_BATCH": 12,
+    "MINUTES_PER_HALF_LB": 1,
+    # Promised-time and label bounds.
+    "DECLARED_LABEL_WEIGHT_CEILING_LBS": 10,
+    # Catering quote tiers.
+    "TIER_1_RATE_CENTS": 1800,
+    "TIER_2_RATE_CENTS": 1650,
+    "TIER_3_RATE_CENTS": 1500,
+    "TIER_2_MIN": 3,
+    "TIER_2_MAX": 6,
+    "RUSH_LIMIT_HOURS": 24,
+    "RUSH_FEE_CENTS": 2600,
+    "CERTIFIED_ADJUSTMENT_PCT": -0.05,
+}
+
+# Case-yield cost components.
+CASE_YIELD = {
+    "RETAIL_LABOR_LOAD_CENTS": 45,
+    "SLICER_CUTS_PER_FEE_UNIT": 20,
+    "FEE_PER_CUT_UNIT_CENTS": 6,
+    "WASTE_RECOVERY_RATE": 0.70,
+    "NET_MARKDOWN_RATE": 0.50,
+}
+
+# Bread forecast chain.
+BREAD_DEMAND = {
+    "BREAD_WASTE_FACTOR": 0.12,
+    "UNITS_PER_CASE": 12,
+    "SETTLEMENT_UPLIFT_CAP": 0.35,
+    "SUBMIT_LEAD_TIME_HOURS": 48,
+    "CONFIRM_FRACTION": 0.8,
+    "SHORT_FRACTION": 0.9,
+}
+
+# Waste liability tiering.
+WASTE_TIERS = {
+    "DISCOUNTED_BASE_RATE": 0.70,
+    "PRIOR_TIER_RATE": 0.30,
+    "TIER_1_MAX_EXCLUSIVE_CENTS": 5000,
+    "TIER_2_MAX_EXCLUSIVE_CENTS": 15000,
+    "FEE_TIER_1_CENTS": 0,
+    "FEE_TIER_2_CENTS": 250,
+    "FEE_TIER_3_CENTS": 600,
+}
+
+CERT_GRACE_WINDOW_HOURS = 72
+REOPEN_LIMIT_PER_DAY = 2
+CATERING_MIN_LEAD_TIME_HOURS = 24
+PICKUP_WINDOW_MAX_MINUTES = 120
+STAGING_BUFFER_MINUTES = 10
+BUCKET_TRUNCATION_MINUTES = 15
+
+LOGICAL_CLOCK_DEFAULT = "2026-09-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "STORE_NUMBER": "101",
+    "STORE_NAME": "Store One",
+    "DELI_CASE_CAPACITY_LBS": 420,
+    "HOT_BAR_CAPACITY_LBS": 90,
+    "SUB_STATION_COUNT": 2,
+    "CERT_ISSUED_AT": "2026-09-01T00:00:00Z",
+    "CERT_EXPIRES_AT": "2026-12-31T00:00:00Z",
+    "CLOCK": "2026-09-02T06:00:00Z",
+}

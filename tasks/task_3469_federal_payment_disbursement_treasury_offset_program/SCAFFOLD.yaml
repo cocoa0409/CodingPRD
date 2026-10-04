@@ -1,0 +1,1420 @@
+# =============================================================================
+# SCAFFOLD.yaml — task_3469_federal_payment_disbursement_treasury_offset_program
+# Federal Payment Disbursement & Treasury Offset Program (Bureau of the Fiscal
+# Service). Flat topology, compliance/audit archetype, logical clock.
+# =============================================================================
+
+scenario: |
+  Federal Payment Disbursement & Treasury Offset Program (Bureau of the Fiscal Service): payment file processing from federal agencies with payee verification and payment method determination, offset program matching payees against a database of delinquent debts across federal and state creditors with priority ordering, exemption rules protecting certain benefit payments and minimum protected amounts, offset notice requirements with pre-offset due process handled by the referring creditor, administrative wage garnishment and cross-servicing of delinquent debt with collection agency referral, state reciprocal agreements offsetting state debts against federal payments and the reverse, refund and reversal handling when an offset is later determined improper, payment integrity controls including do-not-pay verification before disbursement
+
+domain_name: federal-payment-offset
+api_prefix: ""
+
+# =============================================================================
+# §0.3 Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: "Compliance / audit"
+  secondary_archetype: "Ledger reconciliation"
+  complexity_layers:
+    - optimistic_concurrency      # OCC on Payment.version (re-evaluate supersede) and Debt.version (garnishment collect)
+    - cascading_side_effects      # payment reversal depth-3 cascade; do-not-pay record creation depth-2 cascade
+    - scheduled_actions           # logical clock drives notice windows, settlement sweep, request expiry, claim windows
+    - selector_policy             # cross-servicing referral selects a CollectionAgency from a ranked eligible pool
+  entity_topology: flat           # peer entities at root; all links via body/path FKs, no nested URL trees
+  state_machine_shape: cyclic     # Debt cycles ACTIVE->PAID_IN_FULL->ACTIVE and ACTIVE->RETURNED->NOTICED->ACTIVE; Payment carries dual independent state axes; RefundClaim has an appeal loop
+  relationship_patterns:
+    - one_to_many                 # CreditorAgency -> Debt; PaymentFile -> Payment; Payment -> Offset
+    - cross_aggregate             # Offset joins Payment x Debt x CreditorAgency ledger; ReverseOffsetRequest reads across Debt + ReciprocalAgreement
+  role_model: segregation_of_duties  # the RefundOfficer who decides a claim must not be the TreasuryOperator who executed the offset
+  consistency_model: immediate    # every mutation + all cascaded side effects are atomic within the request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: CreditorAgency
+    parent: null
+    common_fields: true
+    fields:
+      - { name: creditor_code, type: string, source: input, description: "Unique creditor code (e.g., IRS, CA-FTB); duplicates rejected with ERR_DUPLICATE_CREDITOR_CODE" }
+      - { name: legal_name, type: string, source: input, description: "Creditor legal name" }
+      - { name: creditor_type, type: enum, source: input, description: "FEDERAL | STATE" }
+      - { name: state_code, type: string, source: input, default: null, description: "Two-letter state code; required when creditor_type == STATE (else ERR_STATE_CODE_REQUIRED); must be absent when creditor_type == FEDERAL (else ERR_INVALID_REQUEST)" }
+      - { name: remitted_gross_ytd_cents, type: integer, source: system, default: 0, description: "Gross collections remitted in the current logical-clock calendar year (pre-fee); drives the remittance fee tier" }
+      - { name: remitted_ytd_year, type: integer, source: system, default: null, description: "Calendar year that remitted_gross_ytd_cents accumulates; lazily reset when the logical clock's year differs" }
+      - { name: remitted_net_total_cents, type: integer, source: system, default: 0, description: "All-time net (post-fee) remittance ledger; credited on collections, debited on refund clawbacks and payment reversals" }
+      - { name: outstanding_receivable_cents, type: integer, source: computed, description: "Sum of current_balance_cents over this creditor's Debt rows with status IN {ACTIVE, IN_COLLECTION}" }
+
+  - name: Payee
+    parent: null
+    common_fields: true
+    fields:
+      - { name: tin, type: string, source: input, description: "Taxpayer identification number; unique across Payee (ERR_DUPLICATE_TIN)" }
+      - { name: tin_type, type: enum, source: input, description: "SSN | EIN" }
+      - { name: legal_name, type: string, source: input, description: "Payee legal name" }
+      - { name: routing_number, type: string, source: input, default: null, description: "Bank routing number; when non-null the payment method is EFT, otherwise CHECK" }
+      - { name: account_last4, type: string, source: input, default: null, description: "Last four digits of the disbursement account" }
+
+  - name: ExemptionPolicy
+    parent: null
+    common_fields: true
+    fields:
+      - { name: payment_type, type: enum, source: input, description: "VENDOR | SALARY | BENEFIT_RETIREMENT | BENEFIT_DISABILITY | TAX_REFUND | GRANT" }
+      - { name: exemption_class, type: enum, source: input, description: "EXEMPT (never offset) | PARTIAL (protected minimum + percentage cap) | FULL (fully offset-eligible)" }
+      - { name: protected_minimum_cents, type: integer, source: input, default: null, description: "Protected floor per payment; required (>= 0) when exemption_class == PARTIAL; must be absent/null for EXEMPT or FULL (else ERR_INVALID_REQUEST)" }
+      - { name: max_offset_pct, type: number, source: input, default: null, description: "Fraction of the payment eligible for offset, in (0, 1]; required when exemption_class == PARTIAL; must be absent/null for EXEMPT or FULL (else ERR_INVALID_REQUEST)" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> ACTIVE -> RETIRED; activating a policy retires the incumbent ACTIVE policy for the same payment_type" }
+
+  - name: Debt
+    parent: null
+    common_fields: true
+    fields:
+      - { name: creditor_agency_id, type: string, source: input, description: "FK -> CreditorAgency.id; referring creditor that owns this debt" }
+      - { name: debtor_tin, type: string, source: input, description: "TIN of the debtor; matched against Payee.tin at offset evaluation" }
+      - { name: debtor_name, type: string, source: input, description: "Debtor name as referred" }
+      - { name: debt_type, type: enum, source: input, description: "CHILD_SUPPORT | FEDERAL_TAX | FEDERAL_NONTAX | STATE_TAX | STATE_OTHER; determines priority_rank" }
+      - { name: original_amount_cents, type: integer, source: input, description: "Referred balance at intake; must be > 0" }
+      - { name: current_balance_cents, type: integer, source: system, description: "Outstanding balance; initialized to original_amount_cents; reduced by collections, restored on payment reversal" }
+      - { name: priority_rank, type: integer, source: computed, description: "CHILD_SUPPORT=10, FEDERAL_TAX=20, FEDERAL_NONTAX=30, STATE_TAX=40, STATE_OTHER=50; lower offsets first" }
+      - { name: delinquent_since, type: datetime, source: input, description: "Date the debt became delinquent; waterfall tie-break after priority_rank" }
+      - { name: notice_sent_at, type: datetime, source: input, default: null, description: "Timestamp of the creditor's pre-offset notice; settable at referral or via POST /debts/{id}/notice" }
+      - { name: due_process_completed, type: boolean, source: input, default: false, description: "Creditor attestation that pre-offset due process (notice + opportunity to dispute) is complete" }
+      - { name: returned_count, type: integer, source: system, default: 0, description: "Number of times this debt has transitioned to RETURNED" }
+      - { name: status, type: enum, source: system, description: "REFERRED | NOTICED | ACTIVE | IN_COLLECTION | PAID_IN_FULL | RETURNED" }
+
+  - name: PaymentFile
+    parent: null
+    common_fields: true
+    fields:
+      - { name: agency_code, type: string, source: input, description: "Submitting federal agency code (free-form registry-less identifier)" }
+      - { name: settlement_date, type: datetime, source: input, description: "Date on which executed payments of this file settle; the clock sweep settles EXECUTED payments whose settlement_date is on or before the clock's UTC date" }
+      - { name: status, type: enum, source: system, description: "RECEIVED -> PROCESSING -> COMPLETED (COMPLETED when payment_count > 0 and every payment is in SETTLED or REVERSED)" }
+      - { name: payment_count, type: integer, source: computed, default: 0, description: "Number of payments in this file" }
+      - { name: total_offset_cents, type: integer, source: computed, default: 0, description: "Sum of Payment.total_offset_cents over the file; per-payment values are rounded before summing (see file_total_aggregation)" }
+      - { name: total_disbursed_cents, type: integer, source: computed, default: 0, description: "Sum of Payment.disbursed_cents over the file" }
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: payment_file_id, type: string, source: system, description: "FK -> PaymentFile.id; parent file taken from the URL path" }
+      - { name: payee_id, type: string, source: input, description: "FK -> Payee.id; payee to be disbursed" }
+      - { name: payee_tin, type: string, source: input, description: "TIN declared on the payment record; must equal Payee.tin of payee_id (else ERR_PAYEE_TIN_MISMATCH)" }
+      - { name: amount_cents, type: integer, source: input, description: "Gross payment amount; must be > 0" }
+      - { name: payment_type, type: enum, source: input, description: "VENDOR | SALARY | BENEFIT_RETIREMENT | BENEFIT_DISABILITY | TAX_REFUND | GRANT; must have an ACTIVE ExemptionPolicy at creation" }
+      - { name: payment_method, type: enum, source: computed, description: "EFT when Payee.routing_number is non-null, otherwise CHECK" }
+      - { name: processing_status, type: enum, source: system, description: "VERIFIED | HELD | EVALUATED | EXECUTED | SETTLED | REVERSED (independent axis 1)" }
+      - { name: integrity_status, type: enum, source: system, description: "CLEAR | FLAGGED (independent axis 2, driven by do-not-pay evaluation)" }
+      - { name: projected_offset_cents, type: integer, source: computed, description: "Intake estimate of the offset pool under the INTAKE_ESTIMATE variant (protected minimum only, no percentage cap)" }
+      - { name: total_offset_cents, type: integer, source: system, default: 0, description: "Sum of APPLIED offset amounts after execute; reset to 0 on reversal" }
+      - { name: disbursed_cents, type: integer, source: system, default: 0, description: "Amount released to the payee at execute (amount_cents - total_offset_cents); reset to 0 on reversal" }
+      - { name: executed_by_user_id, type: string, source: system, default: null, description: "X-User-ID of the TreasuryOperator who executed the payment; used by the segregation-of-duties check on refund decisions" }
+      - { name: executed_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp of execution" }
+
+  - name: Offset
+    parent: null
+    common_fields: true
+    fields:
+      - { name: payment_id, type: string, source: system, description: "FK -> Payment.id; payment being offset" }
+      - { name: debt_id, type: string, source: system, description: "FK -> Debt.id; debt being satisfied" }
+      - { name: priority_rank, type: integer, source: system, description: "Snapshot of Debt.priority_rank at proposal time" }
+      - { name: offset_amount_cents, type: integer, source: computed, description: "Amount this offset takes from the payment (waterfall allocation)" }
+      - { name: fee_cents, type: integer, source: computed, default: null, description: "Collection fee withheld at application (null until APPLIED)" }
+      - { name: net_remittance_cents, type: integer, source: computed, default: null, description: "offset_amount_cents - fee_cents (null until APPLIED)" }
+      - { name: applied_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp when the offset was applied" }
+      - { name: status, type: enum, source: system, description: "PROPOSED -> APPLIED -> REVERSED | REFUNDED; PROPOSED -> DROPPED on re-evaluation or debt return" }
+
+  - name: RefundClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: offset_id, type: string, source: input, description: "FK -> Offset.id; the applied offset claimed to be improper" }
+      - { name: claimed_amount_cents, type: integer, source: input, description: "Amount the claimant seeks; must be > 0 and <= Offset.offset_amount_cents" }
+      - { name: reason, type: enum, source: input, description: "DEBT_NOT_OWED | AMOUNT_INCORRECT | PAYMENT_DUPLICATED | DEBTOR_MISIDENTIFIED" }
+      - { name: status, type: enum, source: system, description: "FILED -> UNDER_REVIEW -> PAID | DENIED; DENIED -> APPEALED -> UNDER_REVIEW (at most one appeal)" }
+      - { name: appeal_count, type: integer, source: system, default: 0, description: "Number of appeals taken; appeals blocked when >= 1 (ERR_APPEAL_LIMIT_REACHED)" }
+      - { name: decided_by_user_id, type: string, source: system, default: null, description: "X-User-ID of the RefundOfficer who last decided" }
+      - { name: decided_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp of the last decision; appeals must be filed within 30 days" }
+      - { name: refund_amount_cents, type: integer, source: computed, default: null, description: "Amount returned to the payee when PAID (== claimed_amount_cents)" }
+      - { name: clawback_cents, type: integer, source: computed, default: null, description: "Amount debited from the creditor's remittance ledger: min(claimed_amount_cents, Offset.net_remittance_cents)" }
+      - { name: treasury_absorbed_cents, type: integer, source: computed, default: null, description: "Portion of the refund absorbed by Treasury (the withheld fee): claimed_amount_cents - clawback_cents" }
+
+  - name: CollectionAgency
+    parent: null
+    common_fields: true
+    fields:
+      - { name: agency_code, type: string, source: input, description: "Unique private collection agency code (ERR_DUPLICATE_AGENCY_CODE)" }
+      - { name: name, type: string, source: input, description: "Agency display name" }
+      - { name: capacity_max_active, type: integer, source: input, description: "Maximum number of concurrently open (INITIATED or ACTIVE) cross-servicing actions this agency will accept; >= 0" }
+
+  - name: CollectionAction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: debt_id, type: string, source: system, description: "FK -> Debt.id; debt under collection, taken from the URL path" }
+      - { name: collection_agency_id, type: string, source: system, default: null, description: "FK -> CollectionAgency.id; assigned by the selector at creation for CROSS_SERVICING, null for AWG" }
+      - { name: action_type, type: enum, source: input, description: "AWG (administrative wage garnishment) | CROSS_SERVICING (private agency referral)" }
+      - { name: notice_sent_at, type: datetime, source: input, default: null, description: "AWG 30-day notice timestamp; required when action_type == AWG, must be absent for CROSS_SERVICING (else ERR_INVALID_REQUEST)" }
+      - { name: disposable_pay_estimate_cents, type: integer, source: input, default: null, description: "Estimated weekly disposable pay used for the PROVISIONAL garnishment projection; required for AWG, absent for CROSS_SERVICING" }
+      - { name: projected_per_period_cents, type: integer, source: computed, default: null, description: "PROVISIONAL garnishment estimate = round_half_up(0.15 * disposable_pay_estimate_cents); null for CROSS_SERVICING" }
+      - { name: collected_total_cents, type: integer, source: system, default: 0, description: "Cumulative amount collected under this action" }
+      - { name: status, type: enum, source: system, description: "INITIATED -> ACTIVE -> COMPLETED | TERMINATED" }
+
+  - name: ReverseOffsetRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: state_code, type: string, source: input, description: "State requesting a reverse offset against its own outgoing payment" }
+      - { name: payee_tin, type: string, source: input, description: "TIN of the payee the state is about to pay" }
+      - { name: requested_amount_cents, type: integer, source: input, description: "Amount of the state's payment exposed for reverse matching; must be > 0" }
+      - { name: status, type: enum, source: system, description: "MATCHED | NO_MATCH -> CONFIRMED; MATCHED -> EXPIRED (lazily, when confirm is attempted after expires_at)" }
+      - { name: matches, type: array, source: computed, description: "Array of { debt_id, matched_amount_cents } over eligible ACTIVE federal debts, priority-waterfall order, capped at requested_amount_cents" }
+      - { name: matched_total_cents, type: integer, source: computed, description: "Sum of matched amounts; 0 and status NO_MATCH when the eligible set is empty" }
+      - { name: expires_at, type: datetime, source: computed, description: "created_at + 10 days; confirm after this instant fails with ERR_REQUEST_EXPIRED and flips status to EXPIRED" }
+      - { name: confirmed_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp of confirmation" }
+      - { name: applied_total_cents, type: integer, source: system, default: null, description: "Total actually applied to debts at confirmation (re-capped against current balances)" }
+
+  - name: ReciprocalAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: state_code, type: string, source: input, description: "State party to the agreement" }
+      - { name: direction, type: enum, source: input, description: "FED_TO_STATE (state debts offset from federal payments) | STATE_TO_FED (federal debts offset from state payments) | BIDIRECTIONAL (counts as both scopes)" }
+      - { name: effective_from, type: datetime, source: input, description: "Half-open window start (inclusive)" }
+      - { name: effective_until, type: datetime, source: input, description: "Half-open window end (exclusive); must be strictly after effective_from" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> ACTIVE; coverage ends when the logical clock passes effective_until (there is no terminate operation)" }
+
+  - name: DoNotPayRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: tin, type: string, source: input, description: "TIN on the do-not-pay list" }
+      - { name: list_source, type: enum, source: input, description: "DEATH_MASTER_FILE | SAM_EXCLUSION | DEBARMENT_LIST" }
+      - { name: effective_from, type: datetime, source: input, description: "Closed interval start (inclusive)" }
+      - { name: effective_until, type: datetime, source: input, description: "Closed interval end (inclusive); must be >= effective_from" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | REMOVED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Debt
+    initial_state: REFERRED
+    terminal_states: [RETURNED]
+    note: "REFERRED when referred without notice_sent_at; NOTICED when referred with notice_sent_at (creation shortcut) or via POST /debts/{id}/notice. Cyclic: RETURNED debts are re-noticed back to NOTICED with a fresh window; PAID_IN_FULL reopens to ACTIVE when a payment reversal restores balance."
+    transitions:
+      - from: REFERRED
+        to: NOTICED
+        trigger: "POST /debts/{debtId}/notice"
+        actor: CreditorAnalyst
+        preconditions:
+          - "debt.status == REFERRED or RETURNED (else ERR_INVALID_STATE)"
+          - "acting CreditorAnalyst's X-User-ID == debt.creditor_agency_id (else ERR_FORBIDDEN_FOR_ROLE)"
+        side_effects:
+          - "notice_sent_at = request value; due_process_completed = request value"
+
+      - from: RETURNED
+        to: NOTICED
+        trigger: "POST /debts/{debtId}/notice"
+        actor: CreditorAnalyst
+        preconditions:
+          - "same as REFERRED -> NOTICED"
+        side_effects:
+          - "notice_sent_at = request value (re-referral requires a fresh notice window); due_process_completed = request value"
+
+      - from: NOTICED
+        to: ACTIVE
+        trigger: "POST /debts/{debtId}/activate"
+        actor: CreditorAnalyst
+        preconditions:
+          - "debt.status == NOTICED (else ERR_INVALID_STATE)"
+          - "due_process_completed == true (else ERR_DUE_PROCESS_NOT_COMPLETED)"
+          - "logical clock >= notice_sent_at + 30 days (else ERR_NOTICE_WINDOW_NOT_ELAPSED; equality activates)"
+          - "if creditor is STATE: an ACTIVE ReciprocalAgreement for (creditor.state_code, direction IN {FED_TO_STATE, BIDIRECTIONAL}) with effective_from <= clock < effective_until must exist (else ERR_AGREEMENT_NOT_ACTIVE)"
+        side_effects:
+          - "debt becomes offset-eligible"
+
+      - from: ACTIVE
+        to: IN_COLLECTION
+        trigger: "POST /debts/{debtId}/collection-actions"
+        actor: TreasuryOperator
+        preconditions:
+          - "debt.status == ACTIVE (else ERR_INVALID_STATE); at most one open collection action per debt is implied because the first creation flips the debt to IN_COLLECTION"
+          - "for CROSS_SERVICING: the CollectionAgency selector pool must be non-empty (else ERR_NO_COLLECTION_AGENCY_AVAILABLE; the debt is left unchanged)"
+        side_effects:
+          - "for CROSS_SERVICING: selector assigns collection_agency_id on the new action"
+
+      - from: IN_COLLECTION
+        to: ACTIVE
+        trigger: "POST /collection-actions/{collectionActionId}/terminate"
+        actor: TreasuryOperator
+        preconditions:
+          - "action.status IN {INITIATED, ACTIVE} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "action -> TERMINATED; debt -> ACTIVE (the terminated action was the only open one)"
+
+      - from: ACTIVE
+        to: PAID_IN_FULL
+        trigger: "system (offset application, garnishment collect, or reverse-offset confirmation drives current_balance_cents to 0)"
+        actor: system
+        preconditions:
+          - "current_balance_cents reaches exactly 0"
+        side_effects:
+          - "if reached via a collect on an ACTIVE CollectionAction: that action -> COMPLETED"
+
+      - from: IN_COLLECTION
+        to: PAID_IN_FULL
+        trigger: "system (collect on the open action drives current_balance_cents to 0)"
+        actor: system
+        preconditions:
+          - "current_balance_cents reaches exactly 0"
+        side_effects:
+          - "the open CollectionAction -> COMPLETED"
+
+      - from: PAID_IN_FULL
+        to: ACTIVE
+        trigger: "system (POST /payments/{paymentId}/reverse restores the offset amount to the balance)"
+        actor: system
+        preconditions:
+          - "a reversal credits current_balance_cents above 0"
+        side_effects:
+          - "current_balance_cents += reversed offset amounts"
+
+      - from: PAID_IN_FULL
+        to: RETURNED
+        trigger: "system (refund claim PAID on an offset of this debt — the offset was improper, the creditor must re-validate the debt)"
+        actor: system
+        preconditions:
+          - "a RefundClaim on an APPLIED offset of this debt is decided APPROVE"
+        side_effects:
+          - "returned_count += 1; balance is NOT restored (refund semantics differ from reversal semantics)"
+
+      - from: ACTIVE
+        to: RETURNED
+        trigger: "system (refund claim PAID on an offset of this debt that only partially satisfied it)"
+        actor: system
+        preconditions:
+          - "a RefundClaim on an APPLIED offset of this debt is decided APPROVE while the debt is still ACTIVE"
+        side_effects:
+          - "returned_count += 1; balance is NOT restored"
+
+  - entity: PaymentFile
+    initial_state: RECEIVED
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: RECEIVED
+        to: PROCESSING
+        trigger: "system (first POST /payment-files/{paymentFileId}/payments)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: PROCESSING
+        to: COMPLETED
+        trigger: "system (after any payment transition, when payment_count > 0 and every payment's processing_status IN {SETTLED, REVERSED})"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Payment
+    initial_state: "VERIFIED (or HELD when the intake do-not-pay scan hits)"
+    terminal_states: [SETTLED, REVERSED]
+    note: "Dual independent state axes: processing_status (VERIFIED | HELD | EVALUATED | EXECUTED | SETTLED | REVERSED) x integrity_status (CLEAR | FLAGGED). The axes evolve independently except: (a) a do-not-pay hit on a VERIFIED payment forces processing_status HELD; (b) execute is gated on integrity_status == CLEAR."
+    transitions:
+      - from: "(creation)"
+        to: VERIFIED
+        trigger: "POST /payment-files/{paymentFileId}/payments"
+        actor: PaymentAgencyAnalyst
+        preconditions:
+          - "payment_file.status IN {RECEIVED, PROCESSING} (else ERR_INVALID_STATE)"
+          - "payee_id exists (else ERR_PAYEE_NOT_FOUND); payee_tin == Payee.tin (else ERR_PAYEE_TIN_MISMATCH)"
+          - "an ACTIVE ExemptionPolicy for payment_type exists (else ERR_NO_ACTIVE_POLICY)"
+        side_effects:
+          - "payment_method computed (EFT iff Payee.routing_number non-null, else CHECK)"
+          - "projected_offset_cents computed via offset_pool_determination INTAKE_ESTIMATE variant"
+          - "integrity_status = FLAGGED and processing_status = HELD when the do-not-pay scan hits, else CLEAR / VERIFIED"
+          - "payment_file -> PROCESSING (if first payment); payment_count += 1"
+
+      - from: VERIFIED
+        to: EVALUATED
+        trigger: "POST /payments/{paymentId}/evaluate-offsets"
+        actor: TreasuryOperator
+        preconditions:
+          - "processing_status IN {VERIFIED, EVALUATED} (else ERR_INVALID_STATE)"
+          - "expected_payment_version == payment.version (else ERR_STALE_VERSION)"
+        side_effects:
+          - "re-evaluation supersedes prior proposals: every existing PROPOSED offset of this payment -> DROPPED"
+          - "match eligible debts (status ACTIVE, debtor_tin == payee_tin, state debts require an ACTIVE covering ReciprocalAgreement at evaluation clock) and create PROPOSED offsets via waterfall_allocation over offset_pool_determination EXECUTION_FINAL"
+          - "payment.version += 1"
+
+      - from: EVALUATED
+        to: EXECUTED
+        trigger: "POST /payments/{paymentId}/execute"
+        actor: TreasuryOperator
+        preconditions:
+          - "processing_status == EVALUATED (else ERR_PAYMENT_NOT_EXECUTABLE)"
+          - "integrity_status == CLEAR (else ERR_DNP_FLAGGED_PAYMENT)"
+        side_effects:
+          - "every PROPOSED offset -> APPLIED: debt.current_balance_cents -= offset_amount_cents (debt -> PAID_IN_FULL at 0); remittance_fee_assessment credits the creditor ledger per offset"
+          - "total_offset_cents = sum(APPLIED offsets); disbursed_cents = amount_cents - total_offset_cents"
+          - "executed_by_user_id = X-User-ID; executed_at = logical clock"
+          - "payment_file totals recomputed (per-payment values summed; see file_total_aggregation)"
+
+      - from: EXECUTED
+        to: SETTLED
+        trigger: "system (POST /_clock/set_current_utc sweep: settlement_date of the parent file is on or before the clock's UTC date)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "payment_file may bubble to COMPLETED"
+
+      - from: EXECUTED
+        to: REVERSED
+        trigger: "POST /payments/{paymentId}/reverse"
+        actor: TreasuryOperator
+        preconditions:
+          - "processing_status == EXECUTED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "every APPLIED offset -> REVERSED (depth-3 cascade): (1) debt.current_balance_cents += offset_amount_cents and PAID_IN_FULL debts reopen to ACTIVE; (2) each affected creditor's remitted_net_total_cents -= offset.net_remittance_cents and remitted_gross_ytd_cents -= offset.offset_amount_cents; (3) creditor outstanding_receivable_cents re-derives from debt statuses"
+          - "total_offset_cents = 0; disbursed_cents = 0 (the improper disbursement is clawed back from the payee channel outside this API's scope)"
+
+      - from: VERIFIED
+        to: HELD
+        trigger: "system (a DoNotPayRecord is created matching this payee's TIN)"
+        actor: system
+        preconditions:
+          - "integrity_status transitions to FLAGGED"
+        side_effects:
+          - "part of the do-not-pay creation cascade; EVALUATED payments are FLAGGED but stay EVALUATED"
+
+      - from: HELD
+        to: VERIFIED
+        trigger: "system (POST /do-not-pay-records/{doNotPayRecordId}/remove removes the last ACTIVE matching record)"
+        actor: system
+        preconditions:
+          - "no remaining ACTIVE DoNotPayRecord matches the payee TIN at the current clock"
+        side_effects:
+          - "integrity_status -> CLEAR"
+
+  - entity: Offset
+    initial_state: PROPOSED
+    terminal_states: [REVERSED, REFUNDED, DROPPED]
+    transitions:
+      - from: PROPOSED
+        to: APPLIED
+        trigger: "POST /payments/{paymentId}/execute"
+        actor: TreasuryOperator
+        preconditions: ["see Payment EVALUATED -> EXECUTED"]
+        side_effects: ["debt balance reduced; remittance fee assessed; applied_at set"]
+      - from: PROPOSED
+        to: DROPPED
+        trigger: "system (re-evaluation supersede: a fresh POST /payments/{paymentId}/evaluate-offsets drops the prior PROPOSED set before recomputing)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: APPLIED
+        to: REVERSED
+        trigger: "system (POST /payments/{paymentId}/reverse)"
+        actor: system
+        preconditions: []
+        side_effects: ["balance restoration + creditor ledger debit per Payment reversal cascade"]
+      - from: APPLIED
+        to: REFUNDED
+        trigger: "system (RefundClaim decided APPROVE)"
+        actor: system
+        preconditions: []
+        side_effects: ["clawback_cents debited from creditor remitted_net_total_cents; debt -> RETURNED"]
+
+  - entity: RefundClaim
+    initial_state: FILED
+    terminal_states: [PAID, DENIED]
+    note: "DENIED is terminal unless appealed within 30 days while appeal_count == 0; APPEALED re-enters UNDER_REVIEW via review, allowing exactly one appeal cycle."
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /refund-claims/{refundClaimId}/review"
+        actor: RefundOfficer
+        preconditions: ["status IN {FILED, APPEALED} (else ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: APPEALED
+        to: UNDER_REVIEW
+        trigger: "POST /refund-claims/{refundClaimId}/review"
+        actor: RefundOfficer
+        preconditions: ["status IN {FILED, APPEALED}"]
+        side_effects: []
+      - from: UNDER_REVIEW
+        to: PAID
+        trigger: "POST /refund-claims/{refundClaimId}/decide with decision == APPROVE"
+        actor: RefundOfficer
+        preconditions:
+          - "status == UNDER_REVIEW (else ERR_INVALID_STATE)"
+          - "X-User-ID != Payment.executed_by_user_id of the claimed offset's payment (else ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "offset -> REFUNDED; refund_amount_cents = claimed_amount_cents"
+          - "clawback_cents = min(claimed_amount_cents, offset.net_remittance_cents) debited from creditor remitted_net_total_cents"
+          - "treasury_absorbed_cents = claimed_amount_cents - clawback_cents"
+          - "debt -> RETURNED (improper offset; creditor must re-validate)"
+          - "decided_by_user_id / decided_at set"
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /refund-claims/{refundClaimId}/decide with decision == DENY"
+        actor: RefundOfficer
+        preconditions:
+          - "status == UNDER_REVIEW"
+          - "segregation-of-duties check as above"
+        side_effects: ["decided_by_user_id / decided_at set"]
+      - from: DENIED
+        to: APPEALED
+        trigger: "POST /refund-claims/{refundClaimId}/appeal"
+        actor: TreasuryOperator
+        preconditions:
+          - "status == DENIED (else ERR_INVALID_STATE)"
+          - "appeal_count == 0 (else ERR_APPEAL_LIMIT_REACHED)"
+          - "logical clock <= decided_at + 30 days (else ERR_APPEAL_WINDOW_EXPIRED)"
+        side_effects: ["appeal_count += 1"]
+
+  - entity: CollectionAction
+    initial_state: INITIATED
+    terminal_states: [COMPLETED, TERMINATED]
+    transitions:
+      - from: INITIATED
+        to: ACTIVE
+        trigger: "POST /collection-actions/{collectionActionId}/activate"
+        actor: TreasuryOperator
+        preconditions:
+          - "status == INITIATED (else ERR_INVALID_STATE)"
+          - "AWG only: logical clock >= notice_sent_at + 15 days (else ERR_AWG_HEARING_WINDOW_OPEN; equality activates)"
+          - "CROSS_SERVICING: no waiting period"
+        side_effects: []
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /collection-actions/{collectionActionId}/collect (self-transition recording a collection event)"
+        actor: TreasuryOperator
+        preconditions:
+          - "status == ACTIVE (else ERR_INVALID_STATE)"
+          - "expected_debt_version == debt.version (else ERR_STALE_VERSION)"
+          - "AWG: disposable_pay_cents required; computed garnishment per awg_garnishment_amount STATUTORY_FINAL; result 0 -> ERR_COLLECT_AMOUNT_ZERO"
+          - "CROSS_SERVICING: remitted_amount_cents required; 0 < remitted_amount_cents <= debt.current_balance_cents (else ERR_COLLECT_EXCEEDS_BALANCE)"
+        side_effects:
+          - "collected = min(garnishment, debt.current_balance_cents) for AWG, else remitted_amount_cents"
+          - "debt.current_balance_cents -= collected; debt.version += 1"
+          - "remittance_fee_assessment credits the creditor ledger (fee tier on pre-event remitted_gross_ytd_cents)"
+          - "collected_total_cents += collected; if debt hits 0: debt -> PAID_IN_FULL and this action -> COMPLETED"
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "system (collect drives the debt balance to 0)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: INITIATED
+        to: TERMINATED
+        trigger: "POST /collection-actions/{collectionActionId}/terminate"
+        actor: TreasuryOperator
+        preconditions: ["status IN {INITIATED, ACTIVE}"]
+        side_effects: ["debt -> ACTIVE"]
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /collection-actions/{collectionActionId}/terminate"
+        actor: TreasuryOperator
+        preconditions: ["status IN {INITIATED, ACTIVE}"]
+        side_effects: ["debt -> ACTIVE"]
+
+  - entity: ReverseOffsetRequest
+    initial_state: "MATCHED (or NO_MATCH when the eligible set is empty)"
+    terminal_states: [NO_MATCH, CONFIRMED, EXPIRED]
+    transitions:
+      - from: "(creation)"
+        to: MATCHED
+        trigger: "POST /reverse-offset-requests"
+        actor: StateCoordinator
+        preconditions:
+          - "selector: an ACTIVE ReciprocalAgreement with agreement.state_code == request.state_code, direction IN {STATE_TO_FED, BIDIRECTIONAL}, effective_from <= clock < effective_until (else ERR_NO_RECIPROCAL_AGREEMENT)"
+        side_effects:
+          - "matches computed via reverse_match_waterfall over federal debts (creditor_type FEDERAL, status ACTIVE, debtor_tin == payee_tin); empty set -> NO_MATCH with matched_total_cents 0"
+          - "expires_at = created_at + 10 days"
+      - from: MATCHED
+        to: CONFIRMED
+        trigger: "POST /reverse-offset-requests/{reverseOffsetRequestId}/confirm"
+        actor: StateCoordinator
+        preconditions:
+          - "status == MATCHED (else ERR_INVALID_STATE)"
+          - "logical clock <= expires_at (else status -> EXPIRED and ERR_REQUEST_EXPIRED)"
+        side_effects:
+          - "each match re-capped to min(matched_amount_cents, debt.current_balance_cents) and applied: balance reduced (PAID_IN_FULL at 0), remittance_fee_assessment credits the federal creditor"
+          - "applied_total_cents = sum of applied amounts; confirmed_at set"
+      - from: MATCHED
+        to: EXPIRED
+        trigger: "system (lazily, when confirm is attempted after expires_at)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: ReciprocalAgreement
+    initial_state: DRAFT
+    terminal_states: [ACTIVE]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /reciprocal-agreements/{reciprocalAgreementId}/activate"
+        actor: TreasurySupervisor
+        preconditions:
+          - "status == DRAFT (else ERR_INVALID_STATE)"
+          - "no other ACTIVE agreement with the same state_code and a conflicting direction scope has a half-open-overlapping window (else ERR_AGREEMENT_OVERLAP)"
+        side_effects: []
+    note: "ACTIVE is absorbing: coverage is time-boxed by [effective_from, effective_until); once the logical clock reaches effective_until the agreement covers nothing. State-debt activations and reverse-offset requests then fail their covering-agreement gates."
+
+  - entity: ExemptionPolicy
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /exemption-policies/{exemptionPolicyId}/activate"
+        actor: TreasurySupervisor
+        preconditions: ["status == DRAFT (else ERR_INVALID_STATE)"]
+        side_effects: ["the incumbent ACTIVE policy for the same payment_type, if any, -> RETIRED (supersede)"]
+
+  - entity: DoNotPayRecord
+    initial_state: ACTIVE
+    terminal_states: [REMOVED]
+    transitions:
+      - from: ACTIVE
+        to: REMOVED
+        trigger: "POST /do-not-pay-records/{doNotPayRecordId}/remove"
+        actor: TreasurySupervisor
+        preconditions: ["status == ACTIVE (else ERR_INVALID_STATE)"]
+        side_effects:
+          - "release cascade: every HELD payment whose payee TIN no longer matches any ACTIVE record at the current clock -> VERIFIED with integrity_status CLEAR"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only — true create-with-supersede conflicts)
+# =============================================================================
+concurrency_rules:
+  - rule_id: payment-reevaluate-stale-version
+    parent_entity: Payment
+    write_endpoint: "POST /payments/{paymentId}/evaluate-offsets"
+    occ_field: "expected_payment_version"
+    description: |
+      Re-evaluating a Payment whose version has advanced since the client last
+      observed it is rejected. Re-evaluation legitimately supersedes the prior
+      PROPOSED offset set (the old proposals are dropped and a fresh match is
+      computed), so a client whose view of the payment predates the most recent
+      evaluation holds a stale basis for its match and is refused with
+      ERR_STALE_VERSION. The check is purely version-based: a second,
+      strictly sequential re-evaluation carrying the pre-supersede version fails.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: garnishment-collect-stale-debt
+    parent_entity: Debt
+    write_endpoint: "POST /collection-actions/{collectionActionId}/collect"
+    occ_field: "expected_debt_version"
+    description: |
+      Recording a collection against a Debt whose version has advanced since the
+      client last observed it is rejected. Each collect mutates
+      current_balance_cents (and caps AWG garnishment at the remaining balance),
+      so a client holding a pre-collection version would compute its garnishment
+      against a balance the debt no longer has; the stale writer is refused with
+      ERR_STALE_VERSION. The check is purely version-based: a second, strictly
+      sequential collect carrying the pre-collection version fails.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: payment_method_determination
+    trigger: "payment creation (POST /payment-files/{paymentFileId}/payments)"
+    algorithm: policy_check
+    formula: |
+      payment_method = EFT if Payee.routing_number is non-null else CHECK
+    input_set: "the Payee row referenced by payee_id"
+    precision: "not applicable (enum)"
+    constants: {}
+
+  - name: dnp_match_evaluation
+    trigger: "payment creation; DoNotPayRecord creation; DoNotPayRecord removal"
+    algorithm: policy_check
+    formula: |
+      hit(payee_tin, clock) = EXISTS DoNotPayRecord r WHERE
+        r.status == ACTIVE AND r.tin == payee_tin
+        AND r.effective_from <= clock <= r.effective_until   # closed interval
+      integrity_status = FLAGGED if hit else CLEAR
+    input_set: "all ACTIVE DoNotPayRecord rows with tin == the payment's payee TIN"
+    precision: "not applicable"
+    constants: {}
+
+  - name: offset_pool_determination
+    trigger: "payment creation (variant INTAKE_ESTIMATE writes projected_offset_cents); POST /payments/{paymentId}/evaluate-offsets (variant EXECUTION_FINAL sizes the waterfall pool)"
+    algorithm: tiered_pricing
+    formula: |
+      # Shared inputs: payment amount_cents A; ACTIVE ExemptionPolicy P for the
+      # payment_type; M = set of eligible matched debts (status ACTIVE, TIN
+      # match, state-debt agreement gate) — M is empty at intake.
+      if P.exemption_class == EXEMPT: pool = 0
+      if P.exemption_class == FULL:   pool = A
+      if P.exemption_class == PARTIAL:
+        base = max(0, A - P.protected_minimum_cents)
+        # variant selection happens here; see variants below
+    input_set: "the Payment, its ACTIVE ExemptionPolicy, and (for EXECUTION_FINAL) the eligible matched Debt set"
+    constants:
+      CHILD_SUPPORT_PCT: 0.65
+    precision: "integer cents; the percentage cap is round_half_up to whole cents per payment"
+    variants:
+      - name: INTAKE_ESTIMATE
+        when: "payment creation; no match set exists yet"
+        difference: "PARTIAL pool = base = max(0, A - protected_minimum_cents); the percentage cap and the child-support branch are NOT applied. This is a worst-case projection for the submitting agency and diverges from EXECUTION_FINAL whenever the percentage cap binds."
+      - name: EXECUTION_FINAL
+        when: "evaluate-offsets (and the values locked into PROPOSED offsets)"
+        difference: "PARTIAL pool = min(base, round_half_up(A * pct)) where pct = CHILD_SUPPORT_PCT (0.65) when any eligible matched debt has debt_type == CHILD_SUPPORT, else P.max_offset_pct. Diverges from INTAKE_ESTIMATE whenever round_half_up(A * pct) < base."
+
+  - name: waterfall_allocation
+    trigger: "POST /payments/{paymentId}/evaluate-offsets"
+    algorithm: waterfall_allocation
+    formula: |
+      eligible = [debt for debt in Debt
+                  if debt.status == ACTIVE
+                  and debt.debtor_tin == payment.payee_tin
+                  and (creditor(debt).creditor_type == FEDERAL
+                       or exists ACTIVE ReciprocalAgreement for
+                          (creditor(debt).state_code,
+                           direction IN {FED_TO_STATE, BIDIRECTIONAL})
+                          with effective_from <= clock < effective_until)]
+      order eligible by (priority_rank ASC, delinquent_since ASC, created_at ASC)
+      remaining = offset_pool_determination.EXECUTION_FINAL
+      for debt in ordered eligible:
+        take = min(remaining, debt.current_balance_cents)
+        if take > 0: create Offset(payment, debt, take, status PROPOSED)
+        remaining -= take
+      leftover (if any) stays with the payee at execute time
+    input_set: "ACTIVE Debt rows matching the payee TIN, after the reciprocal-agreement gate"
+    precision: "integer cents"
+    constants: {}
+    note: "Ordering keys are (priority_rank, delinquent_since, created_at) — never the server-minted id."
+
+  - name: file_total_aggregation
+    trigger: "every Payment state change that alters total_offset_cents or disbursed_cents"
+    algorithm: aggregation
+    formula: |
+      # PINNED ROUNDING ORDER (mode (b)): each payment's offset pool is computed
+      # and rounded to whole cents FIRST (round_half_up inside
+      # offset_pool_determination.EXECUTION_FINAL); the file total is the plain
+      # SUM of those per-payment rounded integers. Summing unrounded pools and
+      # rounding once at the file level is FORBIDDEN — it yields a different
+      # cent total.
+      PaymentFile.total_offset_cents    = sum(Payment.total_offset_cents for payments in file)
+      PaymentFile.total_disbursed_cents = sum(Payment.disbursed_cents    for payments in file)
+      PaymentFile.payment_count         = count(payments in file)
+    input_set: "all Payment rows of the file, any status"
+    precision: "integer cents; per-payment round_half_up happens before summation"
+    constants: {}
+
+  - name: remittance_fee_assessment
+    trigger: "offset application (execute), garnishment/agency collect, reverse-offset confirm"
+    algorithm: threshold
+    formula: |
+      # PINNED EVALUATION ORDER (mode (c)) — the fee tier depends on the same
+      # cumulative counter this event increments, so the order is fixed:
+      #   1. Lazy year reset: if clock year != creditor.remitted_ytd_year,
+      #      set remitted_gross_ytd_cents = 0 and remitted_ytd_year = clock year.
+      #   2. Read pre_event_gross = creditor.remitted_gross_ytd_cents.
+      #   3. fee_pct = 0.03 if pre_event_gross < REMIT_TIER_THRESHOLD_CENTS else 0.02
+      #      (the current event NEVER counts toward its own tier).
+      #   4. fee_cents = round_half_up(gross_cents * fee_pct)
+      #   5. net_cents  = gross_cents - fee_cents
+      #   6. creditor.remitted_gross_ytd_cents += gross_cents
+      #      creditor.remitted_net_total_cents += net_cents
+      # Reversals decrement both counters by the original amounts (step 6 inverse);
+      # refund clawbacks decrement remitted_net_total_cents by clawback_cents only.
+    input_set: "the creditor of the debt being collected"
+    precision: "integer cents, round_half_up on the fee"
+    constants:
+      REMIT_TIER_THRESHOLD_CENTS: 60000
+      REMIT_FEE_PCT_LOW_BAND: 0.03
+      REMIT_FEE_PCT_HIGH_BAND: 0.02
+
+  - name: awg_garnishment_amount
+    trigger: "collection-action creation (variant PROVISIONAL writes projected_per_period_cents); POST /collection-actions/{collectionActionId}/collect (variant STATUTORY_FINAL computes the actual dip)"
+    algorithm: threshold
+    formula: |
+      # Shared input: disposable pay D (estimate at creation; actual per-period
+      # value at collect).
+      pass
+    input_set: "the CollectionAction and its Debt"
+    precision: "integer cents, round_half_up on the 15% term"
+    constants:
+      AWG_DISPOSABLE_PCT: 0.15
+      AWG_WEEKLY_FLOOR_CENTS: 21750   # 30 x $7.25 federal minimum wage
+    variants:
+      - name: PROVISIONAL
+        when: "action creation; only the employer's estimate is known"
+        difference: "projected = round_half_up(AWG_DISPOSABLE_PCT * disposable_pay_estimate_cents). The statutory floor is NOT applied at projection time."
+      - name: STATUTORY_FINAL
+        when: "each collect event"
+        difference: "garnishment = min(round_half_up(AWG_DISPOSABLE_PCT * D), max(0, D - AWG_WEEKLY_FLOOR_CENTS)); collected = min(garnishment, debt.current_balance_cents). Diverges from PROVISIONAL whenever D - AWG_WEEKLY_FLOOR_CENTS < 0.15 * D."
+
+  - name: refund_restitution
+    trigger: "POST /refund-claims/{refundClaimId}/decide with decision == APPROVE"
+    algorithm: aggregation
+    formula: |
+      refund_amount_cents      = claimed_amount_cents            # paid to the payee channel
+      clawback_cents           = min(claimed_amount_cents, offset.net_remittance_cents)  # debited from creditor ledger
+      treasury_absorbed_cents  = claimed_amount_cents - clawback_cents                    # Treasury absorbs the withheld fee
+      # conservation: refund_amount_cents == clawback_cents + treasury_absorbed_cents
+    input_set: "the RefundClaim, its Offset, and the offset creditor's ledger"
+    precision: "integer cents"
+    constants: {}
+
+  - name: reverse_match_waterfall
+    trigger: "POST /reverse-offset-requests"
+    algorithm: waterfall_allocation
+    formula: |
+      eligible = [debt for debt in Debt
+                  if debt.status == ACTIVE
+                  and creditor(debt).creditor_type == FEDERAL
+                  and debt.debtor_tin == request.payee_tin]
+      order by (priority_rank ASC, delinquent_since ASC, created_at ASC)
+      remaining = requested_amount_cents
+      for debt in ordered eligible:
+        take = min(remaining, debt.current_balance_cents)
+        if take > 0: append { debt_id, matched_amount_cents: take } to matches
+        remaining -= take
+      matched_total_cents = requested_amount_cents - remaining
+      status = MATCHED if matches non-empty else NO_MATCH
+    input_set: "ACTIVE Debt rows of FEDERAL creditors matching the request TIN"
+    precision: "integer cents"
+    constants: {}
+
+  - name: outstanding_receivable_aggregation
+    trigger: "derived on every read of CreditorAgency"
+    algorithm: aggregation
+    formula: |
+      outstanding_receivable_cents =
+        sum(debt.current_balance_cents for debt in creditor's debts
+            if debt.status IN {ACTIVE, IN_COLLECTION})
+    input_set: "the creditor's Debt rows in ACTIVE or IN_COLLECTION"
+    precision: "integer cents"
+    constants: {}
+
+  - name: priority_rank_mapping
+    trigger: "debt creation"
+    algorithm: policy_check
+    formula: |
+      priority_rank = { CHILD_SUPPORT: 10, FEDERAL_TAX: 20, FEDERAL_NONTAX: 30,
+                        STATE_TAX: 40, STATE_OTHER: 50 }[debt_type]
+    input_set: "the new Debt"
+    precision: "not applicable"
+    constants:
+      RANK_CHILD_SUPPORT: 10
+      RANK_FEDERAL_TAX: 20
+      RANK_FEDERAL_NONTAX: 30
+      RANK_STATE_TAX: 40
+      RANK_STATE_OTHER: 50
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers must be present and X-User-Role must be a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Caller role must be listed for the endpoint; CreditorAnalyst additionally scoped: X-User-ID must equal the creditor_agency_id of the debt being created or transitioned"
+    error_id: ERR_FORBIDDEN_FOR_ROLE
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: auth
+    check: "Segregation of duties: on refund decide, X-User-ID must differ from the executing operator recorded as Payment.executed_by_user_id of the claimed offset's payment"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /refund-claims/{refundClaimId}/decide"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request schema: unknown/missing required fields, enum membership, amounts > 0, effective_from <= effective_until, conditional fields (STATE creditor requires state_code; FEDERAL forbids it; PARTIAL policy requires protected_minimum_cents and max_offset_pct; EXEMPT/FULL forbid them; AWG requires notice_sent_at + disposable_pay_estimate_cents; CROSS_SERVICING forbids them)"
+    error_id: ERR_INVALID_REQUEST | ERR_STATE_CODE_REQUIRED
+    http_status: 400
+    applies_to: "all mutating endpoints"
+
+  - priority: 5
+    category: existence
+    check: "Path resource ids must exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+
+  - priority: 6
+    category: existence
+    check: "Body foreign keys must exist, validated in the endpoint's declared input order (payee_id -> ERR_PAYEE_NOT_FOUND; creditor_agency_id -> ERR_CREDITOR_NOT_FOUND; offset_id -> ERR_OFFSET_NOT_FOUND)"
+    error_id: "ERR_PAYEE_NOT_FOUND | ERR_CREDITOR_NOT_FOUND | ERR_OFFSET_NOT_FOUND"
+    http_status: 404
+    applies_to: "endpoints with body FKs"
+
+  - priority: 7
+    category: state
+    check: "State-machine preconditions of the attempted transition, including OCC expected_*_version equality (412) and domain state errors (ERR_INVALID_STATE, ERR_PAYMENT_NOT_EXECUTABLE, ERR_OFFSET_NOT_APPLIED, ERR_APPEAL_LIMIT_REACHED)"
+    error_id: "ERR_INVALID_STATE | ERR_PAYMENT_NOT_EXECUTABLE | ERR_OFFSET_NOT_APPLIED | ERR_APPEAL_LIMIT_REACHED | ERR_STALE_VERSION"
+    http_status: "409 | 412"
+    applies_to: "all state-transition endpoints"
+
+  - priority: 8
+    category: business_safety
+    check: "Compliance gates: due-process attestation present (ERR_DUE_PROCESS_NOT_COMPLETED), pre-offset notice window >= 30 days (ERR_NOTICE_WINDOW_NOT_ELAPSED), AWG hearing window >= 15 days (ERR_AWG_HEARING_WINDOW_OPEN), payment not do-not-pay flagged (ERR_DNP_FLAGGED_PAYMENT)"
+    error_id: "ERR_DUE_PROCESS_NOT_COMPLETED | ERR_NOTICE_WINDOW_NOT_ELAPSED | ERR_AWG_HEARING_WINDOW_OPEN | ERR_DNP_FLAGGED_PAYMENT"
+    http_status: 409
+    applies_to: "debt activate, collection-action activate, payment execute"
+
+  - priority: 9
+    category: business_temporal
+    check: "Temporal windows: refund claim within 180 days of offset application (ERR_CLAIM_WINDOW_EXPIRED), appeal within 30 days of decision (ERR_APPEAL_WINDOW_EXPIRED), reverse-offset confirm before expiry (ERR_REQUEST_EXPIRED), reciprocal-agreement window overlap (ERR_AGREEMENT_OVERLAP), do-not-pay window overlap (ERR_DNP_WINDOW_OVERLAP)"
+    error_id: "ERR_CLAIM_WINDOW_EXPIRED | ERR_APPEAL_WINDOW_EXPIRED | ERR_REQUEST_EXPIRED | ERR_AGREEMENT_OVERLAP | ERR_DNP_WINDOW_OVERLAP"
+    http_status: 409
+    applies_to: "refund-claims create/appeal, reverse-offset confirm, reciprocal-agreements create/activate, do-not-pay-records create"
+
+  - priority: 10
+    category: business_constraint
+    check: "Referential-consistency and selector gates: unique tin / creditor_code / agency_code (ERR_DUPLICATE_TIN, ERR_DUPLICATE_CREDITOR_CODE, ERR_DUPLICATE_AGENCY_CODE), payee_tin must equal Payee.tin (ERR_PAYEE_TIN_MISMATCH), ACTIVE ExemptionPolicy present for payment_type (ERR_NO_ACTIVE_POLICY), covering reciprocal agreement for state debts (ERR_AGREEMENT_NOT_ACTIVE), covering agreement for reverse requests (ERR_NO_RECIPROCAL_AGREEMENT), collection-agency pool non-empty (ERR_NO_COLLECTION_AGENCY_AVAILABLE)"
+    error_id: "ERR_DUPLICATE_TIN | ERR_DUPLICATE_CREDITOR_CODE | ERR_DUPLICATE_AGENCY_CODE | ERR_PAYEE_TIN_MISMATCH | ERR_NO_ACTIVE_POLICY | ERR_AGREEMENT_NOT_ACTIVE | ERR_NO_RECIPROCAL_AGREEMENT | ERR_NO_COLLECTION_AGENCY_AVAILABLE"
+    http_status: "409 | 422"
+    applies_to: "creation endpoints, debt activate, evaluate/execute, reverse-offset create, collection-action create"
+
+  - priority: 11
+    category: business_fiscal
+    check: "Amount bounds: claimed_amount_cents <= offset amount (ERR_REFUND_EXCEEDS_OFFSET), remitted_amount_cents <= debt balance (ERR_COLLECT_EXCEEDS_BALANCE), zero computed garnishment rejected (ERR_COLLECT_AMOUNT_ZERO)"
+    error_id: "ERR_REFUND_EXCEEDS_OFFSET | ERR_COLLECT_EXCEEDS_BALANCE | ERR_COLLECT_AMOUNT_ZERO"
+    http_status: 422
+    applies_to: "refund-claims create, collection-action collect"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Logical clock (test-driving endpoint; outside the business surface) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the logical clock. DEFAULT: before any call, the clock reads exactly 2026-09-01T00:00:00Z and never falls back to wall-clock time. Setting the clock also sweeps: EXECUTED payments whose file settlement_date is on or before the clock's UTC date become SETTLED."
+    roles: [TreasurySupervisor]
+    code: 200
+    input: [current_utc]
+    output: { current_utc: string }
+    side_effects: ["settlement sweep on Payment rows", "lazy YTD reset basis for remittance_fee_assessment"]
+
+  # --- CreditorAgency ---
+  - method: POST
+    path: "/creditor-agencies"
+    description: "Register a creditor agency (federal or state)"
+    roles: [TreasurySupervisor]
+    code: 201
+    input: [creditor_code, legal_name, creditor_type, "state_code?"]
+    output: CreditorAgency
+    side_effects: ["ledger counters initialized to 0"]
+
+  - method: GET
+    path: "/creditor-agencies/{creditorAgencyId}"
+    description: "Get a creditor agency including derived ledger fields"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: CreditorAgency
+    side_effects: []
+
+  # --- Payee ---
+  - method: POST
+    path: "/payees"
+    description: "Register a payee (tin unique)"
+    roles: [TreasurySupervisor, TreasuryOperator]
+    code: 201
+    input: [tin, tin_type, legal_name, "routing_number?", "account_last4?"]
+    output: Payee
+    side_effects: []
+
+  # --- ExemptionPolicy ---
+  - method: POST
+    path: "/exemption-policies"
+    description: "Create an exemption policy (DRAFT) for a payment_type"
+    roles: [TreasurySupervisor]
+    code: 201
+    input: [payment_type, exemption_class, "protected_minimum_cents?", "max_offset_pct?"]
+    output: ExemptionPolicy
+    side_effects: []
+
+  - method: POST
+    path: "/exemption-policies/{exemptionPolicyId}/activate"
+    description: "Activate a DRAFT policy; the incumbent ACTIVE policy for the same payment_type is retired (supersede)"
+    roles: [TreasurySupervisor]
+    code: 200
+    input: []
+    output: ExemptionPolicy
+    side_effects: ["incumbent ACTIVE policy -> RETIRED"]
+
+  # --- Debt ---
+  - method: POST
+    path: "/debts"
+    description: "Refer a delinquent debt. When notice_sent_at is supplied the debt starts NOTICED, otherwise REFERRED."
+    roles: [CreditorAnalyst]
+    code: 201
+    input: [creditor_agency_id, debtor_tin, debtor_name, debt_type, original_amount_cents, delinquent_since, "notice_sent_at?", "due_process_completed?"]
+    output: Debt
+    side_effects: ["priority_rank computed", "current_balance_cents = original_amount_cents"]
+
+  - method: GET
+    path: "/debts/{debtId}"
+    description: "Get a debt"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: Debt
+    side_effects: []
+
+  - method: GET
+    path: "/debts"
+    description: "List debts with filters"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: ["creditor_agency_id?", "debtor_tin?", "status?", "limit?", "offset?"]
+    output: Debt[]
+    side_effects: []
+
+  - method: POST
+    path: "/debts/{debtId}/notice"
+    description: "Record the creditor's pre-offset notice and due-process attestation (REFERRED or RETURNED -> NOTICED)"
+    roles: [CreditorAnalyst]
+    code: 200
+    input: [notice_sent_at, due_process_completed]
+    output: Debt
+    side_effects: ["fresh notice window starts"]
+
+  - method: POST
+    path: "/debts/{debtId}/activate"
+    description: "Make a NOTICED debt offset-eligible after due-process, notice-window, and reciprocal-agreement gates"
+    roles: [CreditorAnalyst]
+    code: 200
+    input: []
+    output: Debt
+    side_effects: []
+
+  # --- PaymentFile / Payment ---
+  - method: POST
+    path: "/payment-files"
+    description: "Submit a payment file (RECEIVED)"
+    roles: [PaymentAgencyAnalyst]
+    code: 201
+    input: [agency_code, settlement_date]
+    output: PaymentFile
+    side_effects: []
+
+  - method: GET
+    path: "/payment-files/{paymentFileId}"
+    description: "Get a payment file including derived totals"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: PaymentFile
+    side_effects: []
+
+  - method: POST
+    path: "/payment-files/{paymentFileId}/payments"
+    description: "Add a payment record; payee verification (TIN equality), payment-method determination, do-not-pay scan, and INTAKE_ESTIMATE projection run at intake"
+    roles: [PaymentAgencyAnalyst]
+    code: 201
+    input: [payee_id, payee_tin, amount_cents, payment_type]
+    output: Payment
+    side_effects: ["file -> PROCESSING on first payment", "integrity_status / processing_status initialized from do-not-pay scan"]
+
+  - method: GET
+    path: "/payments/{paymentId}"
+    description: "Get a payment"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  - method: GET
+    path: "/payments"
+    description: "List payments with filters"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: ["payment_file_id?", "payee_id?", "processing_status?", "integrity_status?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: POST
+    path: "/payments/{paymentId}/evaluate-offsets"
+    description: "Run matching and create PROPOSED offsets (waterfall). Allowed from VERIFIED or EVALUATED; from EVALUATED the prior PROPOSED set is dropped and recomputed (supersede). OCC-guarded."
+    roles: [TreasuryOperator]
+    code: 200
+    input: [expected_payment_version]
+    output: Payment
+    side_effects: ["PROPOSED offsets created; superseded ones DROPPED", "increments Payment.version by 1"]
+
+  - method: POST
+    path: "/payments/{paymentId}/execute"
+    description: "Apply PROPOSED offsets, assess remittance fees, disburse the remainder"
+    roles: [TreasuryOperator]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["offsets APPLIED", "debt balances reduced (PAID_IN_FULL at 0)", "creditor ledgers credited net of fee", "executed_by_user_id / executed_at set", "file totals recomputed"]
+
+  - method: POST
+    path: "/payments/{paymentId}/reverse"
+    description: "Reverse an EXECUTED payment found to be improper; depth-3 cascade restores offsets, debts, and creditor ledgers"
+    roles: [TreasuryOperator]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["offsets -> REVERSED", "debt balances restored and PAID_IN_FULL debts reopen to ACTIVE", "creditor remitted_net_total_cents debited", "total_offset_cents / disbursed_cents reset to 0"]
+
+  # --- Offset ---
+  - method: GET
+    path: "/offsets/{offsetId}"
+    description: "Get an offset"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: Offset
+    side_effects: []
+
+  - method: GET
+    path: "/offsets"
+    description: "List offsets with filters"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: ["payment_id?", "debt_id?", "status?", "limit?", "offset?"]
+    output: Offset[]
+    side_effects: []
+
+  # --- RefundClaim ---
+  - method: POST
+    path: "/refund-claims"
+    description: "File a claim that an applied offset was improper; must be within 180 days of Offset.applied_at"
+    roles: [TreasuryOperator]
+    code: 201
+    input: [offset_id, claimed_amount_cents, reason]
+    output: RefundClaim
+    side_effects: []
+
+  - method: GET
+    path: "/refund-claims/{refundClaimId}"
+    description: "Get a refund claim"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: RefundClaim
+    side_effects: []
+
+  - method: GET
+    path: "/refund-claims"
+    description: "List refund claims with filters"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: ["offset_id?", "status?", "limit?", "offset?"]
+    output: RefundClaim[]
+    side_effects: []
+
+  - method: POST
+    path: "/refund-claims/{refundClaimId}/review"
+    description: "Move a FILED or APPEALED claim to UNDER_REVIEW"
+    roles: [RefundOfficer]
+    code: 200
+    input: []
+    output: RefundClaim
+    side_effects: []
+
+  - method: POST
+    path: "/refund-claims/{refundClaimId}/decide"
+    description: "Approve (PAID + clawback cascade) or deny (DENIED) an UNDER_REVIEW claim; segregation of duties enforced against the executing operator"
+    roles: [RefundOfficer]
+    code: 200
+    input: [decision]
+    output: RefundClaim
+    side_effects: ["on APPROVE: offset -> REFUNDED, creditor ledger debited clawback_cents, debt -> RETURNED, refund fields computed"]
+
+  - method: POST
+    path: "/refund-claims/{refundClaimId}/appeal"
+    description: "Appeal a DENIED claim within 30 days of the decision; at most one appeal"
+    roles: [TreasuryOperator]
+    code: 200
+    input: []
+    output: RefundClaim
+    side_effects: ["appeal_count += 1"]
+
+  # --- CollectionAgency / CollectionAction ---
+  - method: POST
+    path: "/collection-agencies"
+    description: "Register a private collection agency"
+    roles: [TreasurySupervisor]
+    code: 201
+    input: [agency_code, name, capacity_max_active]
+    output: CollectionAgency
+    side_effects: []
+
+  - method: POST
+    path: "/debts/{debtId}/collection-actions"
+    description: "Open an AWG or cross-servicing action on an ACTIVE debt; cross-servicing runs the agency selector; debt flips to IN_COLLECTION"
+    roles: [TreasuryOperator]
+    code: 201
+    input: [action_type, "notice_sent_at?", "disposable_pay_estimate_cents?"]
+    output: CollectionAction
+    side_effects: ["debt -> IN_COLLECTION", "selector assigns collection_agency_id for CROSS_SERVICING", "projected_per_period_cents computed for AWG"]
+
+  - method: GET
+    path: "/collection-actions/{collectionActionId}"
+    description: "Get a collection action"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: []
+    output: CollectionAction
+    side_effects: []
+
+  - method: GET
+    path: "/collection-actions"
+    description: "List collection actions with filters"
+    roles: [TreasurySupervisor, TreasuryOperator, PaymentAgencyAnalyst, CreditorAnalyst, StateCoordinator, RefundOfficer, Auditor]
+    code: 200
+    input: ["debt_id?", "collection_agency_id?", "status?", "limit?", "offset?"]
+    output: CollectionAction[]
+    side_effects: []
+
+  - method: POST
+    path: "/collection-actions/{collectionActionId}/activate"
+    description: "Activate an INITIATED action; AWG requires the 15-day hearing window to have elapsed"
+    roles: [TreasuryOperator]
+    code: 200
+    input: []
+    output: CollectionAction
+    side_effects: []
+
+  - method: POST
+    path: "/collection-actions/{collectionActionId}/collect"
+    description: "Record a collection event (AWG computes the statutory dip; cross-servicing records the agency remittance). OCC-guarded on Debt.version."
+    roles: [TreasuryOperator]
+    code: 200
+    input: [expected_debt_version, "disposable_pay_cents?", "remitted_amount_cents?"]
+    output: CollectionAction
+    side_effects: ["debt balance reduced, version bumped", "creditor ledger credited net of fee", "debt PAID_IN_FULL + action COMPLETED at 0"]
+
+  - method: POST
+    path: "/collection-actions/{collectionActionId}/terminate"
+    description: "Terminate an open action; the debt returns to ACTIVE"
+    roles: [TreasuryOperator]
+    code: 200
+    input: []
+    output: CollectionAction
+    side_effects: ["debt -> ACTIVE"]
+
+  # --- ReverseOffsetRequest ---
+  - method: POST
+    path: "/reverse-offset-requests"
+    description: "State requests matching of its outgoing payment against federal debts (reverse offset); requires a covering ACTIVE reciprocal agreement"
+    roles: [StateCoordinator]
+    code: 201
+    input: [state_code, payee_tin, requested_amount_cents]
+    output: ReverseOffsetRequest
+    side_effects: ["matches computed via reverse_match_waterfall", "expires_at = created_at + 10 days"]
+
+  - method: POST
+    path: "/reverse-offset-requests/{reverseOffsetRequestId}/confirm"
+    description: "Confirm the state offset its payment; matched amounts are re-capped to current balances and applied to the federal debts"
+    roles: [StateCoordinator]
+    code: 200
+    input: []
+    output: ReverseOffsetRequest
+    side_effects: ["debt balances reduced", "federal creditor ledgers credited net of fee", "after expires_at: status -> EXPIRED and ERR_REQUEST_EXPIRED"]
+
+  # --- ReciprocalAgreement ---
+  - method: POST
+    path: "/reciprocal-agreements"
+    description: "Create a reciprocal agreement (DRAFT). Half-open window overlap with an ACTIVE agreement of conflicting direction scope is rejected."
+    roles: [TreasurySupervisor]
+    code: 201
+    input: [state_code, direction, effective_from, effective_until]
+    output: ReciprocalAgreement
+    side_effects: []
+
+  - method: POST
+    path: "/reciprocal-agreements/{reciprocalAgreementId}/activate"
+    description: "Activate a DRAFT agreement; overlap with ACTIVE agreements of conflicting scope re-checked"
+    roles: [TreasurySupervisor]
+    code: 200
+    input: []
+    output: ReciprocalAgreement
+    side_effects: []
+
+  # --- DoNotPayRecord ---
+  - method: POST
+    path: "/do-not-pay-records"
+    description: "List a TIN on a do-not-pay source over a closed interval; touching intervals on the same (tin, list_source) conflict"
+    roles: [TreasuryOperator]
+    code: 201
+    input: [tin, list_source, effective_from, effective_until]
+    output: DoNotPayRecord
+    side_effects: ["flag/hold cascade to pre-execution payments of the matching TIN"]
+
+  - method: POST
+    path: "/do-not-pay-records/{doNotPayRecordId}/remove"
+    description: "Remove a record; HELD payments with no remaining matching ACTIVE record are released to VERIFIED/CLEAR"
+    roles: [TreasurySupervisor]
+    code: 200
+    input: []
+    output: DoNotPayRecord
+    side_effects: ["release cascade to HELD payments"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing, or role not declared" }
+  - { id: ERR_FORBIDDEN_FOR_ROLE, http: 403, condition: "Role not permitted on this endpoint, or CreditorAnalyst acting on another creditor's debt" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Refund decider is the same user who executed the claimed offset's payment" }
+
+  # --- existence ---
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path resource id does not exist" }
+  - { id: ERR_PAYEE_NOT_FOUND, http: 404, condition: "payee_id in request body does not exist" }
+  - { id: ERR_CREDITOR_NOT_FOUND, http: 404, condition: "creditor_agency_id in request body does not exist" }
+  - { id: ERR_OFFSET_NOT_FOUND, http: 404, condition: "offset_id in request body does not exist" }
+
+  # --- request schema ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, unknown enum value, non-positive amount, inverted effective window, or conditional-field violation (policy class fields, AWG vs CROSS_SERVICING fields)" }
+  - { id: ERR_STATE_CODE_REQUIRED, http: 400, condition: "creditor_type == STATE without state_code" }
+
+  # --- state ---
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource is in a state where the attempted transition is not defined (including terminal-state lockdown and repeated transitions)" }
+  - { id: ERR_PAYMENT_NOT_EXECUTABLE, http: 409, condition: "POST /payments/{id}/execute attempted while processing_status != EVALUATED" }
+  - { id: ERR_OFFSET_NOT_APPLIED, http: 409, condition: "Refund claim filed against an offset not in APPLIED status" }
+  - { id: ERR_APPEAL_LIMIT_REACHED, http: 409, condition: "Second appeal attempted on a claim" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_*_version does not match the parent entity's current version (OCC)" }
+
+  # --- business_safety (compliance) ---
+  - { id: ERR_DUE_PROCESS_NOT_COMPLETED, http: 409, condition: "Debt activation without the creditor's due-process attestation" }
+  - { id: ERR_NOTICE_WINDOW_NOT_ELAPSED, http: 409, condition: "Debt activation before notice_sent_at + 30 days" }
+  - { id: ERR_AWG_HEARING_WINDOW_OPEN, http: 409, condition: "AWG activation before notice_sent_at + 15 days" }
+  - { id: ERR_DNP_FLAGGED_PAYMENT, http: 409, condition: "Execute attempted on a payment whose integrity_status == FLAGGED" }
+
+  # --- business_temporal ---
+  - { id: ERR_CLAIM_WINDOW_EXPIRED, http: 409, condition: "Refund claim filed more than 180 days after Offset.applied_at" }
+  - { id: ERR_APPEAL_WINDOW_EXPIRED, http: 409, condition: "Appeal filed more than 30 days after the decision" }
+  - { id: ERR_REQUEST_EXPIRED, http: 409, condition: "Reverse-offset confirm after expires_at; the request flips to EXPIRED" }
+  - { id: ERR_AGREEMENT_OVERLAP, http: 409, condition: "Reciprocal agreement window half-open-overlaps an ACTIVE agreement of the same state and conflicting direction scope" }
+  - { id: ERR_DNP_WINDOW_OVERLAP, http: 409, condition: "Do-not-pay closed interval overlaps (touching counts) another ACTIVE record for the same (tin, list_source)" }
+
+  # --- business_constraint ---
+  - { id: ERR_DUPLICATE_TIN, http: 409, condition: "Payee tin already registered" }
+  - { id: ERR_DUPLICATE_CREDITOR_CODE, http: 409, condition: "creditor_code already registered" }
+  - { id: ERR_DUPLICATE_AGENCY_CODE, http: 409, condition: "collection agency_code already registered" }
+  - { id: ERR_PAYEE_TIN_MISMATCH, http: 422, condition: "payee_tin does not equal the Payee.tin of payee_id" }
+  - { id: ERR_NO_ACTIVE_POLICY, http: 409, condition: "No ACTIVE ExemptionPolicy for the payment_type" }
+  - { id: ERR_AGREEMENT_NOT_ACTIVE, http: 409, condition: "State-creditor debt activation without a covering ACTIVE reciprocal agreement" }
+  - { id: ERR_NO_RECIPROCAL_AGREEMENT, http: 409, condition: "Reverse-offset request without a covering ACTIVE STATE_TO_FED/BIDIRECTIONAL agreement in window" }
+  - { id: ERR_NO_COLLECTION_AGENCY_AVAILABLE, http: 409, condition: "Cross-servicing referral with an empty eligible collection-agency pool; no action is created" }
+
+  # --- business_fiscal ---
+  - { id: ERR_REFUND_EXCEEDS_OFFSET, http: 422, condition: "claimed_amount_cents exceeds the offset's offset_amount_cents" }
+  - { id: ERR_COLLECT_EXCEEDS_BALANCE, http: 422, condition: "Cross-servicing remitted_amount_cents exceeds the debt's current balance" }
+  - { id: ERR_COLLECT_AMOUNT_ZERO, http: 422, condition: "Computed AWG garnishment is zero (disposable pay at or below the protected weekly floor)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: TreasurySupervisor
+    description: "BFS supervisor: registry and policy administration, agreements, logical clock, do-not-pay removals"
+    identity: opaque
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+      - "POST /creditor-agencies"
+      - "POST /exemption-policies and POST /exemption-policies/{id}/activate"
+      - "POST /reciprocal-agreements and POST /reciprocal-agreements/{id}/activate"
+      - "POST /collection-agencies"
+      - "POST /do-not-pay-records/{id}/remove"
+    shared_operations:
+      - "POST /payees (with TreasuryOperator)"
+      - "all GET endpoints"
+
+  - name: TreasuryOperator
+    description: "BFS operations analyst: evaluates/executes/reverses payments, files and appeals refund claims, runs collection actions, creates do-not-pay records"
+    identity: opaque
+    exclusive_operations:
+      - "POST /payments/{id}/evaluate-offsets, /execute, /reverse"
+      - "POST /refund-claims and POST /refund-claims/{id}/appeal"
+      - "POST /debts/{id}/collection-actions and /activate, /collect, /terminate on actions"
+      - "POST /do-not-pay-records"
+    shared_operations:
+      - "POST /payees (with TreasurySupervisor)"
+      - "all GET endpoints"
+
+  - name: PaymentAgencyAnalyst
+    description: "Submitting federal agency user: payment files and payment records"
+    identity: opaque
+    exclusive_operations:
+      - "POST /payment-files"
+      - "POST /payment-files/{id}/payments"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: CreditorAnalyst
+    description: "Creditor agency user: refers debts and drives the notice/activate lifecycle for its own creditor only (X-User-ID == creditor_agency_id); RETURNED transitions are system-driven by approved refund claims"
+    identity: "entity_backed:CreditorAgency"
+    exclusive_operations:
+      - "POST /debts"
+      - "POST /debts/{id}/notice and POST /debts/{id}/activate (own creditor's debts only)"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: StateCoordinator
+    description: "State reciprocity coordinator: reverse-offset requests and confirmations"
+    identity: opaque
+    exclusive_operations:
+      - "POST /reverse-offset-requests"
+      - "POST /reverse-offset-requests/{id}/confirm"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: RefundOfficer
+    description: "Independent review officer: reviews and decides refund claims; may not decide a claim whose offset was executed by the same X-User-ID (segregation of duties)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /refund-claims/{id}/review"
+      - "POST /refund-claims/{id}/decide"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: Auditor
+    description: "Read-only oversight"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: System
+    description: "Automation actor for clock sweeps, cascades, and derived-state recomputation; never callable via X-User-Role"
+    identity: opaque
+    exclusive_operations:
+      - "settlement sweep on POST /_clock/set_current_utc"
+      - "do-not-pay flag/hold and release cascades"
+      - "payment-reversal cascade"
+      - "refund-approval clawback cascade"
+    shared_operations: []

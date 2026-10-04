@@ -1,0 +1,58 @@
+"""Error classes and error-id constants (catalog from PRD §5 / scaffold §1.6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FACILITY_NOT_FOUND": 404,
+    "ERR_UNIT_NOT_FOUND": 404,
+    "ERR_EQUIPMENT_NOT_FOUND": 404,
+    "ERR_SUBMISSION_NOT_FOUND": 404,
+    "ERR_PHANTOM_TEST_NOT_FOUND": 404,
+    "ERR_SURVEY_NOT_FOUND": 404,
+    "ERR_QUALIFICATION_NOT_FOUND": 404,
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_RECORD_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_UNIT_DEFERRED": 409,
+    "ERR_CREDENTIAL_REVOKED": 409,
+    "ERR_ACCREDITATION_LAPSED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_DEADLINE_OVERDUE": 400,
+    "ERR_DEFICIENCY_PENDING": 400,
+    "ERR_QUALIFICATION_UNVERIFIED": 400,
+    "ERR_SURVEY_SHORTFALL": 400,
+    "ERR_ROSTER_INELIGIBLE": 400,
+    "ERR_CE_HOURS_SHORTFALL": 400,
+    "ERR_SHIELDING_FAILED": 400,
+    "ERR_UNIT_LABEL_DUPLICATE": 400,
+    "ERR_SERIAL_DUPLICATE": 400,
+    "ERR_CREDENTIAL_NUMBER_DUPLICATE": 400,
+    "ERR_PHANTOM_SCHEDULE_CONFLICT": 400,
+    "ERR_PHANTOM_TEST_CONFLICT": 400,
+    "ERR_SURVEY_WINDOW_CONFLICT": 400,
+    "ERR_DOSE_RECORD_DUPLICATE": 400,
+    "ERR_CYCLE_INDEX_DUPLICATE": 400,
+    "ERR_INVALID_VIEW_COUNT": 400,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_SUBMISSION_WINDOW_CLOSED": 400,
+    "ERR_RESUBMISSION_LIMIT_EXCEEDED": 400,
+    "ERR_CAUSAL_ORDER": 400,
+    "ERR_RESUBMISSION_CHAIN": 400,
+    "ERR_PHANTOM_UNSCORED": 400,
+    "ERR_INSUFFICIENT_REGISTRY_CREDIT": 402,
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message or error_id, ERROR_HTTP[error_id])

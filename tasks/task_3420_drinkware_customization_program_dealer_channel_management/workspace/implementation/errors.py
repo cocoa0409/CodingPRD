@@ -1,0 +1,78 @@
+"""Error catalog: exact error_id -> HTTP status from SCAFFOLD.yaml §1.6."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERROR_HTTP = {
+    # auth
+    "ERR_MISSING_OR_INVALID_CONTEXT_HEADER": 400,
+    "ERR_FORBIDDEN_FOR_ROLE": 403,
+    # existence
+    "ERR_DEALER_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_PRODUCT_LINE_NOT_FOUND": 404,
+    "ERR_DROP_NOT_FOUND": 404,
+    "ERR_ALLOCATION_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_PROOF_NOT_FOUND": 404,
+    "ERR_SLOT_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    # generic request
+    "ERR_INVALID_REQUEST": 400,
+    # state
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_APPLICATION_ALREADY_OPEN": 409,
+    "ERR_DROP_NOT_OPEN_FOR_ALLOCATION": 409,
+    "ERR_SLOT_NOT_OPEN": 409,
+    "ERR_SLOT_NOT_LOCKED": 409,
+    "ERR_ORDER_IN_PRODUCTION": 409,
+    "ERR_FRAUD_REVIEW_REQUIRED": 409,
+    "ERR_PRODUCT_LINE_DISCONTINUED": 409,
+    "ERR_DUPLICATE_ALLOCATION_REQUEST": 409,
+    "ERR_DUPLICATE_SKU": 409,
+    # optimistic concurrency
+    "ERR_STALE_DEALER_VERSION": 412,
+    "ERR_STALE_DROP_VERSION": 412,
+    # cross-entity state
+    "ERR_DEALER_NOT_AUTHORIZED": 403,
+    "ERR_ARTWORK_NOT_APPROVED": 409,
+    # business safety
+    "ERR_SOD_VIOLATION": 403,
+    "ERR_STOREFRONT_REQUIRED": 422,
+    "ERR_BRAND_STANDARD_BELOW_THRESHOLD": 422,
+    "ERR_APPLICATION_INCOMPLETE": 422,
+    # business referential
+    "ERR_COLORWAY_NOT_AVAILABLE": 422,
+    # business temporal
+    "ERR_SLOT_OVERLAP_CONFLICT": 409,
+    "ERR_INSPECTOR_SCHEDULE_CONFLICT": 409,
+    "ERR_ALLOCATION_WINDOW_CLOSED": 422,
+    "ERR_ALLOCATION_WINDOW_NOT_OPEN": 422,
+    "ERR_ALLOCATION_WINDOW_OPEN": 422,
+    "ERR_WARRANTY_EXPIRED": 422,
+    "ERR_RETURN_WINDOW_CLOSED": 422,
+    "ERR_INSPECTION_WINDOW_NOT_REACHED": 422,
+    # business constraint
+    "ERR_BELOW_MINIMUM_QUANTITY": 422,
+    "ERR_PROOF_ROUND_EXHAUSTED": 422,
+    "ERR_CAPACITY_EXCEEDED": 422,
+    "ERR_CAPACITY_EXCEEDS_WINDOW": 422,
+    "ERR_INVALID_WINDOW_ORDER": 422,
+    "ERR_RETURN_RESOLUTION_MISMATCH": 422,
+    "ERR_PERSONALIZED_NOT_RETURNABLE": 422,
+    "ERR_TECHNOLOGY_MISMATCH": 422,
+    "ERR_DTC_RESERVE_EXCEEDS_TOTAL": 422,
+    # business fiscal
+    "ERR_CREDIT_LIMIT_EXCEEDED": 422,
+}
+
+
+def fail(error_id, message):
+    raise ApiError(error_id, ERROR_HTTP[error_id], message)

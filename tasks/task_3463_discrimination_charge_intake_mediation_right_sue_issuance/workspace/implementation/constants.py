@@ -1,0 +1,315 @@
+"""Pinned constants for the EEOC charge-processing implementation.
+
+Every threshold, enum member, and named value referenced by the code is
+defined here exactly once, with the values pinned by PRD.md / SCAFFOLD.yaml.
+"""
+
+# ---------------------------------------------------------------------------
+# Logical clock
+# ---------------------------------------------------------------------------
+CLOCK_BOOT_DEFAULT_ISO = "2026-09-01T00:00:00Z"
+
+# ---------------------------------------------------------------------------
+# Deadlines / windows
+# ---------------------------------------------------------------------------
+FEDERAL_DEFAULT_DEADLINE_DAYS = 180
+AGENCY_DEADLINE_CHOICES = (180, 300)
+EVIDENCE_RESPONSE_WINDOW_DAYS = 30
+RTS_COURT_FILING_DAYS = 90
+RTS_MIN_ELAPSED_DAYS = 180
+VACATE_WINDOW_DAYS = 10
+INTERVIEW_BUFFER_MINUTES = 30
+MAX_MEDIATION_ROUNDS = 2
+
+# ---------------------------------------------------------------------------
+# Jurisdictional size thresholds
+# ---------------------------------------------------------------------------
+TITLE_VII_MIN_EMPLOYEES = 15
+ADEA_MIN_EMPLOYEES = 20
+
+# ---------------------------------------------------------------------------
+# Employer size bands (inclusive lower bounds: 15/20/100/200/500 edges)
+# ---------------------------------------------------------------------------
+BAND_UNDER_15 = "UNDER_15"
+BAND_15_19 = "FROM_15_TO_19"
+BAND_20_100 = "FROM_20_TO_100"
+BAND_101_200 = "FROM_101_TO_200"
+BAND_201_500 = "FROM_201_TO_500"
+BAND_OVER_500 = "OVER_500"
+SIZE_BANDS = (
+    BAND_UNDER_15,
+    BAND_15_19,
+    BAND_20_100,
+    BAND_101_200,
+    BAND_201_500,
+    BAND_OVER_500,
+)
+BAND_EDGE_TITLE_VII = 15
+BAND_EDGE_ADEA = 20
+BAND_EDGE_CAP_T1_MAX = 100
+BAND_EDGE_CAP_T2_MAX = 200
+BAND_EDGE_CAP_T3_MAX = 500
+
+# ---------------------------------------------------------------------------
+# Remedy valuation
+# ---------------------------------------------------------------------------
+ANNUAL_INTEREST_RATE = "0.05"  # Decimal string
+INTEREST_DIVISOR_DAYS = 365
+CAP_TIER_CENTS = {
+    BAND_15_19: 5000000,
+    BAND_20_100: 5000000,
+    BAND_101_200: 10000000,
+    BAND_201_500: 20000000,
+    BAND_OVER_500: 30000000,
+}
+
+# ---------------------------------------------------------------------------
+# Investigation priority score
+# ---------------------------------------------------------------------------
+BASIS_SEVERITY_WEIGHT = {
+    "RETALIATION": 30,
+    "DISABILITY": 25,
+    "AGE": 20,
+    "SEX": 15,
+    "RACE": 15,
+    "COLOR": 15,
+    "RELIGION": 15,
+    "NATIONAL_ORIGIN": 15,
+    "GENETIC_INFO": 15,
+}
+AGE_TIER_10_MIN_DAYS = 90    # 0 points below 90 days
+AGE_TIER_20_MIN_DAYS = 180   # 10 points for 90..179
+AGE_TIER_35_MIN_DAYS = 365   # 20 points for 180..364; 35 at 365+
+AGE_POINTS_T0 = 0
+AGE_POINTS_T10 = 10
+AGE_POINTS_T20 = 20
+AGE_POINTS_T35 = 35
+OVERDUE_PER_REQUEST = 15
+OVERDUE_COMPONENT_CAP = 45
+SYSTEMIC_MULTIPLIER = "1.5"  # Decimal string
+SCORE_CEILING = 100
+ESCALATION_THRESHOLD = 80
+
+# ---------------------------------------------------------------------------
+# Systemic consolidation
+# ---------------------------------------------------------------------------
+CONSOLIDATION_MIN_CHARGES = 3
+CONSOLIDATION_MIN_SHARED_BASIS = 2
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+PAGE_DEFAULT_LIMIT = 10
+PAGE_MIN_LIMIT = 1
+PAGE_MAX_LIMIT = 100
+PAGE_DEFAULT_OFFSET = 0
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+ROLE_INTAKE_OFFICER = "IntakeOfficer"
+ROLE_CHARGING_PARTY = "ChargingParty"
+ROLE_RESPONDENT_REP = "RespondentRep"
+ROLE_MEDIATOR = "Mediator"
+ROLE_INVESTIGATOR = "Investigator"
+ROLE_DIRECTOR = "Director"
+ROLE_COMMISSIONER = "Commissioner"
+ROLE_STATE_AGENCY_OFFICER = "StateAgencyOfficer"
+ROLES = (
+    ROLE_PLATFORM_ADMIN,
+    ROLE_INTAKE_OFFICER,
+    ROLE_CHARGING_PARTY,
+    ROLE_RESPONDENT_REP,
+    ROLE_MEDIATOR,
+    ROLE_INVESTIGATOR,
+    ROLE_DIRECTOR,
+    ROLE_COMMISSIONER,
+    ROLE_STATE_AGENCY_OFFICER,
+)
+# Roles allowed to read a SEALED charge (and whose sealed reads auto-log).
+SEALED_PRIVILEGED_ROLES = frozenset(
+    {ROLE_INTAKE_OFFICER, ROLE_DIRECTOR, ROLE_COMMISSIONER}
+)
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+BASIS_CODES = (
+    "RACE",
+    "COLOR",
+    "RELIGION",
+    "SEX",
+    "NATIONAL_ORIGIN",
+    "AGE",
+    "DISABILITY",
+    "GENETIC_INFO",
+    "RETALIATION",
+)
+BASIS_AGE = "AGE"
+
+WORK_SHARING_POLICIES = ("EEOC_RETAINS_ALL", "DUAL_FILE_DEFAULT", "FEPA_EXCLUSIVE")
+POLICY_EEOC_RETAINS_ALL = "EEOC_RETAINS_ALL"
+POLICY_DUAL_FILE_DEFAULT = "DUAL_FILE_DEFAULT"
+POLICY_FEPA_EXCLUSIVE = "FEPA_EXCLUSIVE"
+
+# Charge case_status
+CHARGE_DOCKETED = "DOCKETED"
+CHARGE_IN_MEDIATION = "IN_MEDIATION"
+CHARGE_UNDER_INVESTIGATION = "UNDER_INVESTIGATION"
+CHARGE_DETERMINATION_REVIEW = "DETERMINATION_REVIEW"
+CHARGE_CONCILIATION = "CONCILIATION"
+CHARGE_DELEGATED_TO_FEPA = "DELEGATED_TO_FEPA"
+CHARGE_CLOSED_SETTLED = "CLOSED_SETTLED"
+CHARGE_CLOSED_NO_CAUSE = "CLOSED_NO_CAUSE"
+CHARGE_LITIGATION_REFERRED = "LITIGATION_REFERRED"
+CHARGE_RTS_ISSUED = "RTS_ISSUED"
+CHARGE_DISMISSED_UNTIMELY = "DISMISSED_UNTIMELY"
+CHARGE_DISMISSED_NO_JURISDICTION = "DISMISSED_NO_JURISDICTION"
+CHARGE_WITHDRAWN = "WITHDRAWN"
+CHARGE_STATUSES = (
+    CHARGE_DOCKETED,
+    CHARGE_IN_MEDIATION,
+    CHARGE_UNDER_INVESTIGATION,
+    CHARGE_DETERMINATION_REVIEW,
+    CHARGE_CONCILIATION,
+    CHARGE_DELEGATED_TO_FEPA,
+    CHARGE_CLOSED_SETTLED,
+    CHARGE_CLOSED_NO_CAUSE,
+    CHARGE_LITIGATION_REFERRED,
+    CHARGE_RTS_ISSUED,
+    CHARGE_DISMISSED_UNTIMELY,
+    CHARGE_DISMISSED_NO_JURISDICTION,
+    CHARGE_WITHDRAWN,
+)
+# Lifecycle terminal states (PRD section 3.2).
+CHARGE_TERMINAL_STATES = frozenset(
+    {
+        CHARGE_DISMISSED_UNTIMELY,
+        CHARGE_DISMISSED_NO_JURISDICTION,
+        CHARGE_CLOSED_NO_CAUSE,
+        CHARGE_RTS_ISSUED,
+        CHARGE_WITHDRAWN,
+    }
+)
+# States that count as "terminal" for the systemic consolidation/resolution
+# rule (PRD section 3.9): the lifecycle terminals plus CLOSED_SETTLED.
+SYSTEMIC_TERMINAL_CHARGE_STATES = CHARGE_TERMINAL_STATES | {CHARGE_CLOSED_SETTLED}
+# States from which a charge may be amended or withdrawn.
+CHARGE_WORKABLE_STATES = frozenset(
+    {
+        CHARGE_DOCKETED,
+        CHARGE_IN_MEDIATION,
+        CHARGE_UNDER_INVESTIGATION,
+        CHARGE_DELEGATED_TO_FEPA,
+    }
+)
+
+# Jurisdiction outcomes
+JURISDICTION_TIMELY_CONFIRMED = "TIMELY_CONFIRMED"
+JURISDICTION_DISMISSED_UNTIMELY = "DISMISSED_UNTIMELY"
+JURISDICTION_DISMISSED_NO_JURISDICTION = "DISMISSED_NO_JURISDICTION"
+
+# Investigation owners
+OWNER_EEOC = "EEOC"
+OWNER_FEPA = "FEPA"
+OWNER_NONE = "NONE"
+
+# Disclosure hold
+HOLD_NONE = "NONE"
+HOLD_SEALED = "SEALED"
+
+# Mediation
+MEDIATION_OFFERED = "OFFERED"
+MEDIATION_ACTIVE = "ACTIVE"
+MEDIATION_SETTLED = "SETTLED"
+MEDIATION_IMPASSE = "IMPASSE"
+MEDIATION_DECLINED = "DECLINED"
+MEDIATION_VACATED = "VACATED"
+MEDIATION_TERMINAL_STATES = frozenset(
+    {MEDIATION_IMPASSE, MEDIATION_DECLINED, MEDIATION_VACATED}
+)
+RESPONSE_PENDING = "PENDING"
+RESPONSE_ACCEPTED = "ACCEPTED"
+RESPONSE_DECLINED = "DECLINED"
+MEDIATION_RESPONSES = (RESPONSE_ACCEPTED, RESPONSE_DECLINED)
+CONCLUDE_OUTCOMES = ("SETTLED", "IMPASSE")
+
+# Mediation sessions
+SESSION_SCHEDULED = "SCHEDULED"
+SESSION_HELD = "HELD"
+SESSION_CANCELLED = "CANCELLED"
+
+# Investigation
+INVESTIGATION_OPEN = "OPEN"
+INVESTIGATION_GATHERING = "GATHERING"
+INVESTIGATION_SUSPENDED_MEDIATION = "SUSPENDED_MEDIATION"
+INVESTIGATION_CLOSED = "CLOSED"
+
+# Evidence requests
+EVIDENCE_REQUEST_TYPES = ("POSITION_STATEMENT", "RFI", "DOCUMENT_DEMAND")
+EVIDENCE_PENDING = "PENDING"
+EVIDENCE_OVERDUE = "OVERDUE"
+EVIDENCE_RESPONDED = "RESPONDED"
+EVIDENCE_WAIVED = "WAIVED"
+
+# Determinations
+DET_OUTCOME_CAUSE = "CAUSE"
+DET_OUTCOME_NO_CAUSE = "NO_CAUSE"
+DET_OUTCOME_UNABLE = "UNABLE_TO_DETERMINE"
+DETERMINATION_OUTCOMES = (DET_OUTCOME_CAUSE, DET_OUTCOME_NO_CAUSE, DET_OUTCOME_UNABLE)
+DET_DRAFT = "DRAFT"
+DET_PENDING_REVIEW = "PENDING_REVIEW"
+DET_RETURNED = "RETURNED"
+DET_APPROVED = "APPROVED"
+DETERMINATION_NON_TERMINAL_STATES = frozenset(
+    {DET_DRAFT, DET_PENDING_REVIEW, DET_RETURNED}
+)
+REVIEW_DECISIONS = ("APPROVE", "RETURN")
+DECISION_APPROVE = "APPROVE"
+DECISION_RETURN = "RETURN"
+
+# Conciliation
+CONC_INITIATED = "INITIATED"
+CONC_OFFER_TABLED = "OFFER_TABLED"
+CONC_COUNTERED = "COUNTERED"
+CONC_SETTLED = "SETTLED"
+CONC_FAILED = "FAILED"
+CONCILIATION_OPEN_STATES = frozenset({CONC_INITIATED, CONC_OFFER_TABLED, CONC_COUNTERED})
+CONCILIATION_ACCEPTABLE_STATES = frozenset({CONC_OFFER_TABLED, CONC_COUNTERED})
+SIDE_COMMISSION = "COMMISSION"
+SIDE_RESPONDENT = "RESPONDENT"
+
+# Remedy package
+VALUATION_PROVISIONAL = "PROVISIONAL"
+VALUATION_FINAL = "FINAL"
+
+# Right-to-sue notices
+RTS_BASIS_ELAPSED = "ELAPSED_180_DAYS"
+RTS_BASIS_DIRECTOR = "DIRECTOR_DISCRETION"
+RTS_BASIS_AUTO = "AUTO_ON_DISMISSAL"
+RTS_ISSUED = "ISSUED"
+RTS_EXPIRED = "EXPIRED"
+RTS_SYSTEM_REQUESTER = "system"
+
+# Settlement paths
+SETTLED_VIA_MEDIATION = "MEDIATION"
+SETTLED_VIA_CONCILIATION = "CONCILIATION"
+
+# Systemic cases
+SYSTEMIC_OPENED = "OPENED"
+SYSTEMIC_EXPANDING = "EXPANDING"
+SYSTEMIC_CONSOLIDATED = "CONSOLIDATED"
+SYSTEMIC_RESOLVED = "RESOLVED"
+
+# Disclosures
+DISCLOSURE_COURT_ORDER = "COURT_ORDER"
+DISCLOSURE_FEPA_WORK_SHARE = "FEPA_WORK_SHARE"
+DISCLOSURE_PARTY_CONSENT = "PARTY_CONSENT"
+DISCLOSURE_INTERNAL_ACCESS = "INTERNAL_ACCESS"
+# Values a client may supply on POST /eeoc/charges/{id}/disclosures.
+DISCLOSURE_CLIENT_BASES = (
+    DISCLOSURE_COURT_ORDER,
+    DISCLOSURE_FEPA_WORK_SHARE,
+    DISCLOSURE_PARTY_CONSENT,
+)

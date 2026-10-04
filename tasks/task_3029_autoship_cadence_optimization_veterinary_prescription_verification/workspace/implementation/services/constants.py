@@ -1,0 +1,74 @@
+"""Constants transcribed from SCAFFOLD.yaml SS1.3/SS1.4 and PRD SS2-SS3."""
+
+# --- projections (SS1.3 dosage_mg_per_day / run_cadence_days) ---------------
+CAT_SPECIES_MULTIPLIER = 1.0
+OTHER_SPECIES_MULTIPLIER = 1.2
+MG_PER_DAY_PRECISION = 2
+MIN_WEIGHT_KG = 2.5
+DOSE_TIER_MG = 30
+DOSE_TIER_LT_MG = 5
+MIN_CYCLE_DAYS = 14
+MAX_EQUIVALENT_DAYS = 84
+UNITS_PER_DOSE = 1
+
+# --- cadence prompts (SS1.3 cadence_prompt_due_days_delta) ------------------
+OVERDUE_URGENT_DAYS = 28
+OVERDUE_SOON_DAYS = 14
+PROMPT_ALIGNED_WINDOW_DAYS = 3
+MAX_PROMPT_DEFERRAL_DAYS = 21
+
+# --- money (SS1.3 autoship_discount_cents / autoship_promo_reconciliation) --
+FIRST_ORDER_DISCOUNT_RATE = 0.35
+RECURRING_DISCOUNT_RATE = 0.10
+PROMO_DISCOUNT_CENTS = 1500
+PROMO_MIN_SUBTOTAL_CENTS = 3500
+PROTECTION_GUARD_RATE = 0.05
+COLD_PACK_FEE_CENTS = 599
+EXPEDITED_SHIPPING_FEE_CENTS = 990
+
+# --- cold chain (SS1.3 cold_pack_units) -------------------------------------
+PACKING_BUFFER_HOURS = 24.0
+AMBIENT_EXPECTED_C = 25.0
+PACK_TARGET_TEMPERATURE_C = 4.0
+DEGRADATION_HOURS_PER_DEGREE_C = 1.5
+COOLING_BURDEN_HOURS_PER_DEGREE_C = 100.0
+
+# --- settlement (SS1.3 order_cancellation_settlement) -----------------------
+FULL_PRICE_LINE_LIMIT = 1
+HALF_PRICE_LINE_LIMIT = 1
+HALF_PRICE_LINE_FACTOR = 0.5
+PACKING_FEE_REFUND_RATE = 0.0
+
+# --- cadence advance (SS1.3 advance_item_cadence) ---------------------------
+DAILY_CADENCE_DAYS = 14
+DEFERRED_CADENCE_DAYS = 28
+UNIT_PRICE_DEFERRAL_THRESHOLD_CENTS = 1000
+
+# --- intervals (SS1.3 transit_window_dates / verification_expiry_stamp) -----
+TRANSIT_DAYS = 2
+TRANSIT_BUFFER_DAYS = 1
+AUTHORIZATION_VALID_DAYS = 365
+
+# --- business caps (SS1.4) --------------------------------------------------
+AUTHORIZATION_GRACE_DAYS = 365
+MAX_RX_UNITS_PER_ORDER = 1000000
+CALLBACK_ATTEMPT_CAP = 3
+
+# --- enumerations -----------------------------------------------------------
+CADENCE_VALUES = (14, 21, 28, 42, 56, 84)
+SPECIES_VALUES = ("DOG", "CAT", "HORSE", "BIRD")
+MEDICATION_SCOPES = ("OTC", "PRESCRIPTION")
+DRUG_SCHEDULES = ("NONE", "CII", "CIII", "CIV", "CV")
+SCRIPT_SOURCES = ("UPLOADED_SCRIPT", "WRITTEN_PRESCRIPTION")
+CANCELLATION_REASONS = ("CUSTOMER_REQUEST", "NON_DELIVERY", "PET_PASSED")
+REFUND_DESTINATIONS = ("WALLET", "ORIGINAL_PAYMENT")
+REVIEW_OUTCOMES = ("APPROVED", "REJECTED")
+VET_STATUSES = (
+    "LISTED",
+    "VETERINARIAN_VERIFIED",
+    "SUSPENDED",
+    "RETIRED",
+    "BLOCKED",
+)
+AUTHORIZING_VET_STATUSES = ("LISTED", "VETERINARIAN_VERIFIED")
+SITE_STATUSES = ("ACTIVE", "RESTRICTED", "CLOSED")

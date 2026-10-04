@@ -1,0 +1,415 @@
+# Connected Fitness Hardware API — Product Requirements Document
+
+## 1. Introduction
+
+This document specifies the product requirements for the Connected Fitness Hardware API, the operational backbone behind a vertically integrated connected-fitness business. The platform sells, delivers, installs and activates cardio hardware into private households, then keeps that hardware fed with a subscription-governed content library. A single household can hold one membership under which several people stream at once, several machines sit in different rooms, and one member may be paying the hardware off in installments. The API is the contract through which every one of those relationships is created, gated and terminated.
+
+The commercial model mixes one-time hardware revenue, recurring subscription revenue and installment credit. That mix is the source of the hardest requirements in this document. A delinquent installment plan must throttle new purchases without ever touching the safety of a machine that someone is standing on, and a paused or cancelled membership must lock the content library without ever disabling a repair dispatch. Delivery economics add a second axis: the same order carries a provisional quote that is struck before anyone knows which zone the van will drive to, and a final captured total struck once the actual delivery has happened, and the two are allowed to disagree. These rules are stated once as global principles and then woven into the lifecycle narratives that follow.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must be authenticated through two mandatory HTTP headers. `X-User-ID` identifies the acting principal and `X-User-Role` declares the capacity in which that principal is acting. If either header is absent, or if `X-User-Role` carries a value that is not one of the declared roles, the request is refused with `ERR_UNAUTHENTICATED` (HTTP 401). A well-formed request whose role is simply not permitted for the operation it attempts is refused with `ERR_UNAUTHORIZED` (HTTP 403) instead.
+
+The system recognises exactly five roles: `MembershipOwner`, `ServiceTechnician`, `Instructor`, `PlatformAdmin` and `Anonymous`.
+
+When `X-User-Role` is `MembershipOwner`, `X-User-ID` is the `id` of the acting `Membership`. Ownership checks on any resource that references a `Membership` compare that resource's foreign-key field to `X-User-ID`, so a household can only read and mutate the memberships, household users, devices, hardware orders, financing plans and enrollments that hang beneath its own membership row. `MembershipOwner` is the only role whose identity is backed by a persisted entity.
+
+The remaining four roles are opaque. When `X-User-Role` is `ServiceTechnician`, `X-User-ID` is an opaque field-crew operator identifier not tied to any persisted entity, and the server never compares it to an entity `id`. The same holds for `Instructor`, whose identifier names the person owning an instructor licensing window but is not resolved against any row; for `PlatformAdmin`, whose identifier names an operations administrator covering parts inventory, underwriting, refurbishment resale and the logical clock; and for `Anonymous`, the unauthenticated caller that is permitted only to consume a verification token that was already issued by someone else. None of these four opaque identifiers participate in ownership comparison.
+
+The `Anonymous` role exists solely so that the verification step for a newly added household user can be exercised without a session. Everywhere else it is refused with `ERR_UNAUTHORIZED`. Note that a `MembershipOwner` may add household users to its own membership but may not confer ownership of a different household; the entity-backed identity rule above is what enforces that.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+Collection reads are paginated through query parameters. The `limit` parameter caps the number of items returned and defaults to 10 when omitted; its minimum accepted value is 1 and its maximum is 100. The `offset` parameter states how many leading items to skip and defaults to 0. Unless a specific endpoint description says otherwise, every list endpoint returns its resources ordered by creation timestamp ascending, so the oldest row appears first and the newest row last.
+
+Every paginated list response carries four pagination fields inside the `meta` object of the envelope: `limit`, `offset`, `total_count` and `has_more`. `total_count` reports the number of resources matching the query across all pages, not merely the number on the current page, and `has_more` is a boolean that is true while further pages remain.
+
+### 2.4. Household Identity, Membership Ownership and Member Roles
+
+A membership is the root of a household. It is created with a `household_name` for display, a `billing_email` used for all billing correspondence, a `plan_tier` that must be either `PLUS` or `BUSINESS`, and a `monthly_fee_cents` stating the recurring fee in whole cents. An optional `concurrent_limit_override` may be supplied at creation, and its default is null, which means the household accepts whatever at-once stream allowance its plan tier grants. A new membership is `PROVISIONAL` with posture `OPEN`, an `active_user_count` of zero, an open `safety_gate_open` flag, and billing anchors already stamped: `billing_cycle_start_at` is set to the current logical clock and `paid_through_at` is set 30 days beyond it.
+
+People are attached to a membership as household users. Each carries a `display_name` shown on the leaderboard, a unique `email`, and a `role` drawn from `OWNER` and `MEMBER`, defaulting to `MEMBER`. Exactly one `OWNER` may exist per membership at any time; an attempt to add a second owner is refused with `ERR_OWNER_ALREADY_EXISTS`. A newly created household user begins in `PENDING_VERIFICATION` with `verified` set to false, an `eviction_count` of zero, and a server-minted `verification_token` returned in the creation response. The token is consumed later by a verification request that supplies `verification_token`; that step sets `verified` to true and moves `status` to `ACTIVE`. Until verification lands, the user nonetheless counts toward the household's `active_user_count`, because the count deliberately includes both `ACTIVE` and `PENDING_VERIFICATION` members.
+
+A household user may hold a `streaming_device_serial` naming the machine currently being streamed on, null when the person is not streaming. When a user is suspended the platform records why in `suspended_reason`, one of `EVICTED_BY_CONCURRENCY`, `MEMBERSHIP_CANCELLED` or `REACTIVATION_UNPAID`.
+
+### 2.5. The Stream Concurrency Ceiling and Eviction Discipline
+
+The allowed at-once stream count for a household is the field `concurrent_limit_effective`. Its resolution is: when the membership's `concurrent_limit_override` is non-null, that override is the effective limit; otherwise the plan-tier default applies, which is 4 streams for `PLUS` and 10 streams for `BUSINESS`. The companion counter `active_user_count` counts household users whose status is `ACTIVE` or `PENDING_VERIFICATION`; `SUSPENDED` and `REMOVED` users are excluded from that count.
+
+When a start-stream request would raise the household past its ceiling, the platform does not simply refuse. The start-stream payload names the machine the user is streaming on through `device_serial`. It evicts one non-owner member: the eviction candidate set is restricted to household users on the same membership whose `role` is `MEMBER` and whose status is `ACTIVE`, excluding the requesting user itself. Candidates are ordered by creation timestamp ascending, with ties broken by `eviction_count` descending. The chosen candidate moves to `SUSPENDED` with `suspended_reason` of `EVICTED_BY_CONCURRENCY`, its `streaming_device_serial` is cleared, and its `eviction_count` is incremented by one. The `OWNER` is never evicted under any circumstance. If the candidate set is empty, no eviction is possible and the request is refused with `ERR_CONCURRENT_LIMIT_EXCEEDED` (HTTP 409).
+
+Restoring an evicted user is a separate act that is admitted only when the restored user still fits under the ceiling — a restore request that would breach the limit is refused with `ERR_CONCURRENT_LIMIT_EXCEEDED`. The member counter `total_streams_observed` is a different measure altogether: it is the sum of `total_workouts` across every device on the membership whose `activation_status` is `ACTIVE` or `LOCKED`.
+
+### 2.6. Membership Posture and the Device Entitlement Latch
+
+The membership exposes a derived aggregate gate called `posture`, taking one of `OPEN`, `RESTRICTED` or `FROZEN`. Posture is recomputed on every mutation that touches membership state, whether directly on the membership or on any of its devices, household users, financing plans or class enrollments. `FROZEN` is selected when the membership status is `CANCELLED` or `TERMINATED`, or when any financing plan on the membership has reached `DEFAULTED`, or when the freeze reason is set. `RESTRICTED` is selected when the membership status is `PAUSED` or `DELINQUENT`, or when `unpaid_financing_count` is at least 1. In every other case the posture is `OPEN`. `RESTRICTED` blocks the creation of new hardware orders and new financing plans but leaves content streaming fully enabled — restriction is not a lockout. `FROZEN` is a lockout: content stops for the household's devices.
+
+The reason a household is frozen is recorded in `attr_frozen_reason`, which is `FINANCING_DEFAULT` when a plan has defaulted, `OWNERSHIP_DISPUTE` when an ownership dispute has been raised, and null when the freeze is merely a consequence of the membership being cancelled or terminated. A cancelled membership therefore carries posture `FROZEN` with `attr_frozen_reason` null, whereas a defaulted plan produces `FROZEN` with `attr_frozen_reason` of `FINANCING_DEFAULT`.
+
+Each device carries a boolean latch, `entitlement_lock`, that is toggled independently of the device's activation state. The expression `content_access_allowed` is the derived entitlement the client UI reads: it is true only when the membership posture is `OPEN` or `RESTRICTED` and the device's `entitlement_lock` is false, and false otherwise. This field is a user-interface affordance and nothing more. It never gates the creation of a service order, the reservation of a part, the scheduling of a repair, the `safety_gate_open` flag, or the scheduling of a safety-critical repair.
+
+### 2.7. Hardware Safety Supremacy Over Financing
+
+Several invariants in this system exist to guarantee that commercial distress can never degrade the physical safety of a machine someone is standing on. The membership carries `safety_gate_open`, which is true while hardware safety functions remain enabled and which no delinquency or financing state may ever clear. The financing plan carries `safety_disable_latched`, a reserved latch that must remain false in every financing state — delinquency never flips it. The service order carries `safety_functions_maintained`, which is always true, because neither service dispatch nor financing delinquency may disable hardware safety functions.
+
+Accordingly, any request that would clear `safety_gate_open` or set `safety_disable_latched` to true is refused with `ERR_SAFETY_DISABLE_FORBIDDEN` (HTTP 409). This clause is evaluated before any financing or entitlement logic that could otherwise mask it, so a caller attempting to disable safety through a financing or lifecycle operation surfaces as a safety refusal rather than as a posture or state complaint. A `DEFAULTED` plan locks content, but every safety path — dispatch, parts reservation, repair scheduling and safety-critical scheduling — stays open.
+
+### 2.8. Monetary Precision and the Dual-Variant Order Total
+
+All monetary quantities in this API are integer counts of cents. No monetary value is ever a fractional or floating-point number in a payload. Where a calculation produces a fractional intermediate result, the final stored amount is rounded half up to zero decimal places — that is, an exact half is rounded away from zero and any remainder below a half is discarded. Quantities, counts, depths and points are likewise integers; percentages are integers. Timestamps are the only non-integer scalars in the model and are formatted as ISO 8601 in UTC at second precision.
+
+Two monetary rules deserve special emphasis because they determine the shape of a hardware order. First, the advisory stair-carry surcharge and assembly charge are computed on a taxed basis whose basis factor is 1.0825, and each of the two additive components is rounded half up to a whole cent *before* the two are summed and before the cap is applied — rounding the combined sum in one step produces a different, incorrect answer and must not be done. Second, the order total is computed on a pinned evaluation order that avoids a circular definition: the finance charge depends on a tier, the tier depends on the pre-finance basis, and the pre-finance basis excludes the finance charge. The tier is keyed on the pre-finance basis (subtotal plus delivery legs plus stair carry plus assembly), never on the post-finance total, so the computation terminates after exactly one pass. The tier rate is 1000 basis points when the pre-finance basis is at least 300,000 cents and 500 basis points otherwise. Partial-percent rates are never used: a plan with an APR of 0 basis points is interest-free, and interest only accrues when the financing method is the scheduled-installment method.
+
+### 2.9. Temporal Windowing Discipline
+
+Every time interval in this system is half-open. A window stated as starting at one instant and ending at another includes its start instant and excludes its end instant, so two windows that merely touch end-to-start do not overlap. Personnel and instructors cannot be double-booked: a proposed window for a crew or an instructor is refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409) when it intersects an existing open window belonging to the same crew or the same instructor.
+
+Three further temporal ceilings apply. A requested membership pause must end after it starts and must not exceed 60 days in length; a pause request outside those bounds is refused with `ERR_PAUSE_WINDOW_INVALID` (HTTP 409). A delivery appointment may be rescheduled at most four times in total — a fifth reschedule is refused with `ERR_RESCHEDULE_LIMIT` (HTTP 409). An operations step requested outside the window it requires — starting an installation visit before its scheduled start, for example, or consuming an on-demand class outside its library window — is refused with `ERR_WINDOW_NOT_OPEN` (HTTP 409). An on-demand class library window remains open for 24 hours after the session's scheduled end, but it may never outlive the instructor's licensing window: the later of the two instants is discarded and the license window end prevails.
+
+The system maintains a logical clock rather than reading real wall-clock time. If the clock is never set, its starting value is exactly the first instant of 1 September 2026 in UTC, and the server must not silently fall back to the machine's real time under any circumstance. All window comparisons, prorations and staleness computations read that logical clock.
+
+### 2.10. Certification Lineage Integrity
+
+Refurbished units are traced through a self-referential link: a device records the `certifying_device_id` of the unit that was returned to seed it. This lineage is a chain, and its length from a batch's source device is the `certification_chain_depth`. The chain is bounded at 3 hops. A certification request that would require a deeper chain is refused with `ERR_CERTIFICATION_CHAIN_EXCEEDED` (HTTP 409), and a lineage that loops back on itself — where the depth recursion would revisit the same device through its own edge — is refused with `ERR_CERTIFICATION_CYCLE` (HTTP 409) rather than being followed indefinitely. A batch may only be opened over a source device that is itself eligible for refurbishment: a source that is neither `DECOMMISSIONED` nor already resale-originated is refused with `ERR_CERTIFYING_DEVICE_NOT_ELIGIBLE` (HTTP 409).
+
+### 2.11. Resource Addressability, Nested Retrieval and Common Properties
+
+When a request path names more than one resource — for instance a parent identifier followed by a child identifier — the system validates the identifier segments strictly from left to right. The first segment that does not resolve to an existing row aborts the request with `ERR_RESOURCE_NOT_FOUND` (HTTP 404), and no attempt is made to resolve later segments. A request addressing a child under a non-existent parent therefore reports the parent's absence, never the child's. Body-supplied foreign keys are resolved with the same rigour, and an unresolvable body reference also yields `ERR_RESOURCE_NOT_FOUND`.
+
+Every entity in this model carries the common system-managed fields. `id` is a server-minted UUID with no type prefix or other decoration. `created_at` is an ISO 8601 UTC timestamp with second precision recording when the row was first created. `updated_at` is an ISO 8601 UTC timestamp recording when the row was last modified, and it is refreshed by any change to the row's properties, including changes to derived or computed fields. `version` is an integer that begins at zero and is incremented by one on every mutation of the row; it is the basis of the concurrency control described next. No entity in this system is immutable after creation, so all of them expose `updated_at` and `version`; there is no entity here that omits either field.
+
+### 2.12. Optimistic Concurrency Control
+
+Four membership lifecycle writes and one device write are guarded against lost updates by optimistic concurrency control, and the guard is not optional on those endpoints: the request body must carry the version field and the server must compare it to the target row's current `version`.
+
+Activation, pausing, cancellation and reactivation each require `expected_membership_version` carrying the membership version the caller last observed. If the membership's current `version` has advanced past the supplied value — because a linkage or a derivative recompute legitimately moved the membership forward — the request is rejected with `ERR_MEMBERSHIP_STALE_VERSION` (HTTP 412). The pause and cancellation variants are guarded for a specific reason: their proration credits are computed from the membership's current cycle anchors, and a stale anchor would yield a wrong refund. Likewise, linking a device serial to a membership requires `expected_device_version` carrying the device version the caller last observed, and a device whose version has since advanced causes the link to be rejected with `ERR_DEVICE_STALE_VERSION` (HTTP 412), so a serial is never bound on the strength of a device row the caller has not observed.
+
+Two further writes accept a membership version field without being among the guarded set: a membership resume accepts `expected_membership_version`, and a redemptive-credit redemption accepts `expected_membership_version`, each carrying the membership version the caller last observed. No other endpoint in this API takes a version field in its request body, and supplying one to an endpoint not listed here is treated as an unknown field and refused with `ERR_INVALID_REQUEST`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. From Quote to Installation: Orders, Delivery Windows and Field Charges
+
+A `MembershipOwner` places a hardware order against its own membership by supplying the `hardware_sku` it wants, a `subtotal_cents` stating the hardware price before any service charge, and optionally a `device_id`; the `financing_method` defaults to `FULL_PAYMENT` and may instead be `FINANCE_SCHEDULED`. The order opens in `PLACED`. At that instant the platform writes `quote_total_cents`, the provisional total, using the forward-looking variant of the order-total rule: because no zone is known yet the delivery component is zero, so the pre-finance basis is merely the subtotal. The order's `delivery_fee_cents` is zero, `stair_carry_fee_cents` and `assembly_fee_cents` are both zero by the as-designed constants, and the finance charge is zero unless the financing method is `FINANCE_SCHEDULED`, in which case it is the pre-finance basis multiplied by the tier rate — 1000 basis points when that basis is at least 300,000 cents, and 500 basis points otherwise — divided by the ten-thousand basis-point scale and rounded half up to whole cents. Nothing in the later delivery step overwrites this provisional figure; both totals remain readable side by side forever.
+
+Orders may not be placed at all while the household is commercially distressed. When the membership posture is `RESTRICTED` or `FROZEN`, order placement and financing origination are refused with `ERR_POSTURE_RESTRICTED` (HTTP 409). This gate is how delinquency throttles new hardware sales without touching content or safety.
+
+A `ServiceTechnician` then creates the installation window by supplying the `hardware_order_id` being fulfilled and a proposed half-open interval from `start_at` to `end_at`, together with the `zone` the crew will drive to — `METRO`, `SUBURBAN` or `RURAL` — and a `technician_crew_code`. The optional `stair_flights` defaults to zero and `has_elevator` defaults to false. The appointment opens in `REQUESTED`, and the mere act of creating it advances the parent order from `PLACED` to `DELIVERY_SCHEDULED`. The zone fixes the appointment's `delivery_legs`: one leg in `METRO`, two in `SUBURBAN`, three in `RURAL`. A proposed window that collides with another open appointment for the same crew is refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409).
+
+Confirming the window is a separate step. Scheduling moves the appointment from `REQUESTED` to `SCHEDULED` and requires two things: the start instant must precede the end instant, and the half-open interval must not intersect any other appointment for the same `technician_crew_code` that is already `SCHEDULED` or `IN_PROGRESS`. The visit itself begins with a start step that moves the appointment from `SCHEDULED` to `IN_PROGRESS`, admitted only once the logical clock has reached `start_at`; an early start is refused with `ERR_WINDOW_NOT_OPEN` (HTTP 409).
+
+When a visit cannot proceed, the crew records the `failure_reason` and the appointment moves from `IN_PROGRESS` to `FAILED`. The legal reasons are `CUSTOMER_NOT_HOME`, `ACCESS_DENIED`, `UNSUITABLE_SPACE`, `STAIR_CAP_EXCEEDED` and `CREW_UNSAFE`. Critically, this transition leaves the parent order untouched in `DELIVERY_SCHEDULED` — a failed visit is a field event, not an order event, and it does not increment `reschedule_count` either, because a failure is not a reschedule.
+
+Recovery runs through rescheduling. A reschedule supplies a fresh `start_at` and `end_at`, moves the appointment from `FAILED` back to `SCHEDULED`, and increments `reschedule_count` by one. It is admitted only while `reschedule_count` is below 4, and the new half-open interval must not collide with another open appointment for the same crew. A fifth reschedule is refused with `ERR_RESCHEDULE_LIMIT` (HTTP 409). Because the appointment has by then returned to `SCHEDULED`, the order's `status` remains `DELIVERY_SCHEDULED` throughout the whole fail-and-retry cycle.
+
+The delivery charge that this appointment will eventually attract has three interacting inputs and is worth stating in full. The zone fixes a base rate — 4500 cents for `METRO`, 3600 for `SUBURBAN`, 3000 for `RURAL` — and also fixes the number of legs described above. The hardware contributes a weight in units, which is 1 for `BIKE` and `REFURB_BIKE` and 2 for `TREAD`, `REFURB_TREAD` and `ROWER`. A per-leg tier rate depends on the leg count: 1500 cents at one leg, 1200 at two legs, and 900 at three or more legs. The delivery fee is the lesser of two candidate quantities: the leg count multiplied by the zone base rate, and the zone base rate plus the weight units multiplied by the tier rate. No rounding step intervenes; the result is exact to the cent.
+
+A pre-purchase advisory quote is available without creating anything. A caller supplies `hardware_sku`, `zone`, `stair_flights`, `has_elevator` and an optional `assembly_required` flag, and receives back `delivery_fee_cents`, `stair_carry_fee_cents`, `assembly_fee_cents` and `quote_total_cents` as a pure preview that writes nothing to any table. The advisory stair figure uses the same taxed basis and the same cap as the post-delivery version, and the same rule that the two additive components are rounded before they are summed.
+
+The stair-carry surcharge deserves its own statement because the order of its arithmetic is pinned. The first flight is always charged at a flat 500 cents; a flight is waived when the building has a working elevator, so the eligible count is the number of flights reduced by one if `has_elevator` is true. Of the eligible flights, the first is covered by the flat charge and only the remainder is billable, each billable flight charged at 250 cents. Both components are scaled by the 1.0825 taxed basis, each is rounded half up to a whole cent *separately* — the flat component on its own and the billable component on its own — and only then are the two rounded amounts added. The sum is finally capped at 2500 cents. Rounding the pre-scaled sum in a single step yields a different, incorrect number and must not be done. Under the shipped configuration, however, the order's `stair_carry_fee_cents` and `assembly_fee_cents` are both pinned to zero on every order, so this formula is exposed only as the advisory figure returned by the quote preview and is never copied onto an order total.
+
+### 3.2. Closing the Visit: Completion Cascades, Warranty and Damage
+
+The technician closes the visit by recording a `completion_grade` of `CLEAN` or `DAMAGED`, moving the appointment from `IN_PROGRESS` to `COMPLETED`. One safety clause gates the close: the carry itself may not exceed five stair flights unless the building has a working elevator. Concretely, completion requires that `stair_flights` is at most 5 or that `has_elevator` is true; when neither holds the request is refused with `ERR_STAIR_CAP_EXCEEDED` (HTTP 409). This is the stagger-carry safety cap, and it exists so that a crew is never asked to hand-carry an unbounded number of flights.
+
+A successful completion cascades across three levels of the model, and each hop is part of the contract. The physical unit moves from `UNASSIGNED` to `DELIVERED`, its `provenance_source` is stamped `NEW_SALE`, its `activated_at` is set to the logical clock, and its `warranty_expires_at` is set exactly 365 days beyond that instant. The parent order moves from `DELIVERY_SCHEDULED` to `DELIVERED`, and it is here — and only here — that the chronological variant of the order total runs: the order's `delivery_fee_cents` is written from the delivery charge for the actual zone, and its `captured_total_cents` is written on the same pinned pre-finance basis used at order time, now with a non-zero delivery component. Because the forward variant saw zero delivery legs and a smaller basis, the two totals legitimately disagree for any non-`METRO` zone and may even fall on opposite sides of the 300,000-cent tier boundary; neither is revised in place and both stay readable. The order's `finance_charge_cents` is then the captured total minus the subtotal minus the delivery fee, floored at zero so it can never go negative.
+
+The delivered unit records its own delivery instant, and the warranty clock starts from that instant rather than from the order date. That distinction matters when a unit is delivered long after it was ordered: a `NEW_SALE` warranty is always measured from `delivered_at`, not from the moment the order was placed.
+
+A trade-in attached to the order carries a precondition the crew cannot skip. The order's `return_device_id` must be either null or must resolve to a device whose `activation_status` is `ACTIVE` or `LOCKED`; a trade-in must be a live unit, and a returned unit in any earlier or terminal state is not acceptable.
+
+When the recorded grade is `DAMAGED`, the platform automatically opens a service order against the delivered device with `reported_fault_code` of `FRAME_CRACK`. This is the one path by which a delivery creates a repair, and it does so without any separate dispatch request from the crew. That automatically-seeded row is a full member of the service-order lifecycle and is treated exactly like a directly reported fault from that point onward.
+
+An order that was delivered may later become the subject of an underwriter's refund dispute. A platform administrator records the outcome through `resolution`, which sets `refund_dispute_status` to `FILED`, `DENIED` or `APPROVED`; the field starts at `NONE`. A `DENIED` outcome latches the order against any later redemptive credit. When a credit is then requested — supplying `redeem_credit_cents` and the caller's `expected_membership_version` — two gates apply in a fixed order. The fiscal dispute gate is evaluated first, so an order whose dispute resolution is `DENIED` is refused with `ERR_REFUND_DISPUTE_DENIED` (HTTP 409) even when the household would also have blocked it; only after that gate clears is the purchase gate evaluated, and a membership in `RESTRICTED` or `FROZEN` posture causes the redemption to be refused with `ERR_PURCHASE_BLOCKED` (HTTP 409). Issuing a credit advances the membership's `version`.
+
+### 3.3. Binding Hardware to a Household: Minting, Linking and Activation
+
+A device enters the world minted against a membership. A technician supplies the `hardware_sku` and a globally unique `serial`, and the row opens in `UNASSIGNED` with `condition` of `NEW`, `entitlement_lock` true, `resale_cycle_count` zero and `total_workouts` zero. Its `content_access_allowed` is false until the unit is both linked and covered by an activated household. The legal `hardware_sku` values are `BIKE`, `TREAD`, `ROWER`, `REFURB_BIKE` and `REFURB_TREAD`, and a refurbishment SKU is only ever legal on a device that originated as a resale.
+
+Linking binds a delivered machine to a household. The request supplies the device's `serial` again as a cross-check, the `membership_id` it is being bound to, and the caller's `expected_device_version`. The unit moves from `DELIVERED` to `LINKED`, its `membership_id` is set from the payload, and `activated_at` is stamped with the logical clock. Three conditions hold. The device must be in `DELIVERED`. The supplied serial must match the device's registered `serial` exactly — any divergence is refused with `ERR_DEVICE_SERIAL_MISMATCH` (HTTP 409). And the receiving membership must be `PROVISIONAL`, `ACTIVE` or `REACTIVATED`. Because a device may only be delivered against an owned membership, the delivery precondition that the unit's membership be non-null is what makes any later link possible. Household users sitting in `PENDING_VERIFICATION` on the receiving household are left untouched by linking — as with activation, verification is never implied.
+
+Activation turns a household's hardware estate live. A `MembershipOwner` activates a `PROVISIONAL` membership, supplying the caller's `expected_membership_version`. Three conditions must hold. The membership must be `PROVISIONAL`; a second sequential activation observes `ACTIVE` and is refused by this same clause, surfacing as `ERR_INVALID_STATE` (HTTP 409). The household must have at least one user counting toward `active_user_count`, that is, at least one household user whose status is `ACTIVE` or `PENDING_VERIFICATION`. And at least one device whose `membership_id` matches the membership must have reached `LINKED` or `ACTIVE`, because activation requires a linked device. On success the membership becomes `ACTIVE`, its billing anchors are re-stamped to the logical clock and to thirty days beyond it, every `LINKED` device on the membership becomes `ACTIVE` with its `entitlement_lock` cleared, and the posture recomputes to `OPEN`. A device may only enter `ACTIVE` out of `LINKED` when its parent membership was `PROVISIONAL` and its `membership_id` equals that membership.
+
+Activation also closes the order. When the order's own device has been linked to the same membership the order was placed under, and that membership then activates, the order moves from `DELIVERED` to its terminal `ACTIVATED` state. Three conditions hold: the device's `membership_id` must equal the order's `membership_id`, exactly as the cross-entity ownership rule requires; the device must have reached `LINKED` or `ACTIVE`; and the order must either be paid in full — its `financing_method` being `FULL_PAYMENT` — or already carry a financing plan in `ORIGINATED`, `CURRENT` or `DELINQUENT` status. `ACTIVATED` and `CANCELLED` are the two terminal states of an order, and any further transition from either is refused with `ERR_ALREADY_TERMINAL` (HTTP 409).
+
+Once live, a device's content access tracks the household. Pausing or cancelling moves every `ACTIVE` device to `LOCKED` and sets its `entitlement_lock`, which recomputes `content_access_allowed` to false. Resuming or reactivating moves every `LOCKED` device back to `ACTIVE` and clears the latch, recomputing `content_access_allowed` to true. A device that re-enters `ACTIVE` on a resale activation or a resale warranty reset does so from `ACTIVE` itself and recomputes its content flag from the parent posture. The device's state machine therefore rides two parallel dimensions that move independently: the `activation_status` pipeline through `UNASSIGNED`, `DELIVERED`, `LINKED`, `ACTIVE` and `LOCKED` to the terminal `DECOMMISSIONED`, and the boolean `entitlement_lock` toggled by household events rather than by the pipeline.
+
+### 3.4. Pausing, Cancelling and Reactivating a Household
+
+Pausing banks a credit. A `MembershipOwner` pauses an `ACTIVE` membership by supplying `pause_start_at`, `pause_end_at` and the caller's `expected_membership_version`. The request requires three things: the membership is `ACTIVE`; the household's `unpaid_financing_count` is zero, because a household carrying a `DELINQUENT` or `DEFAULTED` plan may not pause and such an attempt is refused with `ERR_UNPAID_FINANCING_BLOCK` (HTTP 409); and the requested pause window ends after it starts and spans at most 60 days, else the request is refused with `ERR_PAUSE_WINDOW_INVALID` (HTTP 409). On success `pause_started_at` is stamped from the logical clock, posture moves to `RESTRICTED`, every `ACTIVE` device is locked, and `accrued_pause_credit_cents` is banked by the unused-days variant of the proration: the exact number of days remaining until `paid_through_at` is measured, rounded *up* to the next whole day, capped at 30, divided by 30, multiplied by the household's `monthly_fee_cents` and rounded half up to whole cents. The round-up is deliberate — a partial final day is credited to the member. Note that a membership paused this way is not locked out of the content library, because `RESTRICTED` is not a lockout; the devices are locked here by the pause's explicit device cascade rather than by the posture.
+
+Resuming converts the banked credit back into time. A `MembershipOwner` resumes a `PAUSED` membership with the caller's `expected_membership_version`, requiring that the membership is `PAUSED`, that `unpaid_financing_count` is zero, and that the household still has at least one user counting toward `active_user_count`. On resume, `pause_started_at` is cleared, posture returns to `OPEN`, every locked device becomes `ACTIVE` with its latch cleared, and the credit is converted by dividing `accrued_pause_credit_cents` by `monthly_fee_cents`, multiplying by 30, flooring to whole days, and adding that many days to `paid_through_at`; the credit is then zeroed.
+
+Cancellation is available from either live state, and it is deliberately not symmetric between them. From `ACTIVE`, the household's `accrued_pause_credit_cents` is recomputed on the remaining-days variant: the same leftover-day measurement, but rounded *down* rather than up, so the same membership evaluated on the same clock yields a strictly smaller credit than the pause basis produced. From `PAUSED`, the calculation is not re-run at all — the credit banked at pause time is preserved verbatim, including its round-up. In both cases the membership becomes `CANCELLED`, posture recomputes to `FROZEN` with `attr_frozen_reason` null, every device in `ACTIVE`, `LINKED`, `DELIVERED` or `LOCKED` moves to `LOCKED` with its latch set, and every household user who is `ACTIVE` or `PENDING_VERIFICATION` becomes `SUSPENDED` with `suspended_reason` of `MEMBERSHIP_CANCELLED`. A user suspended by cancellation also has `streaming_device_serial` cleared.
+
+Reactivation reverses cancellation. A `MembershipOwner` reactivates a `CANCELLED` membership with the caller's `expected_membership_version`, requiring that the membership is `CANCELLED`, that `unpaid_financing_count` is zero — reactivation is refused while any plan is `DELINQUENT` or `DEFAULTED`, again with `ERR_UNPAID_FINANCING_BLOCK` — and that at least one household user will count as active after the unsuspension sweep. On success the billing anchors are re-stamped thirty days forward from the logical clock, any banked pause credit is consumed and zeroed, posture recomputes to `OPEN`, every locked device becomes `ACTIVE` with its latch cleared, and every household user suspended for `MEMBERSHIP_CANCELLED` becomes `ACTIVE` with `suspended_reason` cleared. The membership lands in `REACTIVATED`, a transient waypoint rather than a resting state: on the next system step it settles automatically into `ACTIVE` with posture recomputed to `OPEN`.
+
+One suspended user's restoration is not covered by reactivation. A user evicted by the concurrency ceiling carries `suspended_reason` of `EVICTED_BY_CONCURRENCY` and is restored only by an explicit unsuspend request. That request is admitted when the restored user still fits under the household's effective stream ceiling and refused with `ERR_CONCURRENT_LIMIT_EXCEEDED` (HTTP 409) otherwise; on success it clears `suspended_reason` and recomputes the household's member counter. A platform administrator may also suspend a user administratively by supplying a `suspended_reason`, which sets the status to `SUSPENDED`, clears `streaming_device_serial` and recomputes the member counter.
+
+Two endpoints of the lifecycle are automatic rather than caller-driven, and both are irreversible. A `CANCELLED` membership whose billing anchor has gone more than 180 days stale terminates: it becomes `TERMINATED`, every device on it becomes `DECOMMISSIONED` with `content_access_allowed` false and `total_workouts` frozen at its current value, every `SUSPENDED` household user becomes `REMOVED`, and posture recomputes to `FROZEN`. `TERMINATED` is the membership's terminal state, and any further lifecycle action against it is refused with `ERR_ALREADY_TERMINAL` (HTTP 409).
+
+### 3.5. Recovery Orders: Financing Origination, Delinquency and the Safety Floor
+
+Installment credit is originated against an already-delivered order. A `MembershipOwner` supplies the `membership_id`, the `order_id` being financed, a `principal_cents`, a `term_months`, and an `apr_bps`. A plan may only be originated when the order and the membership agree; a mismatch is refused with `ERR_ORDER_MEMBERSHIP_MISMATCH` (HTTP 409). The term must be 6, 12 or 24 months — any other value is refused with `ERR_INSTALLMENT_COUNT_EXCEEDED` (HTTP 409) — and a household that already carries a `DELINQUENT` or `DEFAULTED` plan is refused with `ERR_UNPAID_FINANCING_BLOCK` (HTTP 409). New plans are also blocked by a `RESTRICTED` or `FROZEN` posture through the same commercial gate that blocks hardware orders.
+
+The installment schedule is built with a ceil-and-floor construction that concentrates the leftover cents in the first payment. The total amount due is the principal multiplied by ten thousand plus the basis-point rate, divided by ten thousand, and rounded half up to whole cents. That total is divided by the term to produce a base installment, floored to whole cents, and the remainder — the total less the base multiplied by the term — is computed separately. The very first installment is the base plus the entire remainder; every subsequent installment is the base alone. An APR of 0 basis points therefore yields an interest-free plan whose installments still absorb the rounding remainder into the first payment. The plan opens in `ORIGINATED` with `safety_disable_latched` false, and its `monthly_installment_cents` holds the first-installment figure.
+
+Paying an installment is the household's side of the bargain. A `MembershipOwner` settles the next installment against an `ORIGINATED`, `CURRENT` or `DELINQUENT` plan by calling the pay action. From `ORIGINATED` the plan requires that the next payment would not exceed the term; an attempt to pay past the term is refused with `ERR_INSTALLMENT_COUNT_EXCEEDED` (HTTP 409), and a payment against an already-settled plan is refused with `ERR_PLAN_ALREADY_PAID_OFF` (HTTP 409). A payment against an `ORIGINATED` plan increments `installments_paid` and moves the plan to `CURRENT`, recomputing the parent's `unpaid_financing_count` and posture. A payment from `CURRENT` that brings the paid count to exactly the term moves the plan to `PAID_OFF`, its terminal settled state.
+
+Failure is recorded by a platform administrator rather than by the household, and it escalates on the third strike. Recording a failed installment increments `retry_count` by one. While `retry_count` is below 3 the plan stays `CURRENT`; at `retry_count` of 3 the plan crosses into `DELINQUENT` and `delinquency_count` is incremented by one. So the boundary is exact: two failures leave the plan current, and the third makes it delinquent. Every failure recomputes the parent's `unpaid_financing_count` — the count of plans on the membership whose status is `DELINQUENT` or `DEFAULTED`, with `ORIGINATED`, `CURRENT` and `PAID_OFF` plans excluded. When that count reaches at least one and the membership is still `ACTIVE`, the membership itself cascades to `DELINQUENT` and its posture recomputes to `RESTRICTED`. This is the cross-aggregate hop that turns a missed payment into a household-wide commercial restriction, and it is deliberately circumscribed: `RESTRICTED` blocks new orders and new plans but does not lock content.
+
+Recovery reverses the escalation. A payment landing on a `DELINQUENT` plan returns it to `CURRENT`, increments `installments_paid`, increments `installments_late`, resets `retry_count` to zero, and recomputes the parent's `unpaid_financing_count`; when that count falls to zero and the membership is `DELINQUENT`, the membership cascades back to `ACTIVE` with posture recomputed to `OPEN`. Even a plan that has already been `DEFAULTED` can be cured: a payment that arrives within 30 days of the most recent installment failure returns it to `CURRENT`, increments `installments_late`, and recomputes the parent's exposure. Every one of these paths leaves `safety_disable_latched` false and `safety_gate_open` true; delinquency never disables hardware safety functions, and the safety refusal described in §2.7 outranks any financing clause that a request might otherwise trip.
+
+A defaulted plan can also be unwound chronologically. A platform administrator may apply a rolling correction to a `CURRENT` plan, which decrements `installments_paid` by one — removing the most recent successful installment from the schedule — and rebases `monthly_installment_cents` on the reduced paid count. The correction requires that at least one installment has been paid, and a correction against a plan with nothing paid is refused with `ERR_INVALID_STATE` (HTTP 409).
+
+Cancelling an order interacts with its financing in a way that preserves the safety floor. A `PLACED` order may be cancelled directly by the household, and doing so cancels any delivery appointment on the order's device still sitting in `REQUESTED` or `SCHEDULED`. A `DELIVERED` order may be cancelled only when it was paid in full — a financed order may not be cancelled after delivery, and such an attempt is refused with `ERR_INVALID_STATE` (HTTP 409). When a delivered full-payment order is cancelled and it happens to carry a financing plan still in `ORIGINATED` with no installments paid, that plan is moved to `DEFAULTED` and its safety latch remains false. The order ends in `CANCELLED`, raising its version.
+
+### 3.6. Service Dispatch and Parts Logistics
+
+A fault is reported against a device by supplying the `device_id`, a `reported_fault_code`, and optionally a `diagnosis_note` and the originating `order_id`. The legal fault codes are `NO_POWER`, `BELT_SLIP`, `SENSOR_FAULT`, `SOFTWARE_CRASH` and `FRAME_CRACK`. The order opens in `DISPATCHED`, and two derived fields are stamped from the fault code and the device's warranty position. The `fault_class` is `SAFETY_CRITICAL` when the reported code is `NO_POWER` or `FRAME_CRACK`, and `COSMETIC` for every other code. Its `priority` is `PRIORITY_SAFETY` for any safety-critical fault; otherwise a `FRAME_CRACK` recorded while the device is still inside its active warranty earns `PRIORITY_WARRANTY`, and every remaining case falls to `PRIORITY_STANDARD`. Dispatch sets `safety_functions_maintained` true and never touches the device's `entitlement_lock`. Repair may not be scheduled for a device that has been decommissioned; such a request is refused with `ERR_DISPATCH_DEVICE_NOT_OPERATIONAL` (HTTP 409).
+
+Parts are reserved from inventory. A technician supplies a `part_id` and a `quantity`, and the order moves into `PART_RESERVED` with `part_id` and `reserved_part_qty` recorded. Two compatibility gates apply. The reserved part's `compatible_sku` must equal the device's `hardware_sku`; a mismatch is refused with `ERR_PART_SKU_MISMATCH` (HTTP 409). And the reservation must not strip the shelf too bare: the admission boundary is that the requested quantity may be at most the part's `on_hand_qty` minus its `safety_stock_qty`. A request for exactly that remaining reservable quantity is admitted; a request one unit beyond it is refused with `ERR_PART_SAFETY_STOCK` (HTTP 409). On a successful reservation the part's `reserved_qty` rises by the requested quantity and its `on_hand_qty` is recomputed.
+
+Parts enter the catalogue through a registration step by a platform administrator, who supplies a unique `part_code`, the `compatible_sku` the part fits, the `part_lot_key` that identifies its lot, and an optional `safety_stock_qty` that defaults to 2. A newly registered row opens with `stock_received_qty`, `reserved_qty`, `consumed_qty` and therefore `on_hand_qty` all at zero.
+
+The stock position is maintained as a derived identity rather than a stored running total. `on_hand_qty` is always `stock_received_qty` minus `reserved_qty` minus `consumed_qty`. Receiving units through a restock adds to `stock_received_qty`; reserving adds to `reserved_qty`; resolving a repair consumes the reserved units by adding them to `consumed_qty` and removing them from `reserved_qty`; and releasing a reservation removes them from `reserved_qty`. Every one of those movements recomputes `on_hand_qty` from the identity above, so no separate decrement of `on_hand_qty` is ever performed. As a side note, parts of the same `compatible_sku` are held for shipping in a documented tie-break order: `part_lot_key` ascending, then creation timestamp ascending.
+
+When a cosmetic fault cannot be served because no part is available, the order does not stall in `DISPATCHED` — a rejected reservation attempt for a cosmetic fault parks it in `DISPATCH_PENDING_PART`, and the rejection surfaces as `ERR_PART_INSUFFICIENT` (HTTP 409). Parking for want of a part is impermissible for safety-critical faults, because the safety function must be restored regardless of parts availability. A reservation may also be released back to stock by a platform administrator through a release request that supplies the `service_order_id` and a `quantity` to return; it returns the order to `DISPATCH_PENDING_PART` with `part_id` cleared and `reserved_part_qty` zeroed, reduces the part's `reserved_qty` by the released quantity, and recomputes the stock position.
+
+Scheduling a repair books a half-open window from `scheduled_start_at` to `scheduled_end_at` for the crew. For an order holding a reserved part, scheduling requires only that the window does not intersect another order in `SCHEDULED` or `REPAIR_IN_PROGRESS` for the same crew; a collision is refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409). An order with no part reserved is schedulable only when its fault class is `SAFETY_CRITICAL` (whether the order sits in `DISPATCH_PENDING_PART`, or remains in `DISPATCHED` because a safety-critical reservation was itself refused), which lets a safety-critical repair proceed without a part precisely because the safety function has to be restored first. A cosmetic order with no part reserved is refused with `ERR_PART_REQUIRED_FOR_SCHEDULING` (HTTP 409). Either path lands the order in `SCHEDULED`, and the safety-critical path additionally asserts `safety_functions_maintained` true.
+
+The repair itself runs and then either resolves or falters. Beginning work moves the order from `SCHEDULED` to `REPAIR_IN_PROGRESS`. Resolving it requires that `part_id` is non-null or that the fault class is `SAFETY_CRITICAL`; a safety-critical fault may therefore be resolved with no part at all, which would be refused as incompatible or absent part for any other class with `ERR_PART_MISMATCH_SAFETY` (HTTP 409). Resolution stamps `resolved_at` from the logical clock, asserts `safety_functions_maintained` true, and — when a part was reserved — consumes it by increasing the part's `consumed_qty` by `reserved_part_qty`, decreasing `reserved_qty` by the same amount, and recomputing the stock position. The device's `entitlement_lock` is left exactly as it was. A failed repair returns the order from `REPAIR_IN_PROGRESS` to `SCHEDULED`, and it latches `failure_before_part` true whenever no part was reserved at the moment of failure, capturing the fact that a repair attempt was made without a part in hand. Resolved and cancelled are the two terminal states of a service order; a later transition attempted from `RESOLVED` is refused with `ERR_ALREADY_TERMINAL` (HTTP 409).
+
+### 3.7. Refurbishment: Certification, Resale and the Warranty Reset
+
+A refurbishment batch is opened over a returned unit. A technician supplies the `source_device_id`, a `certification_grade` of `A`, `B` or `C`, and an optional `performance_resale_enabled` flag that defaults to false. The batch opens in `INSPECTING` with `inspected_at` stamped from the logical clock, and its `certification_chain_depth` is computed immediately from the source device's lineage, bounded at 3 hops as described in §2.10. The source must be eligible: a device that is neither `DECOMMISSIONED` nor itself resale-originated is refused with `ERR_CERTIFYING_DEVICE_NOT_ELIGIBLE` (HTTP 409).
+
+Certification prices the unit and fixes its configuration. A technician certifies an `INSPECTING` batch by supplying a grade, which must be one of `A`, `B` or `C`. The batch moves to `CERTIFIED` and its `resale_price_cents` is set as a fraction of the source device's SKU list price: three fifths for grade `A`, one half for grade `B`, and two fifths for grade `C`. If the grade is `B` or `C`, the batch's `performance_resale_enabled` flag is forced to false — a lower-grade unit is never sold as a performance model. The certification step also runs the chain-depth calculation again and enforces both its bound and its cycle guard, refusing a too-deep lineage with `ERR_CERTIFICATION_CHAIN_EXCEEDED` (HTTP 409) and a self-looping lineage with `ERR_CERTIFICATION_CYCLE` (HTTP 409).
+
+Listing a batch makes it purchaseable, and it carries an asymmetry against the batch's configuration flag. A platform administrator lists a `CERTIFIED` batch, and the step requires that the batch either has `performance_resale_enabled` false or carries grade `A`. The batch moves to `LISTED`. The practical effect is that a low-grade batch whose flag was forced false can still be listed, while a batch configured with the performance flag disabled and certified at grade `A` is also admissible; what is excluded is a batch whose flag says performance resale is not enabled yet whose grade would imply otherwise without the flag having been reconciled.
+
+Selling the batch mints the refurbished machine. A platform administrator supplies `buying_membership_id`, and the sale requires that the batch is `LISTED` and that the buying membership's posture is `OPEN` or `RESTRICTED`; a `FROZEN` buyer is refused with `ERR_POSTURE_RESTRICTED` (HTTP 409). The batch moves to `SOLD` and records the minted device in `sold_device_id`. The minted device is born `REFURBISHED` in `condition`, carries `provenance_source` of `RESALE`, points its `certifying_device_id` back at the batch's source device, opens directly in `activation_status` `ACTIVE`, carries a `resale_cycle_count` of 1, and is bound to the buying membership. Its `warranty_expires_at` is set exactly 90 days beyond the logical clock. This is the resale warranty reset: the refurbished unit receives a fresh 90-day window anchored on the sale, and that window replaces rather than extends any prior coverage. The same 90-day reset and the same `resale_cycle_count` of 1 apply when a technician explicitly applies a resale warranty to an already-live resale-provenance device; that action requires `provenance_source` to be `RESALE`, and a device that originated as a new sale is refused with `ERR_WARRANTY_RESET_NOT_ELIGIBLE` (HTTP 409). A batch that has reached `SOLD` is terminal, and a second sale attempt against it is refused with `ERR_ALREADY_TERMINAL` (HTTP 409).
+
+The batch's `library_availability` is a derived flag rather than a stored one: it reads `AVAILABLE` while the batch is `INSPECTING`, `CERTIFIED` or `LISTED`, and flips to `UNAVAILABLE` once a terminal state of the source device makes the batch un-listable.
+
+### 3.8. The Class Library: Licensing Windows, Live Streaming and On-Demand Availability
+
+A class session is authored by an `Instructor` against an instructor licensing window. The creator supplies a `title`, the `instructor_name` who owns the window, a `discipline` of `CYCLING`, `RUNNING`, `STRENGTH` or `YOGA`, a `delivery_mode` of `LIVE` or `ON_DEMAND`, the session's `starts_at` and `ends_at`, a `capacity` that defaults to 100, and the window's own `license_starts_at` and `license_ends_at`. The session opens in `DRAFT` with a `live_enrollment_count` of zero. Two validations apply at authoring time. The licensing window must be internally sane — its start must precede the session start, and its end must follow its own start — and a window that is not sane is refused with `ERR_LICENSE_WINDOW_INVALID` (HTTP 409); note that the draft step only sanity-checks the window and defers full containment to publish time. And the instructor may not already hold an open session covering the same half-open interval, which would be refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409).
+
+Publishing commits the session to the library and is where containment is enforced. An `Instructor` publishes a `DRAFT` session. For a `LIVE` session the entire live window must sit inside the licensing window: the session start must be at or after the license start and the session end at or before the license end, and any violation is refused with `ERR_LICENSE_WINDOW_INVALID` (HTTP 409). For an `ON_DEMAND` session the publish step fixes `on_demand_window_ends_at` as whichever is earlier of the session end plus 24 hours and the license end — the library window is clamped to the licence so it can never outlive the instructor's rights. A publish that would overlap a window the instructor is already streaming through is refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409). The session moves to `PUBLISHED`.
+
+A live session streams automatically. The session's lifecycle field is `scheduled_status`, and it advances `DRAFT` to `PUBLISHED` to `STREAMING` and finally to `ARCHIVED` or `CANCELLED`. For a `LIVE` session, once the logical clock has reached the session start, is still before the session end, and has not passed the license end, the session moves from `PUBLISHED` to `STREAMING` without any request from the instructor. Archiving is likewise automatic on two paths. A `PUBLISHED` session archives once the logical clock has reached its end — for either delivery mode — or once its licensing window has become void because the session was published after the license had already ended; that archive moves the session to `ARCHIVED`, cascades every `ENROLLED` enrollment on it to `EXPIRED`, cascades every `WAITLISTED` enrollment to `EXPIRED`, recomputes `live_enrollment_count` to zero, and recomputes the posture of every membership owning a device with an affected enrollment. A `STREAMING` session archives once the logical clock reaches its end; that path moves the session to `ARCHIVED`, cascades only those `ENROLLED` enrollments whose `completion_pct` is zero to `DROPPED`, and recomputes the count to zero. An `Instructor` may also cancel a `PUBLISHED` session outright, which moves it to `CANCELLED` and drops every `ENROLLED` or `WAITLISTED` enrollment on it, recomputing the count to zero. `ARCHIVED` and `CANCELLED` are the terminal states of a session, and a further transition from either is refused with `ERR_ALREADY_TERMINAL` (HTTP 409).
+
+### 3.9. Taking a Class: Enrollment, Waitlists, Capacity and Leaderboard Integrity
+
+Enrollment binds a household user to a session on a specific device. A `MembershipOwner` supplies the `class_session_id`, the `device_id` and the `enroller_user_id`, and the enrollment opens in `ENROLLED`, or in `WAITLISTED` when a live session has already reached its capacity. Several guards apply. The device must belong to the enroller's own membership, and a device belonging to a different household is refused with `ERR_DEVICE_NOT_ON_MEMBERSHIP` (HTTP 409). The device's `content_access_allowed` must be true, so a device whose household is locked out is refused with `ERR_CONTENT_LOCKED` (HTTP 409). And an enrollment that cannot be admitted is refused with `ERR_CLASS_CAPACITY_EXCEEDED` (HTTP 409) — this covers an on-demand enrollment attempted outside its library window as well as a session that is not in a publishable state. The session's `live_enrollment_count` is recomputed after every enrollment movement.
+
+The waitlist is a queue with a deterministic order. An enrollment moves from `ENROLLED` to `WAITLISTED` when the session's open count has reached its capacity, which happens when a seat is reclaimed by a concurrency eviction on the same session. It is promoted back from `WAITLISTED` to `ENROLLED` once the count sits below capacity, and the promotion always takes the earliest by `enrolled_at` ascending, with ties broken by creation timestamp ascending — so the queue is stable and never depends on identifier ordering. An enrollment may also be dropped by its household while still `ENROLLED` or `WAITLISTED`, which moves it to `DROPPED` and recomputes the count; and it expires automatically when its session archives or cancels, which moves it to `EXPIRED` and recomputes the count. `COMPLETED`, `DROPPED` and `EXPIRED` are all terminal, and none of them counts toward the open-session figure, so an archived session always reconciles its count to zero.
+
+Completing a workout is where the leaderboard integrity cap is applied. A `MembershipOwner` completes an `ENROLLED` enrollment by supplying the raw `output_points` it earned, the `completion_pct` of the class it finished, and a `benchmark_variant` selector. Completion requires that the enrollment is still `ENROLLED`, that the device's `content_access_allowed` is true, and that the session is in `PUBLISHED`, `STREAMING` or `ARCHIVED`. The recorded `completion_grade` is `FULL_CREDIT` when `completion_pct` is at least 80 and `PARTIAL_CREDIT` otherwise, and it is null while the enrollment is not `COMPLETED`.
+
+The integrity cap itself is a small weight-and-ceiling computation. Each discipline carries a points-per-percentage weight: 10 for `CYCLING`, 7 for `RUNNING`, and 5 for both `STRENGTH` and `YOGA`. The session's scheduled length in seconds, divided by 600, scales the session capacity into a duration ceiling, floored to a whole number of points. The discipline ceiling is the lesser of the session capacity multiplied by a points multiplier of 2 and that duration ceiling. A completion is flagged for review when its reported `output_points` exceed the benchmark for the session: the enrollment's `integrity_flagged` boolean is set true, and its `integrity_points` are forced to zero. An unflagged completion earns the lesser of its reported points and the discipline ceiling, written to `integrity_points`. The two benchmark variants differ only in the benchmark they compare against, and they are what make the same workout score differently under identical inputs. Under the strict benchmark the bar is the session end measured in whole seconds floored, so a completion even one second past the scheduled end is flagged and earns nothing. Under the indulgent benchmark the bar is that same floored session end plus a tolerance of 600 seconds, so the very completion the strict variant flags is left unflagged and earns its capped points. A low-output completion beneath both bars is unaffected by the choice and scores identically either way.
+
+A completed workout also ripples upward. The device's `total_workouts` is incremented by one, and the parent membership's derived `total_streams_observed` and posture are recomputed. Opting out is equally cheap: a household may drop an open enrollment while it is `ENROLLED` or `WAITLISTED`, and the session's open count is recomputed afterward.
+
+### 3.10. The Operations Sweep
+
+Beyond the caller-driven workflows, the platform exposes an administrator-only capability that advances every time-dependent rule at once: the operations sweep. Running it archives every session that has elapsed, expires the open enrollments those archives leave behind, promotes eligible waitlisters, terminates cancelled memberships whose billing anchor has gone stale, and decommissions their devices. It returns a summary of what it touched, reporting the number of archived sessions, expired enrollments, promoted waitlisters, terminated memberships and decommissioned devices, and it recomputes every affected open-enrollment figure and household posture as it goes.
+
+The sweep is the batched form of four rules already stated individually, and its per-rule behaviour matches them exactly. Every `PUBLISHED` session whose end has been reached archives and expires every open enrollment on it. Every `STREAMING` session whose end has been reached archives. Every `CANCELLED` membership whose billing anchor is more than 180 days stale — the same grace period that governs automatic termination — moves to `TERMINATED`, its devices to `DECOMMISSIONED` and its suspended users to `REMOVED`. And every `WAITLISTED` enrollment on a session whose open count is below capacity is promoted, taking the earliest by `enrolled_at` ascending and breaking ties by creation timestamp ascending, exactly as the single-session promotion rule does. Companion to it is a clock-advancing capability that sets the logical clock to a supplied `current_utc` instant for every subsequent call; this is the only capability in the API that does not require an authenticated header pair, and its default starting value is the first instant of 1 September 2026 in UTC.
+
+## 4. Endpoint Definitions
+
+New stand-alone resources and new members of a collection are created with a `201 Created` status code — placing an order, registering a part, authoring a class session, originating a plan, and opening a batch all return `201`. Operations that modify an existing resource, including every lifecycle transition, every workflow step and every computed read, return `200 OK`. The table below lists each operation with the roles permitted to invoke it; the request bodies, response payloads and side effects are specified in the narratives of §2 and §3 and are not repeated here.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/fitness/memberships` | Create a membership in PROVISIONAL status | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships` | List memberships | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}` | Get one membership | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/activate` | Activate a provisional membership and flip its linked devices live | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/pause` | Pause an active membership and bank a proration credit | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/resume` | Resume a paused membership and convert the banked credit to paid-through time | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/cancel` | Cancel a membership from ACTIVE or PAUSED | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/reactivate` | Reactivate a cancelled membership | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}/summary` | Computed read of the membership aggregate | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/household-users` | List household users by membership or streaming serial | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/household-users` | Add a household user in PENDING_VERIFICATION | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}/household-users` | List one membership's household users | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/household-users/{userId}` | Get one household user | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/household-users/{userId}/verify` | Consume a verification token and activate the user | MembershipOwner, PlatformAdmin, Anonymous |
+| POST | `/fitness/household-users/{userId}/start-stream` | Bind a user to a device serial, evicting a member when the ceiling is full | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/household-users/{userId}/suspend` | Suspend a household user administratively | PlatformAdmin |
+| POST | `/fitness/household-users/{userId}/unsuspend` | Return an evicted user to ACTIVE | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/devices` | Mint a device serial in UNASSIGNED status | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}/devices` | List one membership's devices | MembershipOwner, ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}` | Get one device | MembershipOwner, ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/devices/{deviceId}/link` | Link a delivered serial to a membership | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/devices/{deviceId}/warranty-reset` | Apply the resale warranty window to a resale device | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices` | List devices by membership, status or lineage | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/memberships/{membershipId}/hardware-orders` | Place a hardware order and write the provisional quote | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}/hardware-orders` | List one membership's hardware orders | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/hardware-orders/{orderId}` | Get one hardware order including both totals | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/hardware-orders` | List hardware orders by membership, device, trade-in or status | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/hardware-orders/{orderId}/refund-dispute` | Record the underwriter resolution of a refund dispute | PlatformAdmin |
+| POST | `/fitness/hardware-orders/{orderId}/redeem-refund` | Issue a redemptive credit against a delivered order | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/hardware-orders` | List orders referencing one device as purchased or traded-in | MembershipOwner, ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/hardware-orders/{orderId}/delivery-appointments` | List appointments fulfilling one order | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/hardware-orders/{orderId}/service-orders` | List service orders tracing to one order | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/hardware-orders/{orderId}/cancel` | Cancel a placed order or a delivered full-payment order | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/delivery-appointments` | Create a delivery window for a device and schedule its order | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/delivery-appointments` | List appointments by device, order, crew or status | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/delivery-appointments/{appointmentId}` | Get one delivery appointment | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/delivery-appointments` | List one device's appointments | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-appointments/{appointmentId}/schedule` | Confirm a requested appointment into a crew window | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-appointments/{appointmentId}/start` | Begin an installation visit | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-appointments/{appointmentId}/complete` | Complete the installation and recapture the order total | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-appointments/{appointmentId}/fail` | Mark a visit failed without touching the order | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-appointments/{appointmentId}/reschedule` | Move a failed appointment into a new crew window | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/delivery-quotes` | Advisory pre-purchase quote of service charges | ServiceTechnician, PlatformAdmin, MembershipOwner |
+| GET | `/fitness/financing-plans` | List financing plans by membership, order or status | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/financing-plans` | Originate an installment plan against a delivered order | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/memberships/{membershipId}/financing-plans` | List one membership's financing plans | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/hardware-orders/{orderId}/financing-plans` | List plans written against one order | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/financing-plans/{planId}` | Get one financing plan | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/financing-plans/{planId}/installments/pay` | Settle the next installment | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/financing-plans/{planId}/installments/fail` | Record a failed installment and advance delinquency | PlatformAdmin |
+| POST | `/fitness/financing-plans/{planId}/installments/rolling-correction` | Chronologically unwind the most recent installment | PlatformAdmin |
+| GET | `/fitness/service-orders` | List service orders by device, order, part or status | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/service-orders` | Dispatch a service order for a device fault | MembershipOwner, ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/service-orders/{serviceOrderId}` | Get one service order | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/service-orders` | List one device's service orders | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/service-orders/{serviceOrderId}/reserve-part` | Reserve a compatible part against a service order | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/parts-inventory/{partId}/reservation-release` | Release a reservation back into stock | PlatformAdmin |
+| POST | `/fitness/service-orders/{serviceOrderId}/schedule` | Book a repair window | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/service-orders/{serviceOrderId}/start-repair` | Begin the repair visit | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/service-orders/{serviceOrderId}/resolve` | Sign off the repair and consume the reserved part | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/service-orders/{serviceOrderId}/fail-repair` | Record a failed repair and return the order to scheduling | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/parts-inventory` | List parts inventory by compatible SKU | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/parts-inventory/{partId}/service-orders` | List service orders that reserved one part row | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/parts-inventory` | Register a part code with a compatible SKU and safety stock | PlatformAdmin |
+| GET | `/fitness/parts-inventory/{partId}` | Get one parts inventory row | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/parts-inventory/{partId}/restock` | Receive part units into stock | PlatformAdmin |
+| GET | `/fitness/service-orders/{serviceOrderId}/parts` | List part rows reserved against one service order | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/class-sessions` | Create a class session in DRAFT with a licensing window | Instructor, PlatformAdmin |
+| GET | `/fitness/class-sessions/{sessionId}` | Get one class session | MembershipOwner, Instructor, PlatformAdmin |
+| GET | `/fitness/class-sessions` | List class sessions by instructor, discipline, mode or status | MembershipOwner, Instructor, PlatformAdmin |
+| POST | `/fitness/class-sessions/{sessionId}/publish` | Publish a draft session and fix its library window | Instructor, PlatformAdmin |
+| POST | `/fitness/class-sessions/{sessionId}/cancel` | Cancel a published session and drop its open enrollments | Instructor, PlatformAdmin |
+| GET | `/fitness/class-sessions/{sessionId}/leaderboard` | Computed read of the integrity-capped leaderboard | MembershipOwner, Instructor, PlatformAdmin |
+| GET | `/fitness/class-enrollments` | List class enrollments by session, device, enroller or status | MembershipOwner, Instructor, PlatformAdmin |
+| POST | `/fitness/class-enrollments` | Enroll a household user on a session for a device | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/class-sessions/{sessionId}/class-enrollments` | List one session's enrollments | MembershipOwner, Instructor, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/class-enrollments` | List one device's enrollments | MembershipOwner, ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/household-users/{userId}/class-enrollments` | List one household user's enrollments | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/class-enrollments/{enrollmentId}/complete` | Complete a workout, applying the integrity cap | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/class-enrollments/{enrollmentId}/drop` | Drop an open enrollment | MembershipOwner, PlatformAdmin |
+| GET | `/fitness/class-enrollments/{enrollmentId}` | Get one class enrollment | MembershipOwner, Instructor, PlatformAdmin |
+| POST | `/fitness/refurb-batches` | Open a refurbishment batch over a returned device | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/refurb-batches` | List batches sourced from one device | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/devices/{deviceId}/refurb-batches-sold` | List batches that sold one device | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/refurb-batches` | List refurbishment batches by source, sold device or status | ServiceTechnician, PlatformAdmin |
+| GET | `/fitness/refurb-batches/{batchId}` | Get one refurbishment batch | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/refurb-batches/{batchId}/certify` | Certify an inspected batch and price the unit | ServiceTechnician, PlatformAdmin |
+| POST | `/fitness/refurb-batches/{batchId}/list` | List a certified batch for resale | PlatformAdmin |
+| POST | `/fitness/refurb-batches/{batchId}/sell` | Sell a listed batch and mint the refurbished device | PlatformAdmin |
+| POST | `/fitness/_clock/set_current_utc` | Set the logical clock for all subsequent calls | MembershipOwner, PlatformAdmin |
+| POST | `/fitness/_run_ops` | Advance the operations sweep | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+The table below lists every error identifier and the HTTP status it carries. The conditions that trigger each error live beside the workflow they guard in §2 and §3 and are not repeated here.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_MEMBERSHIP_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_DEVICE_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_INVALID_STATE` | 409 Conflict |
+| `ERR_ALREADY_TERMINAL` | 409 Conflict |
+| `ERR_POSTURE_RESTRICTED` | 409 Conflict |
+| `ERR_CONCURRENT_LIMIT_EXCEEDED` | 409 Conflict |
+| `ERR_STAIR_CAP_EXCEEDED` | 409 Conflict |
+| `ERR_TEMPORAL_OVERLAP` | 409 Conflict |
+| `ERR_LICENSE_WINDOW_INVALID` | 409 Conflict |
+| `ERR_WINDOW_NOT_OPEN` | 409 Conflict |
+| `ERR_RESCHEDULE_LIMIT` | 409 Conflict |
+| `ERR_PAUSE_WINDOW_INVALID` | 409 Conflict |
+| `ERR_UNPAID_FINANCING_BLOCK` | 409 Conflict |
+| `ERR_SAFETY_DISABLE_FORBIDDEN` | 409 Conflict |
+| `ERR_PART_SKU_MISMATCH` | 409 Conflict |
+| `ERR_PART_MISMATCH_SAFETY` | 409 Conflict |
+| `ERR_PART_SAFETY_STOCK` | 409 Conflict |
+| `ERR_PART_INSUFFICIENT` | 409 Conflict |
+| `ERR_PART_REQUIRED_FOR_SCHEDULING` | 409 Conflict |
+| `ERR_DEVICE_SERIAL_MISMATCH` | 409 Conflict |
+| `ERR_DEVICE_NOT_ON_MEMBERSHIP` | 409 Conflict |
+| `ERR_ORDER_MEMBERSHIP_MISMATCH` | 409 Conflict |
+| `ERR_CERTIFYING_DEVICE_NOT_ELIGIBLE` | 409 Conflict |
+| `ERR_CERTIFICATION_CHAIN_EXCEEDED` | 409 Conflict |
+| `ERR_CERTIFICATION_CYCLE` | 409 Conflict |
+| `ERR_WARRANTY_RESET_NOT_ELIGIBLE` | 409 Conflict |
+| `ERR_CLASS_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_CONTENT_LOCKED` | 409 Conflict |
+| `ERR_OWNER_ALREADY_EXISTS` | 409 Conflict |
+| `ERR_INSTALLMENT_COUNT_EXCEEDED` | 409 Conflict |
+| `ERR_PLAN_ALREADY_PAID_OFF` | 409 Conflict |
+| `ERR_REFUND_DISPUTE_DENIED` | 409 Conflict |
+| `ERR_PURCHASE_BLOCKED` | 409 Conflict |
+| `ERR_DISPATCH_DEVICE_NOT_OPERATIONAL` | 409 Conflict |

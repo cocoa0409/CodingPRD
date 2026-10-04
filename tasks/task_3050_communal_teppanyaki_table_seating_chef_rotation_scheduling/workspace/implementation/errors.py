@@ -1,0 +1,57 @@
+"""Error catalogue and the APIError exception carried through the request cycle."""
+
+HTTP_BY_ERROR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_VENUE_NOT_FOUND": 404,
+    "ERR_PARTY_NOT_FOUND": 404,
+    "ERR_TIER_NOT_FOUND": 404,
+    "ERR_TABLE_NOT_FOUND": 404,
+    "ERR_RESERVATION_NOT_FOUND": 404,
+    "ERR_SEATING_NOT_FOUND": 404,
+    "ERR_CHEF_NOT_FOUND": 404,
+    "ERR_SHOW_NOT_FOUND": 404,
+    "ERR_MAINTENANCE_WINDOW_NOT_FOUND": 404,
+    "ERR_SUSHI_TICKET_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_PROTEIN_TICKET_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_BOOKING_HORIZON_EXCEEDED": 422,
+    "ERR_MAINTENANCE_CONFLICT": 409,
+    "ERR_TIER_MISMATCH": 422,
+    "ERR_TIER_RETIRED": 409,
+    "ERR_TABLE_OVER_CAPACITY": 409,
+    "ERR_HOLD_LIMIT_EXCEEDED": 409,
+    "ERR_HOLD_WINDOW_CLOSED": 409,
+    "ERR_SHARED_SPLIT_INVALID": 422,
+    "ERR_VENTILATION_FREEZE": 409,
+    "ERR_CHEF_ROTATION_EXHAUSTED": 409,
+    "ERR_STATION_OCCUPIED": 409,
+    "ERR_SHOW_DEPENDENCY": 409,
+    "ERR_SHOW_UNDERRUN": 409,
+    "ERR_PROTEIN_VARIANCE_EXCEEDED": 422,
+    "ERR_CREDIT_INELIGIBLE": 422,
+    "ERR_CREDIT_BELOW_MINIMUM": 422,
+    "ERR_CREDIT_OVER_CAP": 422,
+    "ERR_CREDIT_EXCEEDED": 402,
+    "ERR_PARTY_RESTRICTED": 403,
+    "ERR_NO_ACTIVE_SEATING": 409,
+    "ERR_DUPLICATE_SEATING": 409,
+    "ERR_MAINTENANCE_WINDOW_LATE": 409,
+    "ERR_SUSHI_PLATE_LATE": 409,
+    "ERR_SEGREGATION_VIOLATION": 403,
+    "ERR_STALE_VERSION": 412,
+}
+
+
+class APIError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or HTTP_BY_ERROR.get(error_id, 400)
+
+
+def fail(error_id, message=None):
+    raise APIError(error_id, message)

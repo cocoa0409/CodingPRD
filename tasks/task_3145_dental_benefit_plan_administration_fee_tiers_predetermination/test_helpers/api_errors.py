@@ -1,0 +1,88 @@
+"""Error identifiers and their HTTP statuses, transcribed from PRD section 5.
+
+The map is registered with the shared validator layer so that
+``validate_error(response, ERR_X)`` cross-checks the status without every
+call site restating it.
+"""
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+# ─── Authentication and authorization ─────────────────────────────────────
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+
+# ─── Path-resolution and foreign-key 404s ─────────────────────────────────
+
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_PLAN_NOT_FOUND = "ERR_PLAN_NOT_FOUND"
+ERR_PROVIDER_NOT_FOUND = "ERR_PROVIDER_NOT_FOUND"
+ERR_SUBSCRIBER_NOT_FOUND = "ERR_SUBSCRIBER_NOT_FOUND"
+ERR_DEPENDENT_NOT_FOUND = "ERR_DEPENDENT_NOT_FOUND"
+ERR_CLAIM_NOT_FOUND = "ERR_CLAIM_NOT_FOUND"
+ERR_PREDETERMINATION_NOT_FOUND = "ERR_PREDETERMINATION_NOT_FOUND"
+ERR_FEE_SCHEDULE_NOT_FOUND = "ERR_FEE_SCHEDULE_NOT_FOUND"
+
+# ─── State machine and cross-entity state ─────────────────────────────────
+
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_PLAN_NOT_ACTIVE = "ERR_PLAN_NOT_ACTIVE"
+ERR_PROVIDER_TERMINATED = "ERR_PROVIDER_TERMINATED"
+ERR_PROVIDER_BUSY = "ERR_PROVIDER_BUSY"
+ERR_SCHEDULE_OVERLAP = "ERR_SCHEDULE_OVERLAP"
+
+# ─── Temporal and referential business rules ──────────────────────────────
+
+ERR_TIMELY_FILING = "ERR_TIMELY_FILING"
+ERR_RETROACTIVE_PREDETERMINATION = "ERR_RETROACTIVE_PREDETERMINATION"
+ERR_CROSS_REFERENCE_MISMATCH = "ERR_CROSS_REFERENCE_MISMATCH"
+ERR_COB_CONFIG_INVALID = "ERR_COB_CONFIG_INVALID"
+ERR_NO_FEE_SCHEDULE = "ERR_NO_FEE_SCHEDULE"
+
+# ─── Fiscal guards ────────────────────────────────────────────────────────
+
+ERR_INVALID_PLAN_CONFIG = "ERR_INVALID_PLAN_CONFIG"
+ERR_ANNUAL_MAX_EXCEEDED = "ERR_ANNUAL_MAX_EXCEEDED"
+
+# ─── Payload shape ────────────────────────────────────────────────────────
+
+ERR_INVALID_ATTACHMENT = "ERR_INVALID_ATTACHMENT"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+# ─── Optimistic concurrency ───────────────────────────────────────────────
+
+ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+HTTP_STATUS_CODES = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_SEGREGATION_OF_DUTIES: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_PLAN_NOT_FOUND: 404,
+    ERR_PROVIDER_NOT_FOUND: 404,
+    ERR_SUBSCRIBER_NOT_FOUND: 404,
+    ERR_DEPENDENT_NOT_FOUND: 404,
+    ERR_CLAIM_NOT_FOUND: 404,
+    ERR_PREDETERMINATION_NOT_FOUND: 404,
+    ERR_FEE_SCHEDULE_NOT_FOUND: 404,
+    ERR_INVALID_STATE: 409,
+    ERR_PLAN_NOT_ACTIVE: 409,
+    ERR_PROVIDER_TERMINATED: 409,
+    ERR_PROVIDER_BUSY: 409,
+    ERR_SCHEDULE_OVERLAP: 409,
+    ERR_TIMELY_FILING: 422,
+    ERR_RETROACTIVE_PREDETERMINATION: 422,
+    ERR_CROSS_REFERENCE_MISMATCH: 422,
+    ERR_COB_CONFIG_INVALID: 422,
+    ERR_NO_FEE_SCHEDULE: 422,
+    ERR_INVALID_PLAN_CONFIG: 422,
+    ERR_ANNUAL_MAX_EXCEEDED: 422,
+    ERR_INVALID_ATTACHMENT: 400,
+    ERR_INVALID_REQUEST: 400,
+    ERR_STALE_VERSION: 412,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

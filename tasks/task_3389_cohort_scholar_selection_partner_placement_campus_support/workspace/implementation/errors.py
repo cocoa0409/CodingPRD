@@ -1,0 +1,39 @@
+"""Error type and the complete error-id catalog (PRD Section 5)."""
+
+
+class ApiError(Exception):
+    """Carries the scaffold's error_id, HTTP status, and a human message."""
+
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                    # 401
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                    # 400
+ERR_FORBIDDEN = "ERR_FORBIDDEN"                                # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                                # 404
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                        # 412
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                        # 409
+ERR_NOMINEE_NOT_IN_ROUND = "ERR_NOMINEE_NOT_IN_ROUND"          # 409
+ERR_COHORT_NOT_FORMING = "ERR_COHORT_NOT_FORMING"              # 409
+ERR_AGREEMENT_NOT_ACTIVE = "ERR_AGREEMENT_NOT_ACTIVE"          # 409
+ERR_COLLEGE_NOT_ACTIVE = "ERR_COLLEGE_NOT_ACTIVE"              # 409
+ERR_SCHOLAR_NOT_ELIGIBLE = "ERR_SCHOLAR_NOT_ELIGIBLE"          # 409
+ERR_NOMINATION_WINDOW_CLOSED = "ERR_NOMINATION_WINDOW_CLOSED"  # 422
+ERR_DUPLICATE_EVALUATION = "ERR_DUPLICATE_EVALUATION"          # 409
+ERR_ACTIVE_OFFER_EXISTS = "ERR_ACTIVE_OFFER_EXISTS"            # 409
+ERR_COHORT_EXISTS = "ERR_COHORT_EXISTS"                        # 409
+ERR_ACTIVE_AGREEMENT_EXISTS = "ERR_ACTIVE_AGREEMENT_EXISTS"    # 409
+ERR_CITY_MISMATCH = "ERR_CITY_MISMATCH"                        # 422
+ERR_MENTOR_COLLEGE_MISMATCH = "ERR_MENTOR_COLLEGE_MISMATCH"    # 422
+ERR_MENTOR_SCHEDULE_CONFLICT = "ERR_MENTOR_SCHEDULE_CONFLICT"  # 422
+ERR_INTERNSHIP_OVERLAP = "ERR_INTERNSHIP_OVERLAP"              # 422
+ERR_COHORT_SIZE_INVALID = "ERR_COHORT_SIZE_INVALID"            # 422
+ERR_NOMINATION_QUOTA_EXCEEDED = "ERR_NOMINATION_QUOTA_EXCEEDED"  # 422
+ERR_COHORT_FULL = "ERR_COHORT_FULL"                            # 422
+ERR_INSUFFICIENT_EVALUATIONS = "ERR_INSUFFICIENT_EVALUATIONS"  # 422
+ERR_CUTOFF_NOT_MET = "ERR_CUTOFF_NOT_MET"                      # 422
+ERR_RENEWAL_THRESHOLDS_NOT_MET = "ERR_RENEWAL_THRESHOLDS_NOT_MET"  # 422

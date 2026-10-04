@@ -1,0 +1,335 @@
+# Engine Licensing Runtime Economics API — Product Requirements Document
+
+## 1. Introduction
+
+Game engine vendors live and die by developer trust, and nothing erodes that trust faster than retroactive changes to the economics under which a studio shipped its title. This document specifies the Engine Licensing, Runtime Economics & Developer Migration API: the platform-side system through which an engine operator administers licensing tiers calibrated to developer revenue and funding, enforces per-install runtime fees above published thresholds, manages the editorial lifecycle of the editor itself, and — when the relationship ends — settles a departing studio's obligations through a structured migration and buyout workflow.
+
+The system is built around a small set of interlocking economic instruments. Licensing tiers (`PERSONAL`, `EDUCATION`, `PRO`, `ENTERPRISE`) are not fixed price lists but versioned configuration objects with revenue ceilings, funding ceilings, seat minimums, and feature gates; a studio's *effective* tier is recomputed from its own self-reported revenue declarations and can be forced upward by audit. Runtime fees accrue only above a dual install-and-revenue threshold, are self-reported through monthly install reports that pass through a review pipeline, and settle into invoices with a strict payment/waiver waterfall. Policy changes to the fee schedule are first-class entities: a retroactive adverse change automatically spawns grandfathering commitments for already-shipped projects and dents the trust score of every affected studio, and commitments that go unattested silently expire. Around this core orbit an asset marketplace with tiered creator revenue share, console export agreements gated by tier and closed-interval term rules, eligibility audits with an appeal loop, and a four-stage migration assessment that ends either in abandonment or in the archiving of everything the studio ever shipped.
+
+This API is the single surface through which all of those flows are driven. It is written for the engineers implementing the platform: every rule stated here is normative, every threshold is exact, and every state transition described in the business workflows is backed by the endpoint catalogue in Section 4.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines system-wide rules, envelope shapes, and cross-cutting economic principles that apply uniformly to every endpoint.
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two authentication headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, naming their operational capacity. A request missing either header, or carrying an unrecognized role value, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). Even with well-formed headers, a caller whose role is not listed as authorized for the target endpoint is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+The system recognizes exactly five roles, spelled precisely as follows: `PlatformAdmin`, `OrgOwner`, `FinanceOps`, `Auditor`, and `ReviewBoard`.
+
+`PlatformAdmin` is the engine platform operator — a superset role with override power over tier configuration, editor lifecycle, policy changes, export agreements, and org registration. When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server never compares it to any resource's `id`.
+
+`OrgOwner` is the owner of a developer studio. When `X-User-Role` is `OrgOwner`, `X-User-ID` is the `id` of the acting `DeveloperOrg`; ownership checks on any org-scoped resource compare the resource's org foreign key (directly, or through its parent chain — a project belongs to an org, a report to a project, and so on) to `X-User-ID`. An `OrgOwner` acting on a resource whose org chain resolves to a different org's `id` is rejected with `ERR_FORBIDDEN_ORG` (HTTP 403).
+
+`FinanceOps` is the billing operator who finalizes, collects, and waives invoices and may refund marketplace purchases. `Auditor` is the compliance auditor who opens eligibility audits, requests evidence, and resolves cases. `ReviewBoard` is the content and install-report reviewer who accepts or disputes install reports and approves or rejects asset listings. For each of these three roles, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server does not compare it to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints paginate through two query parameters. The `limit` parameter sets the maximum number of items returned; it defaults to 10 when omitted, must be at least 1, and may not exceed 100. The `offset` parameter sets how many items to skip and defaults to 0. Unless a more specific rule applies, every list endpoint returns resources sorted by `created_at` in ascending order. Paginated list responses carry `limit`, `offset`, `total_count`, and `has_more` inside the `meta` object of the response envelope.
+
+### 2.4. Common Resource Properties
+
+Most resources in the system share a standard set of server-managed fields. `id` is a unique server-minted identifier formatted as a UUID, with no type prefix. `created_at` is an ISO 8601 UTC timestamp with three fractional digits recording when the resource was first created. `updated_at` is an ISO 8601 UTC timestamp with three fractional digits refreshed on every mutation. `version` is a system-managed integer that increments on every mutation and underpins optimistic concurrency control.
+
+The full four-field set applies to TierConfig, DeveloperOrg, SeatSubscription, EditorVersion, GameProject, InstallReport, RuntimeFeeInvoice, PolicyChange, GrandfatherCommitment, AssetListing, ExportAgreement, AuditCase, and MigrationAssessment. Two resources are deliberately leaner: a RevenueDeclaration carries only `id` and `created_at` (both `updated_at` and `version` are absent — a declaration, once filed, is never mutated), and an ExportBuild likewise carries only `id` and `created_at`, reflecting its nature as an immutable record of a build that happened. An AssetPurchase also carries only `id` and `created_at`; its `purchased_at` timestamp is the business-meaningful clock for refund windows.
+
+Any mutation to a resource — whether client-driven or a system cascade (for example, a trust-score decrement on a DeveloperOrg, a risk-score recompute on a GameProject, or a status flip on an invoice) — refreshes `updated_at` and increments `version` on every entity actually modified.
+
+### 2.5. The Logical Clock
+
+All temporal rules in the system — due dates, coverage expiry, cooling-off periods, refund windows, LTS windows, tenure calculations, attestation deadlines — are evaluated against a server-side logical clock, never wall-clock time. At server startup the logical clock reads exactly `2026-09-01T00:00:00Z`; before any clock-set call has been made, this default is the current time for every rule in the system. A `PlatformAdmin` may advance the logical clock to a supplied `to_iso8601` instant through the test-driving clock endpoint. Advancing the clock is itself an event: it triggers evaluation of SeatSubscription and ExportAgreement expiry transitions, invoice overdue transitions, and editor-version sunset cascades whose preconditions have become true. The current logical time is readable from the clock endpoint's response as `current_utc`.
+
+### 2.6. Monetary Values, Integer Cents, and Rounding
+
+Every monetary quantity in the system is represented as an integer number of cents — no decimals anywhere in the API surface. Where a calculation produces a fractional intermediate result (annualized revenue projections, waiver caps, percentage shares, early-termination fees), the value is rounded half up to the nearest cent at the point the relevant rule specifies, and always before any subsequent minimum-taking comparison or cross-line summation. Scores that must land on integers (the upgrade risk score) are likewise rounded half up. The system never reports monetary values as strings.
+
+One rounding discipline is pinned and must not be varied: where a fee is composed of multiple per-rate-tier line amounts, each line is individually rounded half up to cents first, and the invoice amount is the sum of those rounded lines. Computing the sum of unrounded line values and rounding once at the end is forbidden, because the two orders disagree on edge values.
+
+### 2.7. Tier Economics and the Two Revenue Variants
+
+Tier determination runs on two variants of the same effective-revenue figure, and the variant used depends on the decision being made. The actual trailing-twelve-months variant uses real receipts only: the sum of `gross_revenue_cents` over the up-to-12 most recent declared `period_month` values, with no projection. The annualized projection variant takes the same sum but, when fewer than 12 months have been declared, scales the partial run-rate up to a full year. The actual variant is the conservative reading and governs audit review and invoice qualification decisions; the annualized variant governs the self-service tier assessment and audit-trigger detection. Because an org with fewer than 12 declared months and positive average monthly revenue produces a strictly larger effective revenue under annualization than under actual receipts, the same declaration data can pass a revenue ceiling under the actual variant and fail it under the annualized variant; both behaviors are intended.
+
+### 2.8. The Invoice Ledger and the Compensating Invariant
+
+A RuntimeFeeInvoice carries two independent status dimensions that evolve in parallel: an assessment dimension (`assessment_status`, one of `PROVISIONAL`, `FINALIZED`, `DISPUTED`, `ADJUSTED`, `VOIDED`) tracking how firmly the amount is established, and a payment dimension (`payment_status`, one of `UNPAID`, `PAID`, `WAIVED`, `OVERDUE`) tracking collection. Payment actions (pay, waive) are only legal once the assessment dimension has reached `FINALIZED`.
+
+The org-level `balance_due_cents` on a DeveloperOrg is a derived ledger figure: the sum, over all of the org's non-terminal-credit invoices (those whose assessment dimension is `FINALIZED` or `ADJUSTED` and whose payment dimension is `UNPAID` or `OVERDUE`), of each invoice's outstanding amount, where the outstanding amount is `final_amount_cents` minus `paid_cents` minus `waived_cents`, floored at zero per invoice. Every pay and every waive is a compensating entry: the invoice's outstanding falls by exactly the amount applied, and the org's `balance_due_cents` falls by the same amount, so that the identity "final minus paid minus waived minus the balance-due delta equals zero" is preserved at every step. An invoice may never be overpaid: a payment exceeding the outstanding balance, or any payment against an invoice with zero outstanding, is rejected with `ERR_PAYMENT_EXCEEDS_BALANCE` (HTTP 422). Partial payments do not exist; the amount must equal the outstanding balance exactly.
+
+### 2.9. Optimistic Concurrency Control
+
+Two write endpoints participate in optimistic concurrency control; no other endpoint takes a version field.
+
+Creating an install report against a project requires the request to carry `expected_project_version`, holding the `version` of the GameProject as the client last observed it. If the project's current `version` does not match — because, for instance, another writer's report creation has already archived a still-DRAFT report for the same period and advanced the project — the create is rejected with `ERR_STALE_VERSION` (HTTP 412), preventing the client from unknowingly archiving a draft it never saw.
+
+Purchasing a seat subscription for an org requires the request to carry `expected_org_version`, holding the `version` of the DeveloperOrg as the client last observed it. Because seat pricing depends on the org's current effective tier constants (the seat minimum and overage rate), and a tier change or audit conversion advances the org's `version`, a mismatch means the pricing basis the client used is no longer valid; the create is rejected with `ERR_STALE_VERSION` (HTTP 412).
+
+Endpoints not named here accept no version field at all.
+
+### 2.10. Nested Resource Retrieval and Validation Ordering
+
+Requests that target nested resources are validated left-to-right along the path: the org identifier is resolved first, then the project within that org, then the child resource within that project. The first identifier that does not correspond to an existing resource yields `ERR_NOT_FOUND` (HTTP 404), and no later identifier or business rule is evaluated. This ordering applies uniformly to reads and writes.
+
+Beyond path resolution, validations on any single request are evaluated in a fixed priority order, so that when several checks would fail simultaneously the caller always sees the same error. The order is: authentication (presence and recognition of `X-User-ID` and `X-User-Role`, `ERR_UNAUTHENTICATED`) first, then role authorization (`ERR_UNAUTHORIZED`), then org ownership for org-scoped endpoints (`ERR_FORBIDDEN_ORG`), then resource existence along the path (`ERR_NOT_FOUND`), then target-state legality for action endpoints (`ERR_INVALID_STATE`), then org-level standing and migration gates (`ERR_ORG_SUSPENDED`), then interval well-formedness (`ERR_INVALID_INTERVAL`), then the three overlap checks in the order subscription overlap (`ERR_SUBSCRIPTION_OVERLAP`), agreement overlap (`ERR_AGREEMENT_OVERLAP`), LTS-window overlap (`ERR_LTS_WINDOW_OVERLAP`), then referential supportability (`ERR_VERSION_UNSUPPORTED`), then export-agreement activeness (`ERR_AGREEMENT_INACTIVE`), then uniqueness of periods and codes (`ERR_DUPLICATE_PERIOD`), then tier feature gates (`ERR_TIER_FEATURE_NOT_ALLOWED`), then seat capacity (`ERR_SEAT_CAPACITY`), then payment exactness (`ERR_PAYMENT_EXCEEDS_BALANCE`), then waiver eligibility (`ERR_WAIVER_NOT_ALLOWED`), then the migration completion gate (`ERR_MIGRATION_BLOCKED`), then the audit freeze (`ERR_AUDIT_IN_PROGRESS`), and finally generic field validation (`ERR_VALIDATION`). So, for example, a ship request on a suspended org whose editor version is also SUNSET surfaces `ERR_ORG_SUSPENDED`, not `ERR_VERSION_UNSUPPORTED`, because the standing gate is checked first.
+
+### 2.11. Status Codes
+
+Operations that create a new resource return `201 Created`; operations that modify an existing resource in place — state transitions, reviews, payments, seat assignments, clock advances — return `200 OK`. All list and single-resource reads return `200 OK`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Licensing Tiers and Studio Onboarding
+
+Everything economic in the system is anchored to a versioned **tier configuration**. A `PlatformAdmin` authors a TierConfig by supplying its `tier_code` — one of `PERSONAL`, `EDUCATION`, `PRO`, or `ENTERPRISE` — together with the tier's economic constants: `revenue_ceiling_cents`, the maximum effective annual revenue (inclusive) an org on this tier may report, where 0 means unlimited; `funding_ceiling_cents`, the maximum lifetime external funding (inclusive) permitted, likewise with 0 meaning unlimited; `seat_minimum`, the minimum number of active seats the tier requires (0 meaning none); and `seat_overage_cents`, the monthly charge levied per seat of shortfall below that minimum. Three boolean feature gates travel with the tier: `runtime_fee_exempt` (set for `PERSONAL` and `EDUCATION`, whose orgs never pay runtime fees), `export_module_allowed` (whether console export modules may be activated on this tier), and `marketplace_sell_allowed` (whether the org may publish paid asset listings).
+
+Tier configurations are versioned rather than edited in place. When a `PlatformAdmin` creates a new config carrying a `supersedes_tier_config_id` that points at an existing config, two preconditions apply: the superseding config must carry the same `tier_code` as the one it replaces, and the replaced config must currently be `ACTIVE`. On success the old config's `tier_config_status` flips from `ACTIVE` to `SUPERSEDED` — its terminal state — while the new config is created `ACTIVE` (the default `tier_config_status` for any fresh config). Orgs already on the tier keep their `effective_tier_code`; what changes is that every future tier determination reads the superseding config's constants, since only `ACTIVE` configurations participate. The list endpoint for tier configs accepts optional `tier_code` and `tier_config_status` filters.
+
+A studio enters the system when a `PlatformAdmin` registers a DeveloperOrg with its `legal_name`, `contact_email`, and the `declared_tier_code` the org signs up on. An org asserting the `EDUCATION` tier must also pass education verification: registration sets `education_verified` (defaulting to `false`) and declaring `EDUCATION` without it is rejected with `ERR_TIER_FEATURE_NOT_ALLOWED`. At registration the org's `effective_tier_code` is initialized to its `declared_tier_code`, its `trust_score` is set to 80 on a 0-to-100 scale, and its `org_standing` is set to `GOOD`.
+
+From then on, the org files a **revenue declaration** each month, carrying the `period_month` the declaration covers (a `YYYY-MM` string, unique per org — a second declaration for an already-covered month is rejected with `ERR_DUPLICATE_PERIOD`), the self-reported `gross_revenue_cents` for that month, and any `funding_received_cents` newly received. The server stamps `declared_at` at filing time. Each declaration triggers a full tier determination; both variants are visible side by side on the tier-assessment computed read, which reports `org_id`, `actual_ttm_revenue_cents`, `annualized_revenue_cents`, `lifetime_funding_cents`, `months_declared`, `tier_by_actual`, `tier_by_annualized`, and the org's current `effective_tier_code`.
+
+Tier determination works as follows. The number of months declared is the count of the org's RevenueDeclaration rows by distinct `period_month`. The trailing-twelve-month revenue is the sum of `gross_revenue_cents` over the up-to-12 most recent declared months. When fewer than 12 months exist, the actual variant takes that partial sum as-is while the annualized variant divides the partial sum by the number of months declared, multiplies by 12, and rounds half up to whole cents; once 12 or more months exist, both variants use the plain trailing sum. Lifetime funding is the sum of `funding_received_cents` across all declarations of any period. The signal tier is the lowest-ranked tier whose `revenue_ceiling_cents` is 0 or at least the effective revenue, *and* whose `funding_ceiling_cents` is 0 or at least the lifetime funding, reading constants from `ACTIVE` tier configs only. Tier ranks are pinned: `PERSONAL` ranks 1, `EDUCATION` ranks 2, `PRO` ranks 3, `ENTERPRISE` ranks 4, and `EDUCATION` counts only when `education_verified` is true — otherwise it is treated at `PERSONAL` rank. If no ACTIVE config admits the figures, there is no signal tier and the effective tier remains the declared tier. The org's `effective_tier_code` is the higher of its declared tier and the signal tier, recomputed under the annualized projection variant — the variant that governs the self-service tier assessment — while the actual variant is reserved for audit review and invoice qualification (§2.7). When a recomputation changes the effective tier, the org's `version` bumps. And when the annualized variant breaches the current tier's ceiling, an AuditCase suggestion is recorded automatically, feeding the audit pipeline of §3.8.
+
+An org's `org_standing` is derived from three signals: the count of open AuditCases, the count of overdue invoices, and the `trust_score`. It cycles through `GOOD`, `REVIEW`, and `SUSPENDED`; a single overdue invoice forces at least `REVIEW`, and the deeper triggers are described with their sources below. The org's `migration_status` (`NONE`, `ASSESSING`, `COOLING_OFF`, `MIGRATED`) is likewise derived, from the latest non-terminal MigrationAssessment. The two standing gates that pervade the rest of this document are these: a `SUSPENDED` org may not ship a project, submit an asset listing for review, or purchase an asset (each attempt fails with `ERR_ORG_SUSPENDED`); and once `migration_status` is `MIGRATED`, no new business write of any kind is accepted for the org.
+
+### 3.2. Seats: Purchase, Assignment, and the Coverage Window
+
+Paid tiers are seat-based. An `OrgOwner` (or `PlatformAdmin`) purchases a SeatSubscription for their org by naming the `tier_code` — only the paid seat tiers `PRO` and `ENTERPRISE` are accepted — the `purchased_seats` count (which must be at least 1), and the coverage interval as `coverage_start` and `coverage_end`. Coverage is a half-open interval: it includes `coverage_start` and excludes `coverage_end`, so `coverage_start` must be strictly before `coverage_end` or the purchase fails with `ERR_INVALID_INTERVAL`. Two subscriptions for the same org and the same `tier_code` may not overlap in half-open terms; back-to-back coverage where one subscription ends exactly on the day another begins is explicitly allowed. An overlapping purchase is rejected with `ERR_SUBSCRIPTION_OVERLAP`. Because the purchase is priced against the org's current effective tier, it carries the OCC field `expected_org_version` described in §2.9, and a successful purchase increments the org's `version` by 1.
+
+A fresh subscription starts `ACTIVE` with `active_seats` at 0 and `available_seats` equal to `purchased_seats`; the invariant `active_seats` plus `available_seats` equals `purchased_seats` holds at all times. Assigning a seat to a team member (the request carries a `member_label`) moves one seat: `active_seats` increases by 1 and `available_seats` decreases by 1. When the last available seat is assigned and `active_seats` reaches `purchased_seats`, the `subscription_status` flips from `ACTIVE` to `EXHAUSTED` automatically. An assign against a subscription with no available seats is rejected with `ERR_SEAT_CAPACITY`. Releasing a seat is the mirror image: it requires at least one active seat (otherwise `ERR_SEAT_CAPACITY`), decrements `active_seats`, increments `available_seats`, and returns an `EXHAUSTED` subscription to `ACTIVE` once the active count falls below the purchased count. Subscriptions may be listed with an optional `tier_code` filter.
+
+Time is the third actor. When the logical clock reaches or passes `coverage_end`, a subscription — whether `ACTIVE` or `EXHAUSTED` — transitions to its terminal `EXPIRED` state: all seats are released, `active_seats` drops to 0, and `available_seats` is recorded as equal to `purchased_seats` as a historical note; those seats are released, not assignable. Expiry evaluation happens whenever the clock advances (§2.5).
+
+### 3.3. Editor Versions, Game Projects, and Upgrade Risk
+
+The engine's own software lifecycle is modeled explicitly. A `PlatformAdmin` registers an EditorVersion with a `version_string` (for example `2022.3.45f1`, unique across the system — a duplicate is rejected with `ERR_DUPLICATE_PERIOD`), the `major_line` it belongs to (for example `2022.3`, grouping versions into a long-term-support line), the `released_on` ISO date, and an optional `deprecated_api_count` (defaulting to 0) recording how many APIs the next major line removes. New versions start with `support_status` `SUPPORTED`. The versions list supports `major_line` and `support_status` filters.
+
+A `PlatformAdmin` advances a version's support lifecycle through transitions that carry a `target_status` and, where relevant, window dates. From `SUPPORTED`, a version may be promoted to `LTS` by supplying `lts_window_start` and `lts_window_end`; the promotion is refused with `ERR_LTS_WINDOW_OVERLAP` if any other version on the same `major_line` already has an LTS window overlapping the proposed closed interval — and because the interval is closed, two windows that merely touch on the same calendar day still count as overlapping. The window dates are stored on the version, and every shipped project pinned to the version has its `upgrade_risk_score` recomputed. From `LTS`, a version moves to `DEPRECATED` once the current date has passed `lts_window_end`; shipped projects pinned to it again have their risk recomputed, now at a higher weight. A version may also skip LTS entirely, moving straight from `SUPPORTED` to `DEPRECATED` once its `released_on` date is at least 24 months in the past, with the same risk recompute. Finally, from `DEPRECATED` a version reaches its terminal `SUNSET` state once its `lts_window_end` lies at least 12 months in the past; at that moment every shipped project pinned to the version freezes (see below) — Frozen projects keep their `lifetime_installs`, and their outstanding invoices remain payable. Any transition request carrying malformed or ill-formed date values is rejected with `ERR_INVALID_INTERVAL`.
+
+A studio's work is organized into GameProjects. An `OrgOwner` (or `PlatformAdmin`) creates one under their org with a `title`, the `editor_version_id` pinning the project to a specific editor version, and an optional `charity_flag` (default `false`) marking a charity or hobby project exempt from runtime fees. The pinned version must exist and must not be `SUNSET`, at creation and again at ship time; a missing or sunset version is rejected with `ERR_VERSION_UNSUPPORTED`. Projects begin in `DEVELOPMENT` with `upgrade_risk_score` initialized. Org projects may be listed with a `project_status` filter, and a cross-org filtered project list accepts `editor_version_id`, `org_id`, and `pinned_policy_change_id` filters.
+
+Shipping is the pivotal act. An `OrgOwner` ships a `DEVELOPMENT` project, provided the owning org's `org_standing` is not `SUSPENDED` (`ERR_ORG_SUSPENDED` otherwise) and the pinned version is not `SUNSET` (`ERR_VERSION_UNSUPPORTED`). The ship transition sets `shipped_on` to the current date and starts runtime-fee tracking with `lifetime_installs` at 0. Shipping also runs a grandfathering evaluation, described with policy changes in §3.5: if an `ACTIVE` adverse retroactive policy change exists whose grandfather window is still open, and the project was shipped on or before the change's `announcement_date` — meaning in practice the ship predates the announcement — a GrandfatherCommitment is created automatically for the project; projects shipped after the announcement instead settle onto the `CONVERTED` schedule going forward.
+
+The upgrade risk score condenses four signals into a single integer from 0 to 100. The support weight contributes up to 25 points: `SUPPORTED` weighs 0, `LTS` weighs 1, `DEPRECATED` weighs 2, and `SUNSET` weighs 3, and the contribution is 25 times the weight divided by 3. Age contributes up to 20 points: the number of whole months since `released_on`, divided by 36 and capped at 1, times 20. The install base contributes up to 35 points: the base-10 logarithm of one plus `lifetime_installs`, divided by 7, capped at 1, times 35. Deprecated APIs contribute up to 20 points: the smaller of `deprecated_api_count` and 200, divided by 200, times 20. The four contributions are summed, capped at 100, and rounded half up to an integer. The score is recomputed on ship, on every support-status transition of the pinned version, and on every install acceptance; when the pinned version sunsets, the recompute runs at the maximum editor-age weight.
+
+A project whose pinned editor version reaches `SUNSET` transitions from `SHIPPED` to `FROZEN`: no new install report may be created for it (attempts are rejected with `ERR_PROJECT_FROZEN`), and its risk score is recomputed as just described. Freezing does not erase history — `lifetime_installs` stays, and outstanding RuntimeFeeInvoices remain payable. The only way out of `FROZEN`, `SHIPPED`, or `DEVELOPMENT` at end of life is the terminal `ARCHIVED` state, which projects reach when the owning org's migration completes (§3.8); for shipped projects the migration gate ensures every non-terminal invoice is already `PAID` or `WAIVED` before archiving, while projects that never shipped carry no runtime invoices and archive without settlement.
+
+### 3.4. Install Reports, Runtime Fees, and the Invoice Lifecycle
+
+Runtime fees settle monthly, driven by the studio's own self-reporting. An `OrgOwner` files an InstallReport against one of their shipped projects, naming the `period_month` (`YYYY-MM`), the `new_device_installs` (installs on devices never previously reported for this project), the `reinstalls` (re-installs on previously counted devices, exempt from the fee), and the `bundle_installs` (installs sold via charity or subscription bundles, likewise exempt). Because a create for a period legitimately supersedes a still-`DRAFT` report for the same period — the prior draft is archived and its `PROVISIONAL` invoice is voided, with the new report's `supersedes_report_id` pointing back at the archived draft — the create carries the OCC field `expected_project_version` of §2.9, and a successful create bumps the project's `version` by 1. At most one non-`ARCHIVED` report may exist per project per period; attempting to create a second live report for a covered period fails with `ERR_DUPLICATE_PERIOD`. Reports on `FROZEN` or `ARCHIVED` projects are refused with `ERR_PROJECT_FROZEN`. The `billable_installs` of a report are exactly its `new_device_installs`; reinstalls and bundle installs never contribute. A new report starts as `DRAFT`. Project-scoped reports may be listed with a `report_status` filter, and a cross-project filtered list supports reverse lookups by `project_id`, `supersedes_report_id`, and `report_status`.
+
+Submitting a `DRAFT` report moves it to `SUBMITTED`. Submission requires the owning project to be `SHIPPED` (not frozen or archived) and the owning org to be free of any open audit — an AuditCase in `OPENED` or `EVIDENCE_REQUESTED` (and, for the migration gate, `APPEALED`) freezes reporting, and a submit attempt during an audit is rejected with `ERR_AUDIT_IN_PROGRESS`. At submission the system creates the report's RuntimeFeeInvoice in `PROVISIONAL` assessment status and `UNPAID` payment status, with `provisional_amount_cents` computed by the provisional variant of the runtime fee assessment; `lifetime_installs` on the project is not yet touched. A report carries exactly one non-`VOIDED` invoice across its entire lifecycle: if the report already has one — for instance an `ADJUSTED` invoice left by a dispute revision — resubmission re-rates that same invoice back to `PROVISIONAL` with a recomputed `provisional_amount_cents` rather than creating a second invoice for the report.
+
+From `SUBMITTED`, a `ReviewBoard` member takes the report into `UNDER_REVIEW` by reviewing with `action` `REVIEW`. From `UNDER_REVIEW` the same review capability, invoked with `action` `ACCEPT`, accepts the report (the precondition is simply that `billable_installs` is non-negative); acceptance is the settlement moment and cascades three ways: the project's `lifetime_installs` increases by the report's `billable_installs` (this is the one and only point at which installs are consumed into the lifetime count), the invoice's `assessment_status` becomes `FINALIZED` with `final_amount_cents` recomputed under the final variant and `due_date` set to 30 days after finalization, and the org's `balance_due_cents` increases by `final_amount_cents`. Alternatively the reviewer may dispute the report with `action` `DISPUTE` and a `review_note`: the report moves to `DISPUTED`, the note is stored, and the invoice's assessment status becomes `DISPUTED` with its amount frozen at the provisional figure. Dispute is not an end state. The `OrgOwner` may revise a `DISPUTED` report back to `DRAFT`, supplying corrected `new_device_installs`, `reinstalls`, and `bundle_installs`; `billable_installs` is recomputed, and the invoice moves to `ADJUSTED` with a recomputed `provisional_amount_cents`. The revision cycle `DISPUTED` back through `DRAFT` and `SUBMITTED` may repeat as often as needed. `ACCEPTED` and `ARCHIVED` are the report's terminal states.
+
+The **runtime fee assessment** itself is a tiered calculation with a strict eligibility gate and a pinned rounding order. The gate is a conjunction of two thresholds, evaluated on the actual trailing-twelve-months revenue variant: the project's `lifetime_installs` *before* this report, plus the report's `billable_installs`, must reach at least one million installs, and the org's effective revenue must reach at least one hundred million cents. If the org's `ACTIVE` tier config is runtime-fee-exempt, or the project's `charity_flag` is set, the amount is zero regardless of the gate. Installs below the threshold are never charged: when the threshold is crossed within the reporting period, only the portion of `billable_installs` above the threshold minus the prior lifetime count is chargeable. Chargeable installs are priced marginally: the first 100,000 chargeable installs in the period are charged at 20 cents each, and every chargeable install beyond 100,000 at 5 cents each. Each rate tier's line amount is rounded half up to whole cents first, and the invoice amount is the sum of the rounded lines — never the other way around.
+
+Which rate schedule applies follows a pinned selection order. First: if the project has a `pinned_policy_change_id` whose GrandfatherCommitment is still `ACTIVE` — attested, or simply still within its attestation window — the `BASE` pre-change rates apply, and the invoice's `fee_schedule_label` records `BASE`. Second: if the org was converted to a new tier by audit, the invoice is labeled `CONVERTED` and priced at the current rates of the new tier. Third: otherwise the rates of the current `ACTIVE` policy change apply if one exists, else the `BASE` rates. An anti-double-counting rule binds every schedule: an install is counted at most once across all reports, because billable installs are consumed into `lifetime_installs` at acceptance, and no schedule — old or new — may re-charge installs already counted; a retroactive policy changes the *rate going forward*, never re-bills accepted installs.
+
+The **provisional and final variants** differ only in their inputs and timing. The provisional variant runs at submit time on the self-reported figures and the lifetime count as of submission; it may even be computed while the org sits on an exempt tier and be re-rated later on tier conversion. The final variant runs at acceptance — or when a `FinanceOps` operator explicitly finalizes a `PROVISIONAL` invoice whose source report is `ACCEPTED` — and recomputes `billable_installs` from the post-dispute revised figures, re-evaluating the gate against the lifetime count at acceptance time; a dispute revision that lowers billable installs below the crossing point yields a final amount smaller than the provisional for identical originally-submitted data. Explicit finalization also sets `due_date` to 30 days out and updates the org's balance.
+
+Invoices then move through collection. A `FinanceOps` operator pays an invoice by supplying an `amount_cents` that must equal the outstanding balance — `final_amount_cents` minus `paid_cents` minus `waived_cents` — exactly; the assessment dimension must be `FINALIZED`, and the payment dimension must be `UNPAID` or `OVERDUE`. Overpayment, underpayment, or any payment against a zero-outstanding invoice is rejected with `ERR_PAYMENT_EXCEEDS_BALANCE`. A successful payment adds the amount to `paid_cents`, drops the org's `balance_due_cents` by the same amount, and moves the payment dimension to `PAID`. Waiver is the parallel write-off: the invoice must be `FINALIZED` and must qualify — the project's `charity_flag` is set, or the org's effective tier at finalization was `PERSONAL` or `EDUCATION`, or grandfathering was applied in error — and the requested waiver must respect the waiver cap: half of the final amount, computed by multiplying `final_amount_cents` by 0.5 and rounding half up to whole cents before comparison, unless the invoice qualifies for a full waiver. An ineligible invoice or an over-cap amount is rejected with `ERR_WAIVER_NOT_ALLOWED`; the waive request carries the `amount_cents` and a `reason`. A successful waive adds to `waived_cents`, reduces the org's balance by the waived amount (preserving the compensating invariant of §2.8), and moves the payment dimension to `WAIVED` once the outstanding reaches zero.
+
+Time acts on invoices too. When the logical clock passes an invoice's `due_date` with an outstanding balance still above zero, the payment dimension flips to `OVERDUE` and the org's standing is recomputed — at least one overdue invoice forces the standing to at least `REVIEW`. Finally, an invoice whose source `DRAFT` report is archived by supersession before ever being submitted is itself `VOIDED`: its provisional amounts are discarded with no balance impact. The invoice's terminal combinations are `FINALIZED`/`PAID`, `FINALIZED`/`WAIVED`, and `VOIDED`/`UNPAID`.
+
+Invoices may be listed per project with `assessment_status` and `payment_status` filters, or across projects with `project_id`, `report_id`, `assessment_status`, and `payment_status` filters — the latter supporting reverse lookup of the invoice a report spawned. The org's ledger is also exposed as a computed read returning `org_id`, `invoiced_cents`, `paid_cents`, `waived_cents`, and the reconciled `balance_due_cents`.
+
+### 3.5. Policy Changes, Grandfathering, and Trust
+
+Fee policy is a managed, auditable object — because the platform's history demands it. A `PlatformAdmin` drafts a PolicyChange with a unique `change_code` (for example `RUNTIME-FEE-2023`; a duplicate is rejected with `ERR_DUPLICATE_PERIOD`), an `announcement_date`, an `effective_date`, a `retroactive_flag` marking the change as retroactive (true when the effective date precedes the announcement date or the change applies to already-shipped projects), an `adverse_flag` marking it as fee-increasing for existing licensees, a `grandfather_window_days` count, and the `new_per_install_cents` marginal rate the change introduces. A policy change is created `DRAFT`.
+
+Activation is where the consequences land; it moves `change_status` from `DRAFT` to `ACTIVE`. A `PlatformAdmin` activates a `DRAFT` change provided both dates are set and — if `retroactive_flag` is true — the `grandfather_window_days` is at least 30; activating a retroactive change with a shorter window is rejected with `ERR_POLICY_WINDOW_TOO_SHORT`. Activation runs a three-hop cascade. Hop one: every GameProject whose `project_status` is `SHIPPED` and whose `shipped_on` is on or before the `announcement_date` receives a GrandfatherCommitment with `locked_schedule_label` `BASE` — the schedule frozen at pre-change rates — and an `attestation_deadline` set to the announcement date plus the grandfather window in days. Hop two: each such project's `pinned_policy_change_id` is set to the change, and any `PROVISIONAL` invoices on those projects keep the `BASE` schedule label. Hop three, only when the change is both retroactive and adverse: every affected org's `trust_score` drops by 10, and any org whose score falls below 50 flips `org_standing` to `REVIEW` — which cascades further, returning that org's `APPROVED` asset listings to `PENDING_REVIEW`. A `DRAFT` change may instead be rescinded, moving it to its other terminal state `RESCINDED`, with no further effect.
+
+A GrandfatherCommitment is not self-executing: the studio must attest. An `OrgOwner` attests the commitment before its `attestation_deadline`; an attested commitment stays `ACTIVE` past the deadline and the project keeps its pinned `BASE` schedule permanently. An unattested commitment is voided by the clock itself: once the current date passes the `attestation_deadline` with the commitment still `ACTIVE` and unattested, its `commitment_status` becomes `VOIDED`, the linked project's `pinned_policy_change_id` is cleared, and subsequent invoice re-rates use the current schedule rather than `BASE`. Commitments are listed with `policy_change_id`, `org_id`, and `project_id` filters.
+
+### 3.6. The Asset Marketplace
+
+Studios on tiers whose configs permit it may sell assets to one another. An `OrgOwner` drafts an AssetListing under their org with a `title` and a `price_cents` (0 is allowed, publishing a free asset); the listing starts `DRAFT` with `review_rounds` at zero. Submitting a listing for review moves it to `PENDING_REVIEW` and increments `review_rounds` by 1, but only when three preconditions hold: the creator org's tier config allows marketplace selling (otherwise `ERR_TIER_FEATURE_NOT_ALLOWED`), the creator org's `org_standing` is `GOOD` (otherwise `ERR_ORG_SUSPENDED`), and the price is non-negative (otherwise `ERR_VALIDATION`). Org listings may be listed with a `listing_status` filter.
+
+A `ReviewBoard` member then reviews a `PENDING_REVIEW` listing with `action` `APPROVE` or `REJECT`, moving it to `APPROVED` or `REJECTED` respectively. The marketplace's lifecycle is deliberately cyclic: a `REJECTED` listing may be revised back to `DRAFT` with an updated `title` and `price_cents`, and an `APPROVED` listing may be delisted by its owner into `DELISTED` — which removes it from purchase but leaves historical purchases untouched — and a `DELISTED` listing may likewise be revised back to `DRAFT`, so the loop from `DRAFT` through review and back can repeat, each resubmission incrementing `review_rounds`. There is also a system-driven edge: when a creator org's standing drops to `REVIEW` or `SUSPENDED` — for instance through an adverse retroactive policy activation — its `APPROVED` listings cascade back to `PENDING_REVIEW` with `review_rounds` incremented, and must be re-approved before new purchases.
+
+Purchasing is the economic act. An `OrgOwner` buys an `APPROVED` listing — the request carries no body; the server records the calling org as the purchase's `buyer_org_id` and the listing's owning org as its `creator_org_id`, and an org buying its own listing is rejected with `ERR_BUYER_IS_CREATOR`. The resulting AssetPurchase snapshots the charge: `gross_cents` equals the listing's price at purchase time, and the split between platform and creator follows the creator revenue share schedule. The share tier is chosen by the creator's lifetime gross — the sum of `gross_cents` over the creator org's prior `COMPLETED` purchases before this one: below one hundred million cents of lifetime gross the platform takes 30 percent; at or above that boundary the platform takes 25 percent. The percentage is applied to this purchase's gross only — it is an average-rate tiering, not a marginal one. The `platform_share_cents` is the gross times the percentage, rounded half up to whole cents; the `creator_share_cents` is the remainder. The creator org's `marketplace_credit_cents` — its accumulated payout balance, which never goes negative — increases by the creator share, and the purchase is recorded `COMPLETED` with `purchased_at` stamped by the server. Purchases may be listed with `listing_id` and `buyer_org_id` filters.
+
+Refunds unwind a purchase exactly. A `PlatformAdmin` or `FinanceOps` operator may refund a purchase within 14 days of its `purchased_at` timestamp; a refund attempted later, or against an already-`REFUNDED` purchase, is rejected with `ERR_REFUND_WINDOW_EXPIRED`. A successful refund sets `purchase_status` to `REFUNDED` and decrements the creator org's `marketplace_credit_cents` by exactly the `creator_share_cents` the purchase added — purchase and refund net to zero.
+
+### 3.7. Console Export Agreements
+
+Shipping to console platforms requires a separate agreement per platform. An `OrgOwner` requests an ExportAgreement for their org by naming the `platform_code` — one of `CONSOLE_A`, `CONSOLE_B`, or `CONSOLE_C` — and the `term_start` and `term_end` dates. The term is a closed interval: both endpoints are inclusive, `term_start` must be on or before `term_end` (a reversed or malformed interval fails with `ERR_INVALID_INTERVAL`), and the overlap rule is correspondingly stricter than the subscription rule — two `ACTIVE` or `PENDING` agreements for the same org and platform whose closed terms so much as touch, including an existing agreement ending exactly on the new term's start date, conflict, and a conflicting request fails with `ERR_AGREEMENT_OVERLAP`. The agreement is created `PENDING`. Agreements may be listed with `platform_code` and `agreement_status` filters.
+
+A `PlatformAdmin` activates a `PENDING` agreement. Activation re-checks the overlap rule and enforces the tier feature gate: the org's effective tier must permit console export modules, or activation fails with `ERR_TIER_FEATURE_NOT_ALLOWED`. While an agreement is `ACTIVE`, the org may record ExportBuilds against it: an `OrgOwner` records a build on one of their projects by supplying the `agreement_id`, the `platform_code`, and a free-form `build_label`; the server stamps `created_on`. The referenced agreement must belong to the same org, match the build's `platform_code`, and be `ACTIVE` — a missing, wrong-org, wrong-platform, or non-active agreement is rejected with `ERR_AGREEMENT_INACTIVE`. Builds are listed per project with a `platform_code` filter, or across projects with `agreement_id` and `project_id` filters.
+
+Revocation is the sharp edge. A `PlatformAdmin` revokes an `ACTIVE` agreement, after which future ExportBuild creation for that platform is rejected. The second hop is subtler: on subsequently submitted install reports, billable console installs for that platform become exempt — treated as `bundle_installs` — on projects whose only export channel was this agreement, which changes provisional invoice amounts on those later reports. Expiry is the clock's job: when the logical clock passes `term_end`, an agreement moves to its terminal `EXPIRED` state. `REVOKED` and `EXPIRED` are both terminal.
+
+### 3.8. Audits, Appeals, and Developer Migration
+
+The audit pipeline guards tier eligibility. An `Auditor` (or `PlatformAdmin`) opens an AuditCase against an org with a `trigger_reason` of `REVENUE_CEILING_BREACH`, `EDUCATION_ELIGIBILITY`, or `MANUAL`; the case starts `OPENED`, and while any case on the org is `OPENED`, `EVIDENCE_REQUESTED`, or `APPEALED`, the org is blocked from submitting install reports (`ERR_AUDIT_IN_PROGRESS`). Cases may be listed with a `case_status` filter. An `Auditor` moves an `OPENED` case to `EVIDENCE_REQUESTED` by requesting evidence, then resolves it in one of two directions.
+
+Resolving with `outcome` `CLEAR` closes the case as `CLEARED` and lifts the org's restrictions. Resolving with `outcome` `CONVERT` and a `resolved_tier_code` forces a tier conversion, provided the resolved tier is strictly higher in rank than the org's current `effective_tier_code`; conversion runs a three-hop cascade. Hop one: the org's `effective_tier_code` becomes the resolved tier and its `trust_score` drops by 15. Hop two: the back-bill is computed — the org's declarations are processed in `period_month` ascending order (ties broken by `declared_at` ascending), the breach month is the first period whose cumulative annualized effective revenue (the annualized projection variant) exceeded the old tier's `revenue_ceiling_cents`, the months since breach are the whole months between the breach month and the current month with any partial month rounded down, the shortfall is the new tier's `seat_minimum` minus the total `purchased_seats` across the org's `ACTIVE` and `EXHAUSTED` subscriptions (floored at zero), and `back_bill_cents` is the shortfall times the new tier's `seat_overage_cents` times the months since breach. Hop three: every open `PROVISIONAL` invoice on the org is re-rated under the new tier's constants and relabeled `CONVERTED` — if the new tier is not runtime-fee-exempt and the old one was, provisional amounts may rise — and `balance_due_cents` is recomputed. Both `CLEARED` and `CONVERTED` are terminal for the case itself.
+
+Conversion is appealable. An `OrgOwner` appeals a `CONVERTED` case, provided `appeal_count` is below 2; each appeal increments `appeal_count` by 1, and an appeal on a case that has already exhausted two appeals, or is not `CONVERTED`, is rejected with `ERR_APPEAL_EXHAUSTED`. An `APPEALED` case is settled by a further auditor resolution: `outcome` `CLEAR` upholds the appeal — the org's `effective_tier_code` is restored to its pre-conversion tier, the `trust_score` is raised back by 15 as a compensating reversal, `CONVERTED`-labeled `PROVISIONAL` invoices are re-rated back to the prior tier's schedule, and the back-bill is reversed; `outcome` `CONVERT` denies the appeal and the conversion stands with no further state change.
+
+Migration is the exit door. An `OrgOwner` opens a MigrationAssessment for their org by naming a free-form `target_engine`; the assessment starts `REQUESTED` and the org's `migration_status` becomes `ASSESSING`. Assessments may be listed with an `assessment_status` filter. Advancing the assessment to `EXPORT_READY` computes the `buyout_quote_cents` through the buyout settlement: the outstanding invoices component is the org's `balance_due_cents`; the committed seat remainder is the sum, over the org's `ACTIVE` and `EXHAUSTED` seat subscriptions, of `purchased_seats` times 15,000 cents per seat-month times the number of remaining whole months until `coverage_end` (any partial remaining month rounds up); and the early termination fee depends on the org's tenure measured from its `created_at` — at least 36 months of tenure, no fee; at least 12 months but fewer than 36, ten percent of the sum of the two components, rounded half up to whole cents; under 12 months, twenty-five percent of that sum, rounded half up. The quote is the sum of the three components.
+
+Each advance request carries a `target` naming the desired next state. From `EXPORT_READY`, advancing to `COOLING_OFF` sets `cooling_off_until` to 14 days after the current date. From `COOLING_OFF` there are two exits. Advancing to `ABANDONED` — also possible directly from `REQUESTED` — closes the assessment as `ABANDONED` and returns the org's `migration_status` to `NONE`. Advancing to `COMPLETED` is gated on three conditions, all enforced together under `ERR_MIGRATION_BLOCKED`: the current date must be on or after `cooling_off_until`, every RuntimeFeeInvoice of the org must be `PAID` or `WAIVED`, and no AuditCase on the org may be `OPENED`, `EVIDENCE_REQUESTED`, or `APPEALED`. Completion cascades: the org's `migration_status` becomes `MIGRATED`, every GameProject of the org — `DEVELOPMENT`, `SHIPPED`, or `FROZEN` — transitions to `ARCHIVED`, and every `APPROVED` AssetListing of the org is `DELISTED`. From that point the org is read-only for new business: any new business write against a `MIGRATED` org fails with `ERR_ORG_SUSPENDED`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource — a tier config, an org, a declaration, a subscription, a project, an editor version, an install report, a policy change, a listing, a purchase, an agreement, a build, an audit case, a migration assessment — return `201 Created`. Operations that modify an existing resource in place (transitions, reviews, payments, waivers, seat assign/release, clock advance, attest, refund, and all `advance`/`resolve`/`activate`-style actions) return `200 OK`, as do all reads. The complete request and response semantics of every endpoint are defined by the workflows in Section 3; this table is a locator only.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Advance the test-driving logical clock to a supplied instant | PlatformAdmin |
+| POST | `/tiers` | Create a tier config, optionally superseding an existing ACTIVE config of the same tier | PlatformAdmin |
+| GET | `/tiers` | List tier configs | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| GET | `/tiers/{id}` | Get one tier config | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| POST | `/orgs` | Register a developer org on a declared tier | PlatformAdmin |
+| GET | `/orgs/{id}` | Get an org with its computed fields | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/orgs/{id}/revenue-declarations` | File a monthly revenue/funding declaration | OrgOwner, PlatformAdmin |
+| GET | `/orgs/{id}/revenue-declarations` | List an org's revenue declarations | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/orgs/{id}/tier-assessment` | Computed read: both tier-determination variants side by side | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/orgs/{id}/seat-subscriptions` | Purchase a seat subscription (OCC on org version) | OrgOwner, PlatformAdmin |
+| GET | `/orgs/{id}/seat-subscriptions` | List an org's seat subscriptions | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/seat-subscriptions/{id}/assign` | Assign one seat to a team member | OrgOwner |
+| POST | `/seat-subscriptions/{id}/release` | Release one assigned seat | OrgOwner |
+| POST | `/orgs/{id}/projects` | Create a game project pinned to an editor version | OrgOwner, PlatformAdmin |
+| GET | `/orgs/{id}/projects` | List an org's projects | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/projects` | Filtered list of projects across orgs | PlatformAdmin, FinanceOps, Auditor |
+| GET | `/projects/{id}` | Get one project | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| POST | `/projects/{id}/ship` | Mark a project shipped; starts runtime-fee tracking | OrgOwner |
+| POST | `/editor-versions` | Register an editor version | PlatformAdmin |
+| GET | `/editor-versions` | List editor versions | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| GET | `/editor-versions/{id}` | Get one editor version | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| POST | `/editor-versions/{id}/transition` | Advance an editor version's support lifecycle | PlatformAdmin |
+| POST | `/projects/{id}/install-reports` | Create a monthly install report (OCC on project version); supersedes a DRAFT for the same period | OrgOwner |
+| GET | `/projects/{id}/install-reports` | List install reports for a project | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| GET | `/install-reports/{id}` | Get one install report | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| GET | `/install-reports` | Filtered list of install reports across projects | PlatformAdmin, FinanceOps, Auditor, ReviewBoard |
+| POST | `/install-reports/{id}/submit` | Submit a DRAFT report; creates the PROVISIONAL invoice | OrgOwner |
+| POST | `/install-reports/{id}/review` | Review action: REVIEW, ACCEPT, or DISPUTE | ReviewBoard |
+| POST | `/install-reports/{id}/revise` | Revise a DISPUTED report back to DRAFT with corrected figures | OrgOwner |
+| GET | `/projects/{id}/invoices` | List runtime fee invoices for a project | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/invoices` | Filtered list of runtime fee invoices across projects | PlatformAdmin, FinanceOps, Auditor |
+| GET | `/invoices/{id}` | Get one invoice | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/invoices/{id}/finalize` | Finalize a PROVISIONAL invoice whose report is ACCEPTED | FinanceOps |
+| POST | `/invoices/{id}/pay` | Pay the outstanding balance exactly | FinanceOps |
+| POST | `/invoices/{id}/waive` | Waive an eligible invoice, subject to cap rules | FinanceOps |
+| GET | `/orgs/{id}/ledger` | Computed read: invoice totals, paid, waived, balance reconciliation | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/policy-changes` | Create a fee policy change (DRAFT) | PlatformAdmin |
+| GET | `/policy-changes/{id}` | Get one policy change | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/policy-changes/{id}/activate` | Activate a policy change; runs the grandfathering and trust cascade | PlatformAdmin |
+| POST | `/policy-changes/{id}/rescind` | Rescind a DRAFT policy change | PlatformAdmin |
+| GET | `/grandfather-commitments` | Filtered list of grandfather commitments | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/grandfather-commitments/{id}` | Get one grandfather commitment | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/grandfather-commitments/{id}/attest` | Attest a grandfather commitment before its deadline | OrgOwner |
+| POST | `/orgs/{id}/asset-listings` | Create an asset listing (DRAFT) | OrgOwner |
+| GET | `/orgs/{id}/asset-listings` | List listings created by an org | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| GET | `/asset-listings/{id}` | Get one listing | PlatformAdmin, OrgOwner, FinanceOps, Auditor, ReviewBoard |
+| POST | `/asset-listings/{id}/submit-review` | Submit a listing for content review | OrgOwner |
+| POST | `/asset-listings/{id}/review` | Review action APPROVE or REJECT | ReviewBoard |
+| POST | `/asset-listings/{id}/revise` | Return a REJECTED or DELISTED listing to DRAFT with edits | OrgOwner |
+| POST | `/asset-listings/{id}/delist` | Delist an APPROVED listing | OrgOwner |
+| POST | `/asset-listings/{id}/purchase` | Buy an APPROVED listing; splits revenue per the creator share schedule | OrgOwner |
+| GET | `/asset-purchases` | Filtered list of purchases | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/asset-purchases/{id}` | Get one purchase | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/asset-purchases/{id}/refund` | Refund a purchase within 14 days; reverses the creator credit exactly | PlatformAdmin, FinanceOps |
+| POST | `/orgs/{id}/export-agreements` | Request a console platform export agreement (PENDING) | OrgOwner |
+| GET | `/orgs/{id}/export-agreements` | List export agreements | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/export-agreements/{id}` | Get one export agreement | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/export-agreements/{id}/activate` | Activate a PENDING agreement | PlatformAdmin |
+| POST | `/export-agreements/{id}/revoke` | Revoke an ACTIVE agreement | PlatformAdmin |
+| POST | `/projects/{id}/export-builds` | Record a console export build against a matching ACTIVE agreement | OrgOwner |
+| GET | `/projects/{id}/export-builds` | List export builds for a project | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| GET | `/export-builds` | Filtered list of export builds across projects | PlatformAdmin, FinanceOps, Auditor |
+| GET | `/export-builds/{id}` | Get one export build | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/orgs/{id}/audit-cases` | Open an eligibility audit | Auditor, PlatformAdmin |
+| GET | `/orgs/{id}/audit-cases` | List audit cases | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/audit-cases/{id}/request-evidence` | Move an OPENED case to EVIDENCE_REQUESTED | Auditor |
+| POST | `/audit-cases/{id}/resolve` | Resolve a case with outcome CLEAR or CONVERT | Auditor |
+| POST | `/audit-cases/{id}/appeal` | Appeal a CONVERTED case (at most two appeals) | OrgOwner |
+| POST | `/orgs/{id}/migration-assessments` | Begin a migration evaluation for an org | OrgOwner |
+| GET | `/orgs/{id}/migration-assessments` | List migration assessments | PlatformAdmin, OrgOwner, FinanceOps, Auditor |
+| POST | `/migration-assessments/{id}/advance` | Advance an assessment: EXPORT_READY, COOLING_OFF, COMPLETED, or ABANDONED | OrgOwner |
+
+## 5. Error Code Catalogue
+
+Trigger conditions for each error are defined in the narratives of Sections 2 and 3; this catalogue is a locator only.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_FORBIDDEN_ORG` | 403 |
+| `ERR_NOT_FOUND` | 404 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_ORG_SUSPENDED` | 409 |
+| `ERR_INVALID_INTERVAL` | 422 |
+| `ERR_SUBSCRIPTION_OVERLAP` | 409 |
+| `ERR_AGREEMENT_OVERLAP` | 409 |
+| `ERR_LTS_WINDOW_OVERLAP` | 409 |
+| `ERR_VERSION_UNSUPPORTED` | 422 |
+| `ERR_AGREEMENT_INACTIVE` | 409 |
+| `ERR_DUPLICATE_PERIOD` | 409 |
+| `ERR_TIER_FEATURE_NOT_ALLOWED` | 422 |
+| `ERR_SEAT_CAPACITY` | 409 |
+| `ERR_PAYMENT_EXCEEDS_BALANCE` | 422 |
+| `ERR_WAIVER_NOT_ALLOWED` | 422 |
+| `ERR_MIGRATION_BLOCKED` | 409 |
+| `ERR_AUDIT_IN_PROGRESS` | 409 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_PROJECT_FROZEN` | 409 |
+| `ERR_VALIDATION` | 422 |
+| `ERR_BUYER_IS_CREATOR` | 422 |
+| `ERR_REFUND_WINDOW_EXPIRED` | 409 |
+| `ERR_APPEAL_EXHAUSTED` | 409 |
+| `ERR_POLICY_WINDOW_TOO_SHORT` | 422 |

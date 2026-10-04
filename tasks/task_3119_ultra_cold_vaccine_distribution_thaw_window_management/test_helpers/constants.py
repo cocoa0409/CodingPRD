@@ -1,0 +1,97 @@
+"""Domain thresholds and numeric constants the PRD states literally."""
+
+THRESHOLDS = {
+    # Product presentation pack sizes and cold-chain envelope
+    "VIALS_PER_CARTON_DEFAULT": 195,
+    "CARTONS_PER_PALLET_DEFAULT": 12,
+    "SHIP_BOX_CARTONS_DEFAULT": 5,
+    "DEFAULT_MIN_ORDER_CARTONS_PROGRAM": 2,
+    "DEFAULT_RESERVABLE_CARTON_PCT": 0.5,
+    "ULTRA_COLD_MIN_C": -90,
+    "ULTRA_COLD_MAX_C": -60,
+    "REFRIGERATED_MIN_C": 2,
+    "REFRIGERATED_MAX_C": 8,
+    "THAW_STABILITY_HOURS": 120,
+    "REFRIGERATED_SHELF_LIFE_HOURS": 720,
+    "EXCURSION_TOLERANCE_MIN_C": -50,
+    "EXCURSION_MAX_SINGLE_BREACH_MINUTES": 180,
+    "EXCURSION_MAX_CUMULATIVE_MINUTES": 360,
+    "REFREEZE_PROHIBITED_DEFAULT": True,
+    "PUNCTURED_BUD_HOURS": 6,
+    "WASTAGE_THRESHOLD_PCT": 0.05,
+    # Allocation waterfall
+    "TOTAL_WEEKLY_CARTONS": 500,
+    # Beyond-use derivation
+    "MAX_STAGED_CARTON_HOURS": 48,
+    "MAX_RECOVERY_HOURS": 48,
+    # Shipper packing
+    "MAX_PACKING_HOURS": 48,
+    "REF_SLOTS": 780,
+    "REF_ICE_SLOT_BASE_DOSES": 400,
+    "ICE_SLOT_HOURS_DIVISOR": 2,
+    # Excursion adjudication
+    "MIN_REMAINING_HOURS": 24,
+    "SLICE_CAP_LE_MINUS_60": 0.10,
+    "SLICE_CAP_LE_MINUS_40": 0.20,
+    "SLICE_CAP_LE_MINUS_20": 0.35,
+    "SLICE_CAP_LE_ZERO": 0.50,
+    "SLICE_CAP_ABOVE_ZERO": 0.75,
+    # Cure time
+    "PHASE_ONE_CAP": 48,
+    "PHASE_TWO_MULTIPLIER": 0.5,
+    "OVERRIDE_CAP": 24,
+    # Standing escalation
+    "PERIOD_WEIGHT": 5,
+    "WINDOW_WEIGHT": 1,
+    "WINDOW_WEIGHT_CAP": 10,
+    "ENTITLEMENT_WEIGHT": 2,
+    "TIER1_RATE": 0.10,
+    "TIER2_RATE": 0.25,
+    "TIER1_SCORE": 21,
+    "TIER0_SCORE_MAX": 20,
+}
+
+# Literal expected values the PRD's own arithmetic produces for the anchored fixture.
+TEST_DEFAULTS = {
+    "PRODUCT_CODE": "PZ-UCV-2026",
+    "DOSES_PER_VIAL": 6,
+    "VIALS_PER_CARTON": 195,
+    "DOSES_PER_CARTON": 1170,
+    "PROGRAM_CODE": "MI",
+    "FIXED_WEEKLY_CARTONS": 20,
+    "WEEKLY_ALLOCATION_CAP": 20,
+    "ENTITLEMENT_COMPUTED_CARTONS": 10,
+    "BATCH_CODE": "UCV-BATCH-0001",
+    "BATCH_RELEASED_CARTONS": 12,
+    "RELEASE_DATE": "2026-09-01T00:00:00Z",
+    "BATCH_EXPIRY": "2027-09-01T00:00:00Z",
+    "WINDOW_OPENS_AT": "2026-09-01T00:00:00Z",
+    "WINDOW_CLOSES_AT": "2026-09-03T00:00:00Z",
+    "SITE_CODE": "MI-RIV-01",
+    "SITE_CAPACITY": 10,
+    "SITE_DAILY_DOSES": 3000,
+    "CERT_EXPIRES_AT": "2027-01-01T00:00:00Z",
+    "START_CLOCK": "2026-09-01T00:00:00Z",
+    "ACCEPTED_CARTONS": 2,
+    "ACCEPTED_DOSES": 2340,
+    "DELIVER_AT": "2026-09-01T06:00:00Z",
+    "SHIPPER_DRY_ICE_KG": 20,
+}
+
+# Key instants the PRD's anchored fixture uses.
+CLOCK = {
+    "START": "2026-09-01T00:00:00Z",
+    "THAW_AT": "2026-09-01T08:00:00Z",
+    "BREACH_FIRST": "2026-09-01T09:00:00Z",
+    "BREACH_LAST": "2026-09-01T10:00:00Z",
+    "ARRIVAL": "2026-09-01T06:00:00Z",
+}
+
+# Slice-boundary to accumulated loss-share tiers, from the PRD's excursion arithmetic.
+SLICE_CAP_TIERS = [
+    (-60.0, 0.10),
+    (-40.0, 0.20),
+    (-20.0, 0.35),
+    (0.0, 0.50),
+]
+SLICE_CAP_ABOVE_ZERO = 0.75

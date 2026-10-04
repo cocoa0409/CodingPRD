@@ -1,0 +1,92 @@
+"""Barrel export: framework generics + PRD-specific code."""
+# Framework generics (re-exported for convenience)
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+# PRD-specific
+from .api_client import ApiClient, api_client
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES
+from .assertions import (
+    assert_alignment,
+    assert_audit_finding,
+    assert_card,
+    assert_card_stock_partition,
+    assert_card_verification,
+    assert_course_monitoring,
+    assert_course_session,
+    assert_guidelines_version,
+    assert_instructor,
+    assert_quality_audit,
+    assert_roster_entry,
+    assert_seat_conservation,
+    assert_skills_evaluation,
+    assert_teaching_evaluation,
+    assert_training_center,
+    assert_training_site,
+)
+from .constants import TEST_DEFAULTS, THRESHOLDS
+from .factories import (
+    DEFAULTS,
+    create_alignment_payload,
+    create_audit_finding_payload,
+    create_card_verification_payload,
+    create_course_session_payload,
+    create_guidelines_version_payload,
+    create_instructor_payload,
+    create_monitoring_payload,
+    create_quality_audit_payload,
+    create_roster_entry_payload,
+    create_site_payload,
+    create_skills_evaluation_payload,
+    create_teaching_evaluation_payload,
+    create_training_center_payload,
+    skills_checklist_items,
+)
+from .fixtures import (
+    ADMIN,
+    COORD,
+    QA,
+    TC,
+    align_center_site,
+    align_instructor,
+    center_version,
+    certify_candidate,
+    close_audit_corrective,
+    complete_session,
+    create_active_center,
+    create_center,
+    create_center_with_aligned_site,
+    create_center_with_faculty,
+    create_finding,
+    create_guidelines_version_active,
+    create_legacy_certified_instructor,
+    create_scheduled_session,
+    enroll_student,
+    open_audit,
+    record_passing_evaluation,
+    revoke_center,
+    set_clock_start,
+    setup_completed_session_with_cards,
+    setup_renewal_ready_instructor,
+    setup_teaching_scenario,
+    start_session,
+    suspend_center,
+)
+from .test_users import TEST_USERS, make_faculty_headers, make_instructor_headers
+from .types import *  # noqa: F401,F403

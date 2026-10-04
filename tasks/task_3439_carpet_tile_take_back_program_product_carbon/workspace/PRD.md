@@ -1,0 +1,344 @@
+# Carpet Tile Take-Back & Product Carbon Accounting API — Product Requirements Document
+
+## 1. Introduction
+
+Modular carpet tile was sold for decades on a simple promise: when a corridor wears out, replace the worn tiles, not the whole floor. Delivering on that promise at commercial scale is an operational discipline — dye lots must match across years, certified installers must be available inside narrow install windows, and selective replacement must fit inside an annual budget. Layered on top of the physical program is a newer, equally demanding discipline: every square meter shipped now carries a carbon story. Customers return used tiles through a take-back program; returned mass is sorted into reuse, depolymerization, downcycling, and landfill pathways; depolymerized mass re-enters production as post-consumer feedstock alongside reclaimed fishing nets and other sources; and the resulting product carbon footprint is computed, verified by an independent third party, published, and cited in carbon-neutrality and carbon-negativity claims that must be backed by retired offsets and by credible manufacturing reduction targets.
+
+This document specifies the API that operates that program end to end. It governs product collections and their dye-lot batches; the intake, quality control, and allocation of recycled and virgin feedstock; customer sites, their certified installation, and the zones laid within them; selective replacement orders with dye-lot matching; the take-back loop from pickup scheduling through sorting and customer credit; product carbon footprint reports and their third-party verification pipeline; carbon claims, offset retirements, and manufacturing emissions targets; and the sustainability documentation packages issued to architect and designer firms. Because the program's public claims are only as strong as their audit trail, the API enforces segregation of duties between report submitters and verifiers and between claim creators and approvers, drives every temporal decision from a single controllable logical clock, and applies optimistic concurrency controls wherever creating a resource legitimately supersedes an existing one. All mutations are immediately consistent: every side effect of an operation is visible in that operation's response and in any subsequent read.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the system-wide rules, contract formats, and cross-cutting principles that apply to every endpoint of the API. All endpoints are mounted under the `/carpetloop` prefix, with one deliberate exception: the logical-clock administration endpoint lives outside the prefix and is described in §2.5.
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two HTTP headers: `X-User-ID`, identifying the acting operator, and `X-User-Role`, naming the operational capacity in which they act. A request missing either header, or presenting an `X-User-Role` value that does not name one of the declared roles, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401).
+
+The system recognizes exactly six roles. `PlatformAdmin` is the program operator and owns product configuration, dye lots, feedstock intake and quality control, emissions targets, and the logical clock. `SustainabilityManager` owns the carbon data plane: feedstock allocation into batch mixes, take-back sorting decisions, product carbon footprint reports, carbon claims, offset retirements, and target readings. `Verifier` is the third-party verifier who clears or fails reports under verification. `ClaimsApprover` is the independent reviewer of carbon claims. `Specifier` is the architect or designer firm user who registers customer sites, requests replacements and take-backs, and issues documentation packages. `Installer` is the certified installation contractor who installs and decommissions sites, lays zones, runs replacement matches and completions, and schedules and collects take-backs. An authenticated request whose role is not listed among an endpoint's authorized roles is rejected with `ERR_FORBIDDEN` (HTTP 403). One endpoint is action-split: on the report verification endpoint, the action `ASSIGN` requires the `SustainabilityManager` role while the actions `CLEAR` and `FAIL` require the `Verifier` role, and a role that is valid for the endpoint but wrong for the requested action is likewise rejected with `ERR_FORBIDDEN`.
+
+For every one of the six roles — `PlatformAdmin`, `SustainabilityManager`, `Verifier`, `ClaimsApprover`, `Specifier`, and `Installer` — the `X-User-ID` header is an opaque operator identifier not tied to any persisted entity. The server never compares `X-User-ID` to any entity's `id`. It does, however, record the identifier on resources it creates or transitions — as `created_by` on customer sites, replacement orders, take-back requests, carbon claims, and specification packages; as `submitted_by` and `verified_by` on footprint reports; and as `reviewed_by` on carbon claims — and ownership checks compare `X-User-ID` against those recorded strings. Specifier-side ownership requires `X-User-ID` to equal the resource's `created_by`. Installer-side ownership requires `X-User-ID` to equal the customer site's `contractor_name` string, which is recorded on the site at registration; an installer whose identifier does not match the site's `contractor_name` is rejected with `ERR_FORBIDDEN` even though the `Installer` role is authorized for the endpoint in general.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Endpoints that return lists of resources accept two query parameters. The `limit` parameter sets the maximum number of items returned; it defaults to 10, with a minimum accepted value of 1 and a maximum accepted value of 100. The `offset` parameter sets the number of items skipped before the page begins and defaults to 0.
+
+Unless otherwise specified, every list endpoint returns its resources sorted by creation timestamp in ascending order — the earliest-created resource first. The `meta` object of a list response carries the four pagination fields `limit`, `offset`, `total_count`, and `has_more`.
+
+### 2.4. Resource Identity, Timestamps and Versioning
+
+Every primary resource — product collections, dye-lot batches, feedstock lots, customer sites, installed zones, replacement orders, take-back requests, footprint reports, carbon claims, manufacturing targets, and specification packages — carries a standard set of system-managed properties:
+
+- `id` (string): a server-minted unique identifier formatted as a UUID, with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits recording when the resource was created.
+- `updated_at` (string): an ISO 8601 UTC timestamp with three fractional digits recording the resource's most recent modification.
+- `version` (integer): a system-managed integer that starts at 1 when the resource is created and increments by exactly 1 on every mutation of the entity's own stored fields — including mutations that arrive through a cascade or an automatic state reconciliation rather than a direct client call on that resource.
+
+Offset retirements are the single exception to this convention. An offset retirement is an immutable event record: it carries `id` and `created_at` only, and both `updated_at` and `version` are absent from it. No operation ever mutates a retirement after creation, so there is nothing for a version to track.
+
+### 2.5. The Program Logical Clock and Reporting-Period Semantics
+
+The API never consults wall-clock time. All temporal decisions — pickup-window validation, collection-window opening, credit and retirement timestamps — are driven by a single server-side **logical clock**. Before any client call, the logical clock reads exactly `2026-09-01T00:00:00Z`, and it never falls back to wall-clock time on its own. A `PlatformAdmin` advances the clock through the administration endpoint by supplying a `current_utc` timestamp; the endpoint responds with the echo of that value as `current_utc`. This capability lives outside the `/carpetloop` prefix and exists so that the program's temporal behavior can be exercised deterministically. The logical clock is the value stamped into `credited_at` when a take-back is sorted and into `retired_at` when an offset is retired.
+
+Reporting periods on footprint reports are **half-open intervals**: a period from `period_start` to `period_end` includes every instant at or after `period_start` and strictly before `period_end`. Batch `production_date` values and take-back `credited_at` timestamps are tested for period membership under this half-open rule, and two periods whose endpoints merely touch — one period's `period_end` equal to the other's `period_start` — do not overlap. The reporting period's `period_end` must be strictly later than its `period_start`; a period that violates this is rejected with `ERR_INVALID_REQUEST` (HTTP 400). Install windows on customer sites follow the opposite convention: `install_window_start` and `install_window_end` form a **closed interval** that includes both endpoints, and the end must not be earlier than the start.
+
+### 2.6. Units, Precision and Rounding Discipline
+
+All rounding in the system uses the round-half-up method at the stated number of decimal places; no other rounding mode is permitted anywhere. The canonical tile mass constant is 4.0 kilograms per square meter (`TILE_MASS_KG_PER_M2`): every square meter of tile, of any collection or dye lot, is treated as massing exactly 4.0 kilograms, and this constant converts between weighed mass and area in both the take-back credit and the recovery-share computations.
+
+Percentages — a batch's `recycled_content_pct` and a supplier's `supplier_reliability_pct` — are stored at 2 decimal places, rounded half up. Areas recovered from weighed mass are computed at 2 decimal places, rounded half up, before they enter any downstream multiplication. Per-square-meter carbon intensities — a batch's `embodied_carbon_kg_per_m2` and a report's `operational_kgco2e_per_m2` and `lifecycle_kgco2e_per_m2` — are stored at 3 decimal places, rounded half up. Two intermediates are held one digit finer: the feedstock component of a batch's embodied carbon is rounded to 4 decimal places before it is combined with manufacturing intensity, and the end-of-life credit inside a lifecycle footprint is rounded to 4 decimal places before it is subtracted. These pinned rounding orders are normative: computing the same quantity at full precision and rounding only at the end yields different last-digit results and is a defect.
+
+Monetary amounts are integer cents throughout — `quoted_cost_cents`, `credit_cents`, `annual_replacement_budget_cents`, and `spent_replacement_cents` are all whole cents, and any credit or quote formula whose arithmetic lands on a fraction of a cent is rounded half up to the nearest whole cent as its final step. Posture thresholds on manufacturing targets and offset-coverage comparisons on claims are exact decimal comparisons on stored values, with boundary inclusivity as stated in the relevant workflow sections.
+
+### 2.7. Optimistic Concurrency on Create-with-Supersede Operations
+
+Three creation endpoints are **create-with-supersede** operations: opening a footprint report, issuing a specification package, and opening a replacement order each legitimately retires an existing resource of the same family — an overlapping draft report, the previously issued package for the same firm and collection, or a non-terminal order on the same zone — and each advances the version of a parent resource as part of doing so. Because the create itself rewrites state the client may have based its decision on, these three endpoints carry an optimistic concurrency check.
+
+Opening a footprint report and issuing a specification package each require the request body to carry `expected_collection_version`, holding the version of the target product collection the client last observed. Opening a replacement order requires `expected_site_version`, holding the version of the target customer site the client last observed. If the value presented does not match the parent's current `version` — because another writer's create has advanced that version since the client last read it — the request is rejected with `ERR_STALE_VERSION` (HTTP 412), protecting the client from, for example, superseding a package it has never seen or drafting a report over a draft it did not know had been replaced. The field is non-optional on these three endpoints. Endpoints not named here take no version field at all; the optimistic check exists only on the three create-with-supersede operations.
+
+### 2.8. Validation Pipeline and Error Precedence
+
+Every request that reaches business logic passes through a fixed validation pipeline, and the pipeline is **first-failure-wins**: checks run in the priority order below, and the first check that fails determines the error response; later checks are not evaluated for that request.
+
+1. **Authentication.** The `X-User-ID` and `X-User-Role` headers are present and the role names one of the six declared roles; otherwise `ERR_UNAUTHENTICATED` (HTTP 401).
+2. **Role authorization.** The role is listed for the endpoint — including the action-level split on the report verification endpoint; otherwise `ERR_FORBIDDEN` (HTTP 403).
+3. **Ownership.** Specifier operations require `X-User-ID` equal to the resource's `created_by`; Installer operations require `X-User-ID` equal to the site's `contractor_name`; otherwise `ERR_FORBIDDEN` (HTTP 403).
+4. **Existence.** Path identifiers and referenced foreign keys in the body are resolved left to right, in the order collection, batch, lot, site, zone, order, take-back, report, claim, target, package; the first missing reference yields its resource-specific 404 (see §2.10).
+5. **Transition existence.** The target resource is in a state from which the requested transition exists; otherwise `ERR_INVALID_STATE` (HTTP 409). This is the generic state error for every action endpoint.
+6. **Specific state guards.** Batch creation, report creation, and report submission require an `ACTIVE` collection (`ERR_COLLECTION_SUNSET`, 409); zone creation requires a `RELEASED` batch (`ERR_BATCH_NOT_RELEASED`, 409) and a site in `INSTALLED` or `IN_SERVICE` (`ERR_SITE_NOT_INSTALLED`, 409); take-back creation requires a site in `INSTALLED` or `IN_SERVICE` (`ERR_SITE_NOT_INSTALLED`, 409); replacement order creation, matching, and completion require the zone to be `IN_SERVICE` (`ERR_ZONE_NOT_IN_SERVICE`, 409); order completion requires the order itself to be `MATCHED` (`ERR_ORDER_NOT_MATCHED`, 409); site decommissioning requires that no take-back of the site is in flight (`ERR_TAKEBACK_IN_FLIGHT`, 409).
+7. **Optimistic concurrency.** On the three create-with-supersede endpoints, the presented `expected_collection_version` or `expected_site_version` equals the parent's current `version`; otherwise `ERR_STALE_VERSION` (HTTP 412).
+8. **Segregation of duties.** Report verification actions `CLEAR` and `FAIL` require the verifier's `X-User-ID` to differ from the report's `submitted_by`; claim review requires the reviewer's `X-User-ID` to differ from the claim's `created_by`; otherwise `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+9. **Referential business guards.** Claim submission and publication require a `PUBLISHED` report (`ERR_REPORT_NOT_PUBLISHED`, 422); package issuance requires a `PUBLISHED` report and, when a claim is referenced, a `PUBLISHED` claim (`ERR_CLAIM_NOT_PUBLISHED`, 422); a claim's `boundary` must equal its report's `boundary` (`ERR_BOUNDARY_MISMATCH`, 422); a `CARBON_NEGATIVE` claim must declare the `CRADLE_TO_GRAVE` boundary (`ERR_NEGATIVE_REQUIRES_CRADLE_TO_GRAVE`, 422) and must name a `manufacturing_target_id` (`ERR_TARGET_REQUIRED_FOR_NEGATIVE`, 422), and at submission the referenced target's posture must not be `BREACHED` (`ERR_TARGET_BREACHED`, 422); an `ADHESIVE_FREE` installation requires the certified flag (`ERR_ADHESIVE_FREE_CERT_REQUIRED`, 422); allocation requires a lot in `QC_PASSED` (`ERR_LOT_NOT_QC_PASSED`, 422); a replacement order's zone must belong to the order's site (`ERR_ZONE_SITE_MISMATCH`, 422).
+10. **Temporal guards.** A certified installer's `cert_expires_on` must be strictly later than the site's `install_window_start` (`ERR_CONTRACTOR_CERT_EXPIRED`, 422); a pickup window must be well-formed and open in the future (`ERR_PICKUP_WINDOW_INVALID`, 422); collection may not be confirmed before the window opens (`ERR_COLLECT_WINDOW_NOT_OPEN`, 422); a new report's half-open period must not overlap a same-collection report still inside the verification pipeline (`ERR_REPORT_PERIOD_OVERLAP`, 409).
+11. **Constraint guards.** Dye-lot uniqueness within a collection (`ERR_DYE_LOT_CONFLICT`, 409); zone-code uniqueness among a site's in-service zones, checked at zone creation and again at order completion for the `new_zone_code` (`ERR_ZONE_CODE_CONFLICT`, 409); the contractor's buffered-window conflict (`ERR_CONTRACTOR_WINDOW_CONFLICT`, 409); release mass balance (`ERR_MIX_MASS_MISMATCH`, 422); sort mass balance (`ERR_SORT_MASS_IMBALANCE`, 422); a non-empty report input set (`ERR_EMPTY_REPORT_INPUT`, 422); and general request shape — required fields present, enum members known, `vintage_year` at least 2020, `target_reduction_pct` strictly between 0 and 1, quantities positive (`ERR_INVALID_REQUEST`, 400).
+12. **Capacity and fiscal guards, evaluated last.** Allocation quantity within the lot's `available_kg` (`ERR_INSUFFICIENT_LOT_KG`, 422); zone area within the batch's `available_m2` (`ERR_AREA_EXCEEDS_BATCH`, 422); order completion within the site's remaining replacement budget (`ERR_REPLACEMENT_BUDGET_EXCEEDED`, 422).
+
+### 2.9. Program-Wide Cascades and Automatic State Reconciliation
+
+Several operations produce effects well beyond their target resource. The program has three named cascades, one site-level cascade, and a set of automatic state transitions that fire without any client call on the affected resource.
+
+**Cascade A — publish, supersede, retire, revoke.** Publishing a verified footprint report walks three links. Link 1: every other `PUBLISHED` report of the same collection whose half-open period overlaps the newly published report's period moves to `SUPERSEDED`. Link 2: every carbon claim in `PUBLISHED` whose `report_id` references a report superseded in link 1 moves to `RETIRED`. Link 3: every specification package in `ISSUED` whose `claim_id` references a claim retired in link 2 moves to `REVOKED`.
+
+**Cascade B — breach reverts review.** When a new manufacturing-target reading pushes the target's posture into `BREACHED`, every carbon claim that references that target through `manufacturing_target_id` and is currently `IN_REVIEW` reverts to `DRAFT`; its `reviewed_by` is cleared while its `required_offset_kgco2e` is retained for audit.
+
+**Cascade C — sorting creates feedstock.** When a take-back sort records a `depolymerize_kg` greater than zero, the system creates a new feedstock lot whose `source_type` is `POST_CONSUMER_TILE`, whose `quantity_kg` equals the `depolymerize_kg`, whose `carbon_factor_kgco2e_per_kg` is the program constant `TAKEBACK_LOT_CARBON_FACTOR`, whose `supplier_name` is the program constant `TAKEBACK_SUPPLIER_NAME`, whose status is `RECEIVED`, and whose `origin_takeback_id` is the id of the take-back that produced it. The new lot's `supplier_reliability_pct` is computed at creation exactly like any directly posted lot's, grouping on the `TAKEBACK_SUPPLIER_NAME` string.
+
+**Site decommission cascade.** Decommissioning a site that is `IN_SERVICE` reclaims every zone still `IN_SERVICE` to `RECLAIMED`, cancels every replacement order of the site in `DRAFT` or `MATCH_FAILED`, and cancels every order in `MATCHED` with the order's full cancellation side effect — the reserved area is returned to the matched batch's `available_m2`, and a batch sitting at `EXHAUSTED` reverts to `RELEASED` as availability returns. Decommissioning from `PLANNED` carries none of these child effects, since a planned site has no zones and no orders to resolve.
+
+**Automatic transitions.** A batch moves from `RELEASED` to `EXHAUSTED` the moment its `available_m2` reaches zero — whether through a zone laying, a match reservation, or an order completion — and returns from `EXHAUSTED` to `RELEASED` the moment availability is restored above zero by a cancellation. A feedstock lot moves from `QC_PASSED` to `DEPLETED` when allocation consumes its last available kilogram, and returns from `DEPLETED` to `QC_PASSED` when a deallocation restores availability. A site moves from `INSTALLED` to `IN_SERVICE` automatically when its first zone is laid. Zone terminal states `REPLACED` and `RECLAIMED` are set only by these system transitions, never by a direct client call on the zone. Every one of these automatic mutations updates the affected entity's `updated_at` and increments its `version` just as a direct write would.
+
+### 2.10. Nested Path Resolution and Referenced-Resource Existence
+
+Requests that address nested resources — a batch within a collection, a zone within a site, an offset within a claim — are validated strictly left to right along the path, and the first identifier that does not resolve to an existing resource determines the error, whether the unresolvable segment is a `collection_id`, `batch_id`, `lot_id`, `site_id`, `zone_id`, `order_id`, `takeback_id`, `report_id`, `claim_id`, `target_id`, or `package_id`. The existence vocabulary is per-resource: `ERR_COLLECTION_NOT_FOUND`, `ERR_BATCH_NOT_FOUND`, `ERR_LOT_NOT_FOUND`, `ERR_SITE_NOT_FOUND`, `ERR_ZONE_NOT_FOUND`, `ERR_ORDER_NOT_FOUND`, `ERR_TAKEBACK_NOT_FOUND`, `ERR_REPORT_NOT_FOUND`, `ERR_CLAIM_NOT_FOUND`, `ERR_TARGET_NOT_FOUND`, and `ERR_PACKAGE_NOT_FOUND`, each an HTTP 404. A request to lay a zone under a site that does not exist therefore fails with `ERR_SITE_NOT_FOUND` before the batch in the body is ever examined, and body-carried foreign keys are resolved in the same canonical order — collection, batch, lot, site, zone, order, take-back, report, claim, target, package — so that a creation payload referencing two nonexistent resources always fails on the earlier one in that order.
+
+## 3. Business Logic & Workflows
+
+This section walks the program's business processes in lifecycle order: product configuration and feedstock first, then sites and zones, then the replacement and take-back loops that run during a floor's service life, and finally the carbon-accounting pipeline — reports, verification, claims, offsets, targets — and the documentation packages that carry it to specifiers.
+
+### 3.1. Product Collections and the Sunset Gate
+
+A **ProductCollection** is the program's unit of design identity: every tile that shares a pattern family belongs to one collection, and dye lots, footprint reports, carbon claims, and spec packages all anchor to it. A `PlatformAdmin` registers a collection with a display `name`, a `pattern_code` shared by all of the collection's dye lots, a `backing_type` of either `STANDARD` or `ADHESIVE_FREE_CAPABLE`, and a `lifecycle_boundary` of either `CRADLE_TO_GATE` or `CRADLE_TO_GRAVE`. The collection's boundary is only the documentary default for the reporting program: each footprint report and each carbon claim binds its own `boundary` explicitly, and it is those per-resource values — not the collection default — that drive computation and validation. The optional `claim_intent` field, defaulting to `NONE` and alternatively `CARBON_NEUTRAL` or `CARBON_NEGATIVE`, declares the program's ambition for the collection and selects which take-back credit variant applies to returns declared under it (§3.5). A new collection is `ACTIVE` with `version` 1.
+
+When a collection leaves the market, a `PlatformAdmin` sunsets it, moving `status` from `ACTIVE` to `SUNSET` and incrementing the collection's `version` by 1. Sunset is a gate on new work, not a retraction of history: creating a dye-lot batch under a `SUNSET` collection, creating a footprint report against one, or submitting a report belonging to one are all rejected with `ERR_COLLECTION_SUNSET` (HTTP 409), while reports, claims, and packages already published remain exactly as they were.
+
+### 3.2. Feedstock Intake, Quality Control and Batch Composition
+
+Production is tracked as **TileBatch** resources — one per dye lot — created by a `PlatformAdmin` under a collection. The creation payload carries the `dye_lot_code`, the `production_date`, the `produced_m2` of the run, the run's manufacturing emissions intensity `mfg_intensity_kgco2e_per_m2`, and the measured color distance `delta_e` of the lot against the collection standard. The `dye_lot_code` must be unique within its collection; a duplicate is rejected with `ERR_DYE_LOT_CONFLICT` (HTTP 409). Both `produced_m2` and `mfg_intensity_kgco2e_per_m2` must be positive, and `delta_e` must be zero or greater. A new batch enters `QUARANTINE` with its `available_m2` initialized to the full `produced_m2`, an empty `feedstock_mix`, and the batch's `collection_id` taken from the creation path. Batches can be listed with optional `collection_id` and `status` filters.
+
+A batch in quarantine is a bill of materials under construction. Its `feedstock_mix` is a list of entries, each pairing a `lot_id` with a `quantity_kg`, and the mix may only be mutated while the batch remains in `QUARANTINE` — any attempt to allocate into or deallocate from a batch that has left quarantine is rejected with `ERR_INVALID_STATE` (HTTP 409). The raw materials live in **FeedstockLot** resources, registered by a `PlatformAdmin` with a `supplier_name`, a `source_type` of `RECLAIMED_FISHING_NET`, `POST_CONSUMER_TILE`, `POST_INDUSTRIAL_SCRAP`, or `VIRGIN`, a positive `quantity_kg`, and a `carbon_factor_kgco2e_per_kg` of zero or greater. Directly posted lots carry a null `origin_takeback_id`; lots born from the take-back sort cascade (§2.9, cascade C) have it set by the system. Every lot arrives in `RECEIVED` status. A `PlatformAdmin` then records a quality-control decision: an `outcome` of `PASS` moves the lot to `QC_PASSED`, and an `outcome` of `FAIL` moves it to `QC_FAILED`, which is terminal. Lots can be listed with optional `supplier_name`, `source_type`, `status`, and `origin_takeback_id` filters — the last of these being the traceability channel that surfaces cascade-created lots.
+
+At the moment a lot is created, the system computes its `supplier_reliability_pct`. The statistic groups on the exact `supplier_name` string: it considers every previously created lot of the same supplier that has reached a decided state — `QC_PASSED` or `QC_FAILED` — in creation order, and when no such decided lots exist the new lot's reliability is 100.00. Otherwise it is one hundred multiplied by the total received kilograms of the decided lots that passed, divided by the total received kilograms of all decided lots, rounded half up to 2 decimal places.
+
+Allocation is the `SustainabilityManager`'s lever. Allocating kilograms from a lot into a batch's mix requires the lot to be in `QC_PASSED` — otherwise `ERR_LOT_NOT_QC_PASSED` (HTTP 422) — and requires the requested `quantity_kg` to be no more than the lot's `available_kg`, where `available_kg` is the lot's `quantity_kg` minus its currently `allocated_kg`; an overdraw is rejected with `ERR_INSUFFICIENT_LOT_KG` (HTTP 422). A successful allocation decreases the lot's `available_kg` by the allocated quantity, increases its `allocated_kg` by the same amount, and adds or merges the corresponding `feedstock_mix` entry on the batch; when the allocation consumes the lot's last available kilogram the lot moves automatically from `QC_PASSED` to `DEPLETED`. Deallocation is the exact mirror and the compensating action of allocation: kilograms return to the lot's `available_kg`, leave its `allocated_kg`, the batch's mix entry is reduced or removed, and a lot sitting at `DEPLETED` reverts to `QC_PASSED` as soon as availability returns. Both operations immediately recompute the batch's two computed carbon fields.
+
+The first computed field, `recycled_content_pct`, answers how much of the mix is non-virgin: the system sums the `quantity_kg` of every mix entry whose lot's `source_type` is anything other than `VIRGIN` into a recycled mass, sums every mix entry's `quantity_kg` into a total mass, and stores one hundred times the recycled mass divided by the total mass, rounded half up to 2 decimal places. While the mix is empty the total mass is zero and `recycled_content_pct` is undefined (null). The second computed field, `embodied_carbon_kg_per_m2`, answers how much carbon each square meter of the batch embodies. Its computation is pinned in two steps: first the feedstock component — each mix entry's `quantity_kg` multiplied by its lot's `carbon_factor_kgco2e_per_kg`, all summed, divided by the batch's `produced_m2`, and rounded half up to 4 decimal places; then that rounded component is added to the batch's `mfg_intensity_kgco2e_per_m2` and the sum is rounded half up to 3 decimal places for storage. Downstream consumers, the footprint computation in particular, must use this stored 3-decimal value and never recompute embodied carbon from the mix at full precision. The batch's `allocated_mass_kg` is the plain sum of all mix-entry quantities and is the number the release gate checks.
+
+Release is the `PlatformAdmin`'s final word on a batch. Releasing requires the parent collection to be `ACTIVE` — releasing under a `SUNSET` collection is rejected with `ERR_COLLECTION_SUNSET` — and requires mass balance: the batch's `allocated_mass_kg` must equal its `produced_m2` multiplied by the canonical 4.0 kilograms per square meter, with both sides compared at 2 decimal places; a mismatch is rejected with `ERR_MIX_MASS_MISMATCH` (HTTP 422). A successful release moves the batch from `QUARANTINE` to `RELEASED` and re-validates both computed fields one final time. From that point the batch is sellable inventory: zone layings, match reservations, and order completions draw down `available_m2`, and the moment it reaches zero the batch moves automatically from `RELEASED` to `EXHAUSTED`, returning to `RELEASED` if a cancellation ever restores availability above zero.
+
+### 3.3. Customer Sites, Certified Installation and Zone Laying
+
+The demand side of the program begins when a `Specifier` registers a **CustomerSite**. The registration payload names the installation contractor through `contractor_name`, gives the site's `address`, declares the closed install window from `install_window_start` to `install_window_end` (the end must not precede the start), and records the `installation_system` — `ADHESIVE_FREE` or `CONVENTIONAL` — together with the contractor's certification snapshot `adhesive_free_certified`, the certification's `cert_expires_on`, and the site's `annual_replacement_budget_cents`, a whole-cents budget of zero or more. The site is born `PLANNED`, with `created_by` set to the registering `Specifier`'s `X-User-ID` and `spent_replacement_cents` initialized to zero.
+
+Installation is the contractor's own act: an `Installer` marks the site installed, and the request's `X-User-ID` must equal the site's `contractor_name` or the call is rejected with `ERR_FORBIDDEN`. Four conditions guard the `PLANNED` to `INSTALLED` transition, on top of the identity check. An `ADHESIVE_FREE` installation system requires `adhesive_free_certified` to be true; otherwise `ERR_ADHESIVE_FREE_CERT_REQUIRED` (HTTP 422). Whenever the contractor is recorded as certified, the certification must still be live at the window's opening: `cert_expires_on` must be strictly later than `install_window_start`, otherwise `ERR_CONTRACTOR_CERT_EXPIRED` (HTTP 422). Finally, one contractor cannot be in two places at once: no other site with the same `contractor_name` may sit in `INSTALLED` or `IN_SERVICE` with an install window that conflicts with this one, where a conflict is judged after extending each closed window by a buffer of one full day — 86,400 seconds — at both ends; a conflict is rejected with `ERR_CONTRACTOR_WINDOW_CONFLICT` (HTTP 409). A successful install moves the site to `INSTALLED` and increments its `version` by 1.
+
+With a site installed, the `Installer` lays **InstalledZone** resources within it, each drawn from a single dye lot. Laying a zone names the `batch_id` of the batch being laid, a `zone_code`, and a positive `area_m2`; the zone's `site_id` comes from the creation path. The batch must be `RELEASED` — laying from any other batch state is rejected with `ERR_BATCH_NOT_RELEASED` (HTTP 409) — and the site must be `INSTALLED` or `IN_SERVICE`, otherwise `ERR_SITE_NOT_INSTALLED` (HTTP 409). The `zone_code` must be unique among the site's zones that are currently `IN_SERVICE`; a collision is rejected with `ERR_ZONE_CODE_CONFLICT` (HTTP 409). The requested `area_m2` may not exceed the batch's `available_m2`, on pain of `ERR_AREA_EXCEEDS_BATCH` (HTTP 422). A successful laying debits the batch's `available_m2` by the zone's area — exhausting the batch into `EXHAUSTED` if the debit brings availability to exactly zero — and creates the zone already `IN_SERVICE`. Laying the site's first zone also bubbles the site itself from `INSTALLED` to `IN_SERVICE`, incrementing the site's `version` by 1. Zones can be listed with optional `site_id`, `batch_id`, and `status` filters.
+
+Decommissioning ends a site's participation. The `Installer` whose `X-User-ID` matches the site's `contractor_name` may decommission from either `PLANNED` or `IN_SERVICE`, provided no take-back request of the site is still in flight — a take-back in `REQUESTED`, `SCHEDULED`, or `COLLECTED` blocks the transition with `ERR_TAKEBACK_IN_FLIGHT` (HTTP 409). The transition lands the site in its terminal `DECOMMISSIONED` state and increments its `version` by 1; from `IN_SERVICE` it also fires the decommission cascade of §2.9, reclaiming zones and cancelling non-terminal replacement orders with their reservation releases.
+
+### 3.4. Selective Replacement Orders and Dye-Lot Matching
+
+Selective replacement is the program's reason to exist, and it runs through **ReplacementOrder** resources. A `Specifier` opens an order with the `site_id`, the `zone_id` of the zone to be replaced, a `reason` of `WEAR`, `DAMAGE`, or `DESIGN_CHANGE`, the `new_zone_code` the replacement laying will carry, and — because opening an order is a create-with-supersede operation — an `expected_site_version` per §2.7, rejected with `ERR_STALE_VERSION` (HTTP 412) when it no longer matches the site's current `version`. The zone must belong to the named site: an order whose `zone_id` resolves to a zone of a different site is rejected with `ERR_ZONE_SITE_MISMATCH` (HTTP 422), and a zone not currently `IN_SERVICE` rejects the create with `ERR_ZONE_NOT_IN_SERVICE` (HTTP 409). If the zone already has a non-terminal order — one in `DRAFT`, `MATCHED`, or `MATCH_FAILED` — the new order supersedes it: the older order is cancelled, releasing any reservation per the cancellation side effects below, and the site's `version` increments by 1 as part of the create. The new order starts in `DRAFT` with `created_by` recorded, `matched_batch_id` null, and `quoted_cost_cents` not yet set. Orders can be listed with optional `site_id`, `zone_id`, `matched_batch_id`, and `status` filters.
+
+Matching is the `Installer`'s job — again with `X-User-ID` equal to the site's `contractor_name` — and it asks a precise question: which released batch should re-lay this zone? The candidate set is every batch of the same collection as the zone's current batch whose status is `RELEASED` and whose `available_m2` is at least the zone's `area_m2`. Candidates are ranked by three keys applied in order: an exact dye-lot match first — a candidate whose `dye_lot_code` equals the zone's batch's `dye_lot_code` ranks above every non-match — then the smallest absolute difference between the candidate's `delta_e` and the zone's batch's `delta_e`, then the earliest `created_at`, and this third key resolves any full tie; resource ids are never used as a tie-breaker. When the candidate set is empty, the match attempt moves the order from `DRAFT` to `MATCH_FAILED` with no side effects and `matched_batch_id` still null; a later re-match — typically after new batches are released — runs the same selection again, succeeding into `MATCHED` or remaining `MATCH_FAILED` when the pool is still empty.
+
+A successful match moves the order to `MATCHED`, sets `matched_batch_id` to the chosen batch, and quotes the job. The quote is the zone's `area_m2` multiplied by the program's base price of 1200 cents per square meter, multiplied by a dye-lot factor — exactly 1.00 when the matched batch shares the zone's batch's `dye_lot_code`, and 1.15 (a fifteen percent surcharge for a different lot) otherwise — with the result rounded half up to whole cents and stored as `quoted_cost_cents`. The match also reserves inventory: the matched batch's `available_m2` is debited by the zone's `area_m2`, and a batch driven to zero moves to `EXHAUSTED`.
+
+Completion converts the reservation into a new laying, and its guards run in a fixed order. The order must be `MATCHED` — completing anything else is rejected with `ERR_ORDER_NOT_MATCHED` (HTTP 409) — and the target zone must still be `IN_SERVICE`, a check evaluated before any fiscal check and rejected otherwise with `ERR_ZONE_NOT_IN_SERVICE`. The site's ledger then takes the floor: the sum of the site's `spent_replacement_cents` and this order's `quoted_cost_cents` must not exceed the site's `annual_replacement_budget_cents`, otherwise `ERR_REPLACEMENT_BUDGET_EXCEEDED` (HTTP 422); the site's `spent_replacement_cents` is always the sum of `quoted_cost_cents` over the site's `COMPLETED` replacement orders. The `new_zone_code` must be unique among the site's `IN_SERVICE` zones at completion time, otherwise `ERR_ZONE_CODE_CONFLICT`. A successful completion moves the targeted zone from `IN_SERVICE` to `REPLACED`, creates the replacement zone with `zone_code` equal to the order's `new_zone_code`, `batch_id` equal to the order's `matched_batch_id`, the same `area_m2` as the replaced zone, and status `IN_SERVICE`; it adds the `quoted_cost_cents` to the site's `spent_replacement_cents`; and it makes the matched reservation permanent, changing no availability — though the batch still moves to `EXHAUSTED` if its `available_m2` stands at zero.
+
+Cancellation unwinds. A `Specifier` cancels an order they created — `X-User-ID` must equal the order's `created_by`, otherwise `ERR_FORBIDDEN` — from either `DRAFT` or `MATCHED`. From `DRAFT` the order simply becomes `CANCELLED`. From `MATCHED` the reservation is released: the matched batch's `available_m2` is credited back the zone's `area_m2`, and a batch sitting at `EXHAUSTED` reverts to `RELEASED` as availability returns. The same two transitions are reachable without a client call — a newer order for the same zone supersedes into cancellation, and a site's decommission cascade cancels all of the site's non-terminal orders with the same reservation-release semantics. `COMPLETED` and `CANCELLED` are the order's terminal states.
+
+### 3.5. The Take-Back Loop: Pickup, Sorting and Customer Credit
+
+When a floor reaches the end of a phase of its life, a `Specifier` opens a **TakeBackRequest** against the site, declaring the `collection_id` of the tiles being returned, a `condition_grade` of `A`, `B`, or `C`, and a positive `declared_area_m2`. The site must be `INSTALLED` or `IN_SERVICE`; a take-back against a site in `PLANNED` or `DECOMMISSIONED` is rejected with `ERR_SITE_NOT_INSTALLED` (HTTP 409). The declared collection is exactly that — a declaration — and no tiles are checked against it; but it drives the credit variant at sorting time and the recovery-share accounting in the footprint computation. The request is born `REQUESTED` with `created_by` recorded, and requests can be listed with optional `site_id`, `collection_id`, and `status` filters.
+
+Logistics then run through the site's contractor. Scheduling is an `Installer` act — `X-User-ID` equal to the site's `contractor_name` — that sets `pickup_window_start` and `pickup_window_end` and moves the request from `REQUESTED` to `SCHEDULED`; the window must be well-formed, with the start strictly earlier than the end, and the start must lie strictly after the current logical clock, otherwise `ERR_PICKUP_WINDOW_INVALID` (HTTP 422). Collection confirms the physical pickup: the same contractor identity check applies, the current logical clock must have reached the `pickup_window_start` — collecting earlier is rejected with `ERR_COLLECT_WINDOW_NOT_OPEN` (HTTP 422) — and the weighed `collected_kg` must be positive, otherwise `ERR_INVALID_REQUEST` (HTTP 400). A confirmed collection moves the request from `SCHEDULED` to `COLLECTED` and stores the weighed mass.
+
+Sorting is where the `SustainabilityManager` turns mass into money and feedstock. The sort call records four pathway masses — `reuse_kg`, `depolymerize_kg`, `downcycle_kg`, and `landfill_kg` — each of which must be zero or greater, and whose sum must equal the request's `collected_kg` when compared at 2 decimal places; any imbalance is rejected with `ERR_SORT_MASS_IMBALANCE` (HTTP 422). A balanced sort moves the request from `COLLECTED` to its terminal `CREDITED` state, stamps `credited_at` with the current logical clock, computes and stores the `credit_variant` and the `credit_cents`, and fires cascade C from §2.9: a `depolymerize_kg` greater than zero creates a new feedstock lot of `source_type` `POST_CONSUMER_TILE` with `quantity_kg` equal to the depolymerized mass, the program's `TAKEBACK_LOT_CARBON_FACTOR` as its `carbon_factor_kgco2e_per_kg`, `TAKEBACK_SUPPLIER_NAME` as its `supplier_name`, status `RECEIVED`, and `origin_takeback_id` pointing back at this take-back.
+
+The credit computation is pinned step by step. First, recovered area: the `collected_kg` is divided by the canonical 4.0 kilograms per square meter and the quotient is rounded half up to 2 decimal places — this rounding happens before any money is computed, and the alternative order (multiplying mass by the rate and dividing once at the end) is a rejected variant that yields different cents. Second, the base credit: the recovered square meters are multiplied by the grade rate for the request's `condition_grade` — 250 cents per square meter for grade `A`, 150 for grade `B`, and 40 for grade `C`. Third, the variant selected by the declared collection's `claim_intent` decides the rest. Under the `STANDARD` variant — selected when the collection's `claim_intent` is `NONE` — the pathway split is irrelevant and the `credit_cents` is simply the base credit rounded half up to whole cents. Under the `CIRCULAR` variant — selected when `claim_intent` is `CARBON_NEUTRAL` or `CARBON_NEGATIVE` — a pathway bonus is added: the raw bonus is `reuse_kg` times 30 cents per kilogram, plus `depolymerize_kg` times 18, plus `downcycle_kg` times 6, plus `landfill_kg` times 0; this raw bonus is capped at forty percent of the base credit, the cap itself computed at 2 decimal places, and the applied bonus is the smaller of the cap and the raw bonus; the `credit_cents` is then the base credit plus the applied bonus, rounded half up to whole cents. The recorded `credit_variant` tells the customer which rule priced their return.
+
+A `Specifier` may cancel a take-back they created — `X-User-ID` equal to the request's `created_by`, otherwise `ERR_FORBIDDEN` — from `REQUESTED` or from `SCHEDULED`. Cancelling a merely requested take-back is a clean transition to `CANCELLED`; cancelling a scheduled one also clears both pickup-window fields back to null. `CREDITED` and `CANCELLED` are terminal.
+
+### 3.6. Product Carbon Footprint Reports and Third-Party Verification
+
+The carbon-accounting pipeline begins with the **PCFReport**. A `SustainabilityManager` opens a report against a collection with a `period_start`, a `period_end` strictly later than the start, a declared `boundary` of `CRADLE_TO_GATE` or `CRADLE_TO_GRAVE`, and an `expected_collection_version` per §2.7 — a stale expectation is rejected with `ERR_STALE_VERSION` (HTTP 412). The collection must be `ACTIVE`, otherwise `ERR_COLLECTION_SUNSET`. The period may not overlap — under the half-open rule of §2.5, where touching endpoints do not overlap — any report of the same collection sitting in `SUBMITTED`, `IN_VERIFICATION`, or `VERIFIED`, the in-verification pipeline; such an overlap is rejected with `ERR_REPORT_PERIOD_OVERLAP` (HTTP 409). Overlapping reports in other states are handled by supersession instead: any same-collection `DRAFT` whose period overlaps the new report's is moved to `SUPERSEDED` as part of the create, and overlapping `PUBLISHED` reports are superseded at publish time, so neither blocks creation. The new report starts in `DRAFT`, and its creation increments the collection's `version` by 1. Reports can be listed with optional `collection_id` and `status` filters.
+
+Submission is the compute step. A `SustainabilityManager` submits a `DRAFT` report, which requires the collection still `ACTIVE` (`ERR_COLLECTION_SUNSET`) and requires a non-empty input set — a submission whose period and status filters select no batches at all is rejected with `ERR_EMPTY_REPORT_INPUT` (HTTP 422). A successful submission moves the report to `SUBMITTED`, records `submitted_by` as the acting `X-User-ID`, and computes and stores **both** footprint variants from identical inputs.
+
+The computation deserves precision. The input set is every batch of the report's collection whose `production_date` falls inside the half-open period and whose status is `RELEASED` or `EXHAUSTED`. The **OPERATIONAL** variant — cradle-to-gate accounting, always stored on `operational_kgco2e_per_m2` — is a weighted mean of batch embodied carbon: each input batch contributes its stored 3-decimal `embodied_carbon_kg_per_m2` multiplied by its `produced_m2`, the products are summed, the sum is divided by the total `produced_m2` of the input set, and the quotient is rounded half up to 3 decimal places. Using each batch's stored 3-decimal value in this weighted sum is pinned; recomputing per-batch embodied carbon at full precision before weighting is the rejected variant and changes last digits. The **LIFECYCLE** variant — cradle-to-grave accounting, always stored on `lifecycle_kgco2e_per_m2` — starts from that same operational value, then adjusts for transport and end-of-life recovery. Recovery is measured from the take-back loop: the credited take-backs are those of the same collection, in `CREDITED` status, whose `credited_at` falls inside the same half-open period; each contributes its `collected_kg` divided by 4.0 kilograms per square meter and rounded half up to 2 decimal places, and those recovered areas are summed. The recovery share is the smaller of 1 and the recovered area divided by the input set's total `produced_m2`. The end-of-life credit is 2.10 kilograms of CO2e per square meter scaled by the recovery share, rounded half up to 4 decimal places. The lifecycle value is then the operational value plus the transport constant of 0.35 kilograms of CO2e per square meter, minus the rounded end-of-life credit, with the final result rounded half up to 3 decimal places. Both variants are always computed and stored regardless of which `boundary` the report declares; the boundary governs which variant downstream consumers select, not which are computed.
+
+Verification is an independent pair of eyes, enforced structurally, and is driven by an `action` field on the verification call with three legal values. With an `action` of `ASSIGN`, a `SustainabilityManager` assigns the report for verification by supplying a `verifier_org` — its absence is rejected with `ERR_INVALID_REQUEST` — moving the report from `SUBMITTED` to `IN_VERIFICATION` and recording the organization. From there a `Verifier` either clears or fails the report, and in both cases the verifier's `X-User-ID` must differ from the report's `submitted_by`; a verifier reviewing their own submission is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). Clearing moves the report to `VERIFIED` and records `verified_by`. Failing requires a `findings_count` of at least 1 — otherwise `ERR_INVALID_REQUEST` — and moves the report to `REJECTED`. Rejection is not the end: a `SustainabilityManager` may revise a `REJECTED` report back to `DRAFT`, which clears `submitted_by`, `verifier_org`, `verified_by`, and both computed variant values to null, readying the report for a corrected resubmission.
+
+Publication is the point of no return. A `SustainabilityManager` publishes a `VERIFIED` report, moving it to `PUBLISHED` and firing cascade A of §2.9: overlapping same-collection `PUBLISHED` reports move to `SUPERSEDED` (the report's terminal state), claims published on those reports move to `RETIRED`, and specification packages referencing those claims move to `REVOKED`.
+
+### 3.7. Carbon Claims, Offset Retirements and Manufacturing Targets
+
+A **CarbonClaim** turns a published footprint into a market statement. A `SustainabilityManager` drafts a claim with the `collection_id`, the `report_id` of the footprint declaration it rests on, a `claim_type` of `CARBON_NEUTRAL` or `CARBON_NEGATIVE`, a positive `claimed_volume_m2` covering the production volume the claim speaks for, and a `boundary`. Two structural rules bind the draft. The claim's `boundary` must equal the referenced report's `boundary`, otherwise `ERR_BOUNDARY_MISMATCH` (HTTP 422). A `CARBON_NEGATIVE` claim must declare the `CRADLE_TO_GRAVE` boundary — otherwise `ERR_NEGATIVE_REQUIRES_CRADLE_TO_GRAVE` (HTTP 422) — and must name a `manufacturing_target_id`, otherwise `ERR_TARGET_REQUIRED_FOR_NEGATIVE` (HTTP 422); neutral claims carry the field optionally. A new claim is `DRAFT` with `created_by` recorded, `offset_coverage` at `NONE`, and `retired_kgco2e` at zero. Claims can be listed with optional `collection_id`, `report_id`, `manufacturing_target_id`, and `status` filters.
+
+Submission moves a claim from `DRAFT` to `IN_REVIEW` — and, because the claim lifecycle is a loop, the same action resubmits a `REJECTED` claim back to `IN_REVIEW`. Both paths require the referenced report to be `PUBLISHED`, otherwise `ERR_REPORT_NOT_PUBLISHED` (HTTP 422), and a `CARBON_NEGATIVE` claim additionally requires its referenced manufacturing target's posture to be anything other than `BREACHED`, otherwise `ERR_TARGET_BREACHED` (HTTP 422). Submission computes the claim's `required_offset_kgco2e` and refreshes its `offset_coverage`; resubmission recomputes the requirement and clears `reviewed_by` so the earlier review cannot carry over.
+
+The offset requirement follows a pinned evaluation order. First, the report value: because the claim's `boundary` equals its report's, exactly one stored variant is selected — the report's `lifecycle_kgco2e_per_m2` when the boundary is `CRADLE_TO_GRAVE`, otherwise its `operational_kgco2e_per_m2`. Second, the gross obligation: the selected report value multiplied by the claim's `claimed_volume_m2`. Third, the requirement: the larger of zero and the gross obligation, plus — only for a `CARBON_NEGATIVE` claim — a fixed buffer of 500.0 kilograms of CO2e. Fourth, the retired total: the sum of `quantity_kgco2e` over the claim's offset retirements. Fifth, the coverage: `NONE` when the retired total is zero, `FULL` when the retired total is at least the requirement, and `PARTIAL` when some offsets have been retired but the retired total still falls short of the requirement. Kilogram quantities are carried at 3 decimal places and the comparisons are exact decimal. The ordering matters semantically: the requirement depends on the report's stored variant, coverage depends on the requirement, the publication gate depends on coverage, and retiring offsets changes coverage but never changes the requirement — only a submit or resubmit recomputes it.
+
+Review is segregated by construction. A `ClaimsApprover` reviews an `IN_REVIEW` claim with a `decision` of `APPROVE` or `REJECT`, moving it to `APPROVED` or `REJECTED` respectively and recording `reviewed_by`; the reviewer's `X-User-ID` must differ from the claim's `created_by`, otherwise `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). Publication then turns approval into a public artifact: a `SustainabilityManager` publishes an `APPROVED` claim, which requires the referenced report to still be `PUBLISHED` (`ERR_REPORT_NOT_PUBLISHED`) and requires `offset_coverage` to be `FULL`, otherwise `ERR_OFFSET_COVERAGE_INSUFFICIENT` (HTTP 422). A published claim lives until cascade A retires it — when its report is superseded by a newer publish, the claim moves to its terminal `RETIRED` state — or until cascade B intervenes earlier: a claim sitting `IN_REVIEW` when its referenced manufacturing target's posture turns `BREACHED` reverts to `DRAFT`, its `reviewed_by` cleared and its `required_offset_kgco2e` retained for audit.
+
+Offsets are how coverage is earned. A `SustainabilityManager` retires an offset against a claim by naming the `registry` — `VERRA`, `GOLD_STANDARD`, or `ACR` — the `vintage_year`, which must be 2020 or later (otherwise `ERR_INVALID_REQUEST`), and a positive `quantity_kgco2e`. The claim must be `IN_REVIEW` or `APPROVED`; retiring against a claim in any other state is rejected with `ERR_INVALID_STATE` (HTTP 409). Retirement is immediate at creation: the **OffsetRetirement** record is created with its `claim_id` taken from the path and its `retired_at` stamped from the logical clock, the claim's `retired_kgco2e` increases by the retired quantity, and the claim's `offset_coverage` is recomputed against the standing requirement. Retirements are immutable event records and can be listed under their claim with ordinary pagination.
+
+**ManufacturingTarget** resources anchor the negative-claim story in factory reality. A `PlatformAdmin` creates a target with a `program_name`, a positive `baseline_intensity_kgco2e_per_m2`, and a `target_reduction_pct` strictly between 0 and 1 (otherwise `ERR_INVALID_REQUEST`). The target's `current_intensity_kgco2e_per_m2` starts equal to the baseline, its `posture` starts `AT_RISK`, and its `readings_log` — an append-only list of entries carrying `period_end`, `intensity_kgco2e_per_m2`, and `recorded_at` — starts empty. A `SustainabilityManager` records readings against the target, each appending to the log and recomputing the posture. The target intensity is the baseline multiplied by one minus the reduction fraction. The current intensity is the baseline before any reading exists; afterwards it is the intensity of the reading with the greatest `period_end`, and when two readings share that `period_end` the one recorded later wins. The posture is `ON_TRACK` when the current intensity is at or below the target intensity — the boundary is inclusive — otherwise `AT_RISK` when the current intensity is at or below the baseline, and `BREACHED` when it exceeds even that. Entering `BREACHED` fires cascade B of §2.9, reverting in-review claims that reference the target.
+
+### 3.8. Specification Packages for Architects and Designers
+
+The outward face of the carbon pipeline is the **SpecPackage**: the sustainability documentation bundle a `Specifier` issues to an architect or designer firm. Issuance names the `architect_firm`, the `collection_id`, and the `report_id` of a footprint report that must be `PUBLISHED` at issuance — otherwise `ERR_REPORT_NOT_PUBLISHED` (HTTP 422). A `claim_id` may be included to bind a carbon claim into the package; when present it too must be `PUBLISHED`, otherwise `ERR_CLAIM_NOT_PUBLISHED` (HTTP 422). Because issuing a package is a create-with-supersede operation, the payload carries `expected_collection_version` per §2.7, rejected with `ERR_STALE_VERSION` (HTTP 412) when the collection's version has moved on. Issuing a package for a firm-and-collection pair that already has an `ISSUED` package supersedes it: the older package moves to `SUPERSEDED`, and the new package's `package_version` continues the pair's issuance sequence — a per-(`architect_firm`, `collection_id`) counter that starts at 1 for the first package of the pair. The new package is `ISSUED` with `created_by` recorded, and the creation increments the collection's `version` by 1. Packages can be listed with optional `architect_firm`, `collection_id`, `report_id`, `claim_id`, and `status` filters. From `ISSUED` a package leaves service in exactly two ways: superseded by a newer issuance for the same pair, or revoked by cascade A when the claim it references is retired out from under it — `REVOKED` being its other terminal state.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource — a collection, batch, feedstock lot, site, zone, replacement order, take-back request, report, claim, offset retirement, manufacturing target, or specification package — return `201 Created`. Operations that act on an existing resource — state transitions, QC decisions, allocations, matches, completions, cancellations, sorts, submissions, reviews, readings, and the logical-clock set — return `200 OK`, as do all retrievals and lists. Request and response field semantics for every operation are defined by the narratives of §2 and §3; the table below is the addressing and authorization contract only. "All roles" means every one of the six declared roles in §2.1.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/carpetloop/collections` | Create a product collection | PlatformAdmin |
+| GET | `/carpetloop/collections/{collection_id}` | Get a collection | All roles |
+| POST | `/carpetloop/collections/{collection_id}/sunset` | Sunset a collection (blocks new batches and reports) | PlatformAdmin |
+| POST | `/carpetloop/collections/{collection_id}/batches` | Create a dye-lot batch in QUARANTINE | PlatformAdmin |
+| GET | `/carpetloop/batches/{batch_id}` | Get a batch | All roles |
+| GET | `/carpetloop/batches` | List batches with filters | All roles |
+| POST | `/carpetloop/batches/{batch_id}/release` | Release a batch from quarantine after the mass-balance check | PlatformAdmin |
+| POST | `/carpetloop/feedstock-lots` | Register a feedstock lot (RECEIVED) | PlatformAdmin |
+| GET | `/carpetloop/feedstock-lots/{lot_id}` | Get a feedstock lot | All roles |
+| GET | `/carpetloop/feedstock-lots` | List feedstock lots with filters (traceability channel for cascade-created lots) | All roles |
+| POST | `/carpetloop/feedstock-lots/{lot_id}/qc` | Record a QC decision on a lot | PlatformAdmin |
+| POST | `/carpetloop/feedstock-lots/{lot_id}/allocate` | Allocate kilograms of a QC_PASSED lot into a QUARANTINE batch's mix | SustainabilityManager |
+| POST | `/carpetloop/feedstock-lots/{lot_id}/deallocate` | Release kilograms of this lot from a QUARANTINE batch's mix | SustainabilityManager |
+| POST | `/carpetloop/sites` | Register a customer installation site (PLANNED) | Specifier |
+| GET | `/carpetloop/sites/{site_id}` | Get a site | All roles |
+| POST | `/carpetloop/sites/{site_id}/install` | Mark the site installed (certification and contractor window-buffer checks) | Installer |
+| POST | `/carpetloop/sites/{site_id}/decommission` | Decommission the site; reclaims zones and cancels non-terminal orders | Installer |
+| POST | `/carpetloop/sites/{site_id}/zones` | Lay a zone from a released batch | Installer |
+| GET | `/carpetloop/zones/{zone_id}` | Get a zone | All roles |
+| GET | `/carpetloop/zones` | List zones with filters | All roles |
+| POST | `/carpetloop/replacement-orders` | Open a selective replacement order; supersedes a non-terminal order on the same zone | Specifier |
+| GET | `/carpetloop/replacement-orders/{order_id}` | Get a replacement order | All roles |
+| GET | `/carpetloop/replacement-orders` | List replacement orders with filters | All roles |
+| POST | `/carpetloop/replacement-orders/{order_id}/match` | Run dye-lot matching for the order | Installer |
+| POST | `/carpetloop/replacement-orders/{order_id}/complete` | Complete a matched replacement | Installer |
+| POST | `/carpetloop/replacement-orders/{order_id}/cancel` | Cancel a draft or matched order; releases any reservation | Specifier |
+| POST | `/carpetloop/take-back-requests` | Open a take-back request for a site's declared collection tiles | Specifier |
+| GET | `/carpetloop/take-back-requests/{takeback_id}` | Get a take-back request | All roles |
+| GET | `/carpetloop/take-back-requests` | List take-back requests with filters | All roles |
+| POST | `/carpetloop/take-back-requests/{takeback_id}/schedule` | Schedule pickup into a future window | Installer |
+| POST | `/carpetloop/take-back-requests/{takeback_id}/collect` | Confirm collection with weighed mass | Installer |
+| POST | `/carpetloop/take-back-requests/{takeback_id}/cancel` | Cancel a requested or scheduled take-back | Specifier |
+| POST | `/carpetloop/take-back-requests/{takeback_id}/sort` | Record sorting pathway masses; computes credit; may create a feedstock lot | SustainabilityManager |
+| POST | `/carpetloop/pcf-reports` | Open a product carbon footprint report; supersedes overlapping drafts | SustainabilityManager |
+| GET | `/carpetloop/pcf-reports/{report_id}` | Get a report | All roles |
+| GET | `/carpetloop/pcf-reports` | List reports with filters | All roles |
+| POST | `/carpetloop/pcf-reports/{report_id}/submit` | Submit for verification; computes both footprint variants | SustainabilityManager |
+| POST | `/carpetloop/pcf-reports/{report_id}/revise` | Return a rejected report to DRAFT for correction | SustainabilityManager |
+| POST | `/carpetloop/pcf-reports/{report_id}/verification` | Verification actions: ASSIGN (manager), CLEAR (verifier), FAIL (verifier) | SustainabilityManager, Verifier |
+| POST | `/carpetloop/pcf-reports/{report_id}/publish` | Publish a verified report; cascades supersede, retire, revoke | SustainabilityManager |
+| POST | `/carpetloop/carbon-claims` | Draft a carbon claim bound to a report and boundary | SustainabilityManager |
+| GET | `/carpetloop/carbon-claims/{claim_id}` | Get a claim | All roles |
+| GET | `/carpetloop/carbon-claims` | List claims with filters | All roles |
+| POST | `/carpetloop/carbon-claims/{claim_id}/submit` | Submit (or resubmit) a claim for review; computes the offset requirement | SustainabilityManager |
+| POST | `/carpetloop/carbon-claims/{claim_id}/review` | Approve or reject a claim (segregated from the creator) | ClaimsApprover |
+| POST | `/carpetloop/carbon-claims/{claim_id}/publish` | Publish an approved claim; requires FULL offset coverage and a still-published report | SustainabilityManager |
+| POST | `/carpetloop/carbon-claims/{id}/offsets` | Retire offsets against a claim (immediate; claim must be IN_REVIEW or APPROVED) | SustainabilityManager |
+| GET | `/carpetloop/carbon-claims/{id}/offsets` | List a claim's offset retirements | All roles |
+| POST | `/carpetloop/manufacturing-targets` | Create a manufacturing emissions reduction target | PlatformAdmin |
+| GET | `/carpetloop/manufacturing-targets/{target_id}` | Get a target | All roles |
+| POST | `/carpetloop/manufacturing-targets/{target_id}/readings` | Record a period intensity reading; recomputes posture; may revert in-review claims | SustainabilityManager |
+| POST | `/carpetloop/spec-packages` | Issue a sustainability documentation package; supersedes the prior ISSUED package for the same firm and collection | Specifier |
+| GET | `/carpetloop/spec-packages/{package_id}` | Get a package | All roles |
+| GET | `/carpetloop/spec-packages` | List packages with filters | All roles |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock (outside the `/carpetloop` prefix) | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+The catalogue below enumerates every machine-readable error identifier the API can return and its HTTP status. The trigger conditions for each identifier are defined in the narratives of §2 and §3, not repeated here.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_COLLECTION_NOT_FOUND` | 404 |
+| `ERR_BATCH_NOT_FOUND` | 404 |
+| `ERR_LOT_NOT_FOUND` | 404 |
+| `ERR_SITE_NOT_FOUND` | 404 |
+| `ERR_ZONE_NOT_FOUND` | 404 |
+| `ERR_ORDER_NOT_FOUND` | 404 |
+| `ERR_TAKEBACK_NOT_FOUND` | 404 |
+| `ERR_REPORT_NOT_FOUND` | 404 |
+| `ERR_CLAIM_NOT_FOUND` | 404 |
+| `ERR_TARGET_NOT_FOUND` | 404 |
+| `ERR_PACKAGE_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_COLLECTION_SUNSET` | 409 |
+| `ERR_BATCH_NOT_RELEASED` | 409 |
+| `ERR_SITE_NOT_INSTALLED` | 409 |
+| `ERR_ZONE_NOT_IN_SERVICE` | 409 |
+| `ERR_ORDER_NOT_MATCHED` | 409 |
+| `ERR_TAKEBACK_IN_FLIGHT` | 409 |
+| `ERR_DYE_LOT_CONFLICT` | 409 |
+| `ERR_ZONE_CODE_CONFLICT` | 409 |
+| `ERR_REPORT_PERIOD_OVERLAP` | 409 |
+| `ERR_CONTRACTOR_WINDOW_CONFLICT` | 409 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_MIX_MASS_MISMATCH` | 422 |
+| `ERR_SORT_MASS_IMBALANCE` | 422 |
+| `ERR_EMPTY_REPORT_INPUT` | 422 |
+| `ERR_PICKUP_WINDOW_INVALID` | 422 |
+| `ERR_COLLECT_WINDOW_NOT_OPEN` | 422 |
+| `ERR_CONTRACTOR_CERT_EXPIRED` | 422 |
+| `ERR_ADHESIVE_FREE_CERT_REQUIRED` | 422 |
+| `ERR_LOT_NOT_QC_PASSED` | 422 |
+| `ERR_REPORT_NOT_PUBLISHED` | 422 |
+| `ERR_CLAIM_NOT_PUBLISHED` | 422 |
+| `ERR_BOUNDARY_MISMATCH` | 422 |
+| `ERR_NEGATIVE_REQUIRES_CRADLE_TO_GRAVE` | 422 |
+| `ERR_TARGET_REQUIRED_FOR_NEGATIVE` | 422 |
+| `ERR_TARGET_BREACHED` | 422 |
+| `ERR_OFFSET_COVERAGE_INSUFFICIENT` | 422 |
+| `ERR_INSUFFICIENT_LOT_KG` | 422 |
+| `ERR_AREA_EXCEEDS_BATCH` | 422 |
+| `ERR_REPLACEMENT_BUDGET_EXCEEDED` | 422 |
+| `ERR_ZONE_SITE_MISMATCH` | 422 |
+

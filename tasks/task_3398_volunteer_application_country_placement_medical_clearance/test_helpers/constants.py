@@ -1,0 +1,136 @@
+"""Domain constants — every numeric threshold, rate, and enum literal a test
+could need, taken verbatim from the PRD.
+
+Also carries the canonical logical-clock instants used by the composite
+fixtures so every precondition is reachable from the deterministic clock
+start (2026-09-01T00:00:00Z): all fixture windows lie strictly after it.
+"""
+
+# --- Logical clock (PRD: "The Logical Clock and the Deterministic Sweep") ---
+DEFAULT_CLOCK_START = "2026-09-01T00:00:00Z"
+INVITATION_ACCEPTANCE_WINDOW_DAYS = 10
+
+# --- Pagination (PRD: "Pagination") ---
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+PAGINATION_DEFAULT_OFFSET = 0
+
+# --- Skill catalog / sectors (PRD: "Setting the Stage") ---
+SKILL_CATALOG = [
+    "TEACHING_ENGLISH", "MATH_SCIENCE", "PRIMARY_HEALTH", "NURSING",
+    "AGRONOMY", "FORESTRY", "SMALL_BUSINESS", "IT", "WATER_SANITATION",
+    "YOUTH_DEVELOPMENT",
+]
+SECTORS = [
+    "EDUCATION", "HEALTH", "AGRICULTURE", "ENVIRONMENT", "YOUTH",
+    "COMMUNITY_DEVELOPMENT",
+]
+EVENT_TYPES = ["MEDICAL_CARE", "SAFETY_INCIDENT", "SECURITY_ALERT", "ALL_CLEAR", "COMMENDATION"]
+EVENT_SEVERITIES = ["ROUTINE", "URGENT", "CRITICAL"]
+ET_REASONS = ["MEDICAL", "FAMILY", "SECURITY", "ADMINISTRATIVE"]
+DENTAL_STATUSES = ["CLEAR", "NEEDS_TREATMENT"]
+MEDICAL_DETERMINATIONS = ["CLEARED", "CLEARED_WITH_ACCOMMODATION", "DENIED", "DEFERRED"]
+BACKGROUND_OUTCOMES = ["CLEAR", "ADVERSE"]
+SUITABILITY_OUTCOMES = ["FAVORABLE", "UNFAVORABLE"]
+PLACEMENT_DECISIONS = ["CONFIRM", "REJECT"]
+
+# --- Field-shape bounds (PRD: "Validation Discipline and Error Precedence") ---
+SCORE_MIN = 1.0
+SCORE_MAX = 5.0
+MEDICAL_TIER_MIN = 1
+MEDICAL_TIER_MAX = 3
+CONDITION_SEVERITY_MIN = 1
+CONDITION_SEVERITY_MAX = 3
+MIN_SEATS_TOTAL = 1
+MIN_COHORT_CAPACITY = 1
+MIN_TRAINING_CAPACITY = 1
+
+# --- Match-score weights (PRD: "Matching, Invitation Issuance") ---
+STRICT_WEIGHT = 0.7
+SECTOR_WEIGHT = 0.2
+COUNTRY_WEIGHT = 0.1
+COUNTRY_RANK_STEP = 0.25
+OPEN_PREFERENCE_COUNTRY_BONUS = 0.5
+
+# --- Interview scoring (PRD: "Interviews: Scheduling, Scoring") ---
+W_MOTIVATION = 0.30
+W_ADAPTABILITY = 0.25
+W_SKILL_COMPETENCY = 0.25
+W_CROSS_CULTURAL = 0.20
+MIN_DIMENSION_FLOOR = 2.0
+STRONGLY_RECOMMEND_MIN = 4.0
+RECOMMEND_MIN = 3.0
+NEUTRAL_MIN = 2.5
+
+# --- Medical clearance (PRD: "Medical Clearance") ---
+MAX_MEDICAL_DEFERRALS = 2
+ACCOMMODATION_GAP_EXACTLY = 1  # gap == 1 is the only gap admitting CLEARED_WITH_ACCOMMODATION
+
+# --- Training assessment (PRD: "Pre-Service Training") ---
+TECHNICAL_PASS_MIN = 2.5
+CULTURAL_PASS_MIN = 2.5
+# Language pass threshold is the cohort program's language_threshold_score.
+
+# --- Readjustment allowance & service duration (PRD: "Readjustment Allowance") ---
+READJUSTMENT_MONTHLY_RATE_CENTS = 47500
+DAYS_PER_MONTH = 30
+HALF_MONTH_DAYS = 15
+SERVICE_TERM_DAYS = 810
+ET_SHORT_SERVICE_THRESHOLD_MONTHS = 18
+NCE_MIN_MONTHS_SERVED = 12
+NCE_DURATION_MONTHS = 12
+# Penalized variant: round_half_up(47500 * 2 / 3) per month, THEN multiply.
+PENALIZED_MONTHLY_CENTS = 31667
+
+# --- Canonical fixture instants (all strictly after DEFAULT_CLOCK_START) ---
+INTERVIEW_START = "2026-09-05T14:00:00Z"
+INTERVIEW_END = "2026-09-05T15:00:00Z"
+INTERVIEW_START_ALT = "2026-09-06T14:00:00Z"
+INTERVIEW_END_ALT = "2026-09-06T15:00:00Z"
+OPENING_DEPARTURE_DATE = "2027-01-15T00:00:00Z"
+OPENING_ISSUE_DEADLINE = "2026-12-01T00:00:00Z"
+COHORT_START_DATE = "2027-01-01T00:00:00Z"
+COHORT_END_DATE = "2027-03-31T00:00:00Z"
+COHORT_NAME = "PST-2027-A"
+# Swearing-in happens with the clock at the cohort start, so service starts here.
+SERVICE_START_CLOCK = "2027-01-01T00:00:00Z"
+# 2027-01-01 + 810 days (leap year 2028 included).
+EXPECTED_COMPLETION_DATE = "2029-03-21T00:00:00Z"
+# A cleared invitation issued at the clock start expires when the clock passes this.
+INVITATION_DEADLINE_AT_CLOCK_START = "2026-09-11T00:00:00Z"
+CLOCK_AFTER_INVITATION_EXPIRY = "2026-09-12T00:00:00Z"
+CLOCK_AFTER_ISSUE_DEADLINE = "2026-12-02T00:00:00Z"
+
+# --- Canonical readjustment expectations (derived per the PRD formulas) ---
+# ET FAMILY at day 180 (2027-01-01 -> 2027-06-30): 6 months, penalized.
+ET_6MO_END_CLOCK = "2027-06-30T00:00:00Z"
+ET_6MO_MONTHS = 6
+ET_6MO_GROSS_CENTS = 285000
+ET_6MO_PAID_CENTS = 190002
+ET_6MO_FORFEITED_CENTS = 94998
+# ET FAMILY at day 90 (2027-01-01 -> 2027-04-01): 3 months, penalized.
+ET_3MO_END_CLOCK = "2027-04-01T00:00:00Z"
+ET_3MO_MONTHS = 3
+ET_3MO_GROSS_CENTS = 142500
+ET_3MO_PAID_CENTS = 95001
+ET_3MO_FORFEITED_CENTS = 47499
+# NCE boundary pair: day 344 -> 11 months; day 345 -> 12 months (MEDICAL ET).
+ET_11MO_END_CLOCK = "2027-12-11T00:00:00Z"
+ET_11MO_MONTHS = 11
+ET_11MO_GROSS_CENTS = 522500
+ET_11MO_PAID_CENTS = 348337
+ET_11MO_FORFEITED_CENTS = 174163
+ET_12MO_END_CLOCK = "2027-12-12T00:00:00Z"
+ET_12MO_MONTHS = 12
+ET_12MO_GROSS_CENTS = 570000
+ET_12MO_PAID_CENTS = 380004
+ET_12MO_FORFEITED_CENTS = 189996
+# ET SECURITY at day 14 (2027-01-01 -> 2027-01-15): 0 months.
+ET_0MO_END_CLOCK = "2027-01-15T00:00:00Z"
+# FULL completion at expected_completion_date: 810 days -> 27 months.
+FULL_MONTHS = 27
+FULL_GROSS_CENTS = 1282500
+
+# --- A guaranteed-absent UUID-shaped id for 404 probes ---
+BOGUS_UUID = "99999999-9999-4999-8999-999999999999"

@@ -1,0 +1,485 @@
+# Accelerator Allocation, Cloud Partner Supply and Developer Programs API — Product Requirements Document
+
+## 1. Introduction
+
+This document specifies the requirements for the Accelerator Allocation, Cloud Partner Supply and Developer Programs API, mounted under the top-level path `/accelerators`. The system is the supplier-side control plane for a portfolio of accelerator SKUs: it decides which partners may receive product, how scarce units are apportioned across competing requests, which software stacks and support subscriptions may be attached to hardware, and which of those attachments carry export-control or confidentiality obligations. Every commercial relationship in the portfolio — a cloud provider taking delivery, a system builder certifying a reference architecture, an embedded vendor negotiating a long-term availability window, or a direct enterprise customer borrowing evaluation hardware — flows through the same set of gates.
+
+Three pressures shape the design. The first is scarcity: accelerator supply is finite and split between partner allocation and an evaluation pool that must stay ring-fenced, so the system needs a deterministic, externally observable ordering of competing claims rather than a first-come-first-served queue. The second is regulation: certain destinations and certain performance densities are subject to export control, and preview software carries confidentiality obligations that must be acknowledged before it may be loaded onto a device. The third is auditability: allocations, entitlements and support fees are conserved quantities governed by double-entry-style ledgers, and the separation of duties between the operator who activates a deployment and the operator who terminates it must be enforced mechanically.
+
+Because deadlines, grace windows, horizon bands and late fees all recur across the requirements, the system runs on a server-side logical clock rather than wall-clock time. The clock is deterministic and explicitly settable by an administrative capability, which makes every temporal rule in this document reproducible.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines rules that apply across the entire API: who may call it, what every response looks like, how lists are paged and ordered, how scarce capacity is governed, and how the system's derived quantities stay consistent.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID` identifies the acting principal and `X-User-Role` declares the capacity in which it acts. Both headers are mandatory; if either is absent, or if `X-User-Role` carries a value that is not one of the roles enumerated below, the request is rejected with `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` and HTTP 400. When the headers are well-formed but the declared role is not among the roles permitted for the targeted operation, the request is rejected with `ERR_FORBIDDEN_FOR_ROLE` and HTTP 403.
+
+The system recognises exactly seven roles, spelled as follows: `PlatformAdmin`, `SupplyPlanner`, `PartnerProgramManager`, `PartnerOps`, `SupportAccountManager`, `SupplyComplianceOfficer`, and `LifecycleProgramManager`. A role is never inferred from the resource being addressed, and a request that names an unknown role is treated as a malformed header rather than an authorisation failure.
+
+`PlatformAdmin` is an opaque operator identity: when `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it (for example, on the audit trail's `actor_user_id`) but does not compare it to any entity's `id`. The same opaque treatment applies to `SupplyPlanner`, `PartnerProgramManager`, `SupportAccountManager`, `SupplyComplianceOfficer`, and `LifecycleProgramManager`. `PartnerOps` is the one entity-backed role: when `X-User-Role` is `PartnerOps`, `X-User-ID` is the `id` of the acting `PartnerAccount`; ownership checks on any resource that references a `PartnerAccount` compare the resource's foreign-key field (such as `partner_id` or `embedded_partner_id`) to `X-User-ID`. A `PartnerOps` caller that addresses a partner other than itself is subject to the role check and, where the operation targets its own sub-collections, is treated as operating on its own account.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. The `limit` parameter sets the maximum number of items returned, defaults to 10, and must lie between 1 and 100 inclusive. The `offset` parameter sets the number of leading items to skip and defaults to 0. Requests outside those bounds are rejected as malformed input.
+
+Every list endpoint returns its items sorted by creation timestamp in ascending order unless the endpoint's own description states otherwise. The `meta` object of a list response carries `limit`, `offset`, `total_count`, and `has_more`.
+
+### 2.4. Partner Standing, Qualification and Program Eligibility
+
+A `PartnerAccount` holds two independent lifecycle fields, and the distinction matters for every rule that follows. The `qualification_status` field tracks the certification pipeline and takes one of `APPLIED`, `IN_VALIDATION`, `QUALIFIED`, or `REJECTED`, and it is written only by the partner state machine. The `status` field tracks commercial standing and takes one of `ACTIVE`, `SUSPENDED`, or `TERMINATED`. A partner can therefore be standing-suspended while still being certified, and the two fields are never synchronised automatically.
+
+The `allocation_priority_class` field is a derived tier recomputed at every allocation epoch for qualified partners; it takes one of `TIER_1`, `TIER_2`, `TIER_3`, or `UNQUALIFIED`, and it is never accepted from a client. Partners that are not in `QUALIFIED` qualification always classify as `UNQUALIFIED`. Among qualified partners, the tier-1 path requires all three of: an `entitlement_units_held` of at least 2000, an on-time delivery ratio of at least 0.8, and a `qualification_attempt_count` of exactly zero. A partner that satisfies the entitlement bar of at least 500 but not the full tier-1 conjunction classifies as `TIER_2`; everyone else qualified classifies as `TIER_3`. The on-time ratio is the count of on-time deliveries divided by the larger of one and the total delivery count, rounded half-even to four decimal places. Note that a single prior rejection removes the partner from the tier-1 path even when it holds 2000 or more entitlement units, and that an entitlement holding of exactly 2000 satisfies the bar while 1999 does not.
+
+Most allocation-bearing programs require certification: a partner must have a `qualification_status` of `QUALIFIED` before it may hold allocations, hold an enterprise support subscription, hold a developer program membership, borrow evaluation hardware, or receive a long-term lifecycle commitment. Attempts without certification are rejected with `ERR_QUALIFICATION_NOT_MET` and HTTP 422.
+
+### 2.5. Export Control, Destination Bands and Performance Density
+
+Every `HardwareDeployment` resolves an `export_classification` from its `destination_country_code` together with the product's performance density. The classification takes one of `TIER_1_CLEARED`, `TIER_2_LICENSE_REQUIRED`, or `TIER_3_PROHIBITED`. The permitted destination codes are `US`, `DE`, `FR`, `CN`, `SG`, and `CA`.
+
+A `TIER_3_PROHIBITED` classification blocks the operation outright with `ERR_EXPORT_CONTROL_RESTRICTED` and HTTP 403. A `TIER_2_LICENSE_REQUIRED` classification does not block the operation by itself, but every such operation additionally requires an `ExportLicenseGrant` for the same product and destination whose `grant_status` is `ACTIVE`; when no such grant is on file the request is refused with `ERR_EXPORT_LICENSE_REQUIRED` and HTTP 403. A `TIER_1_CLEARED` classification imposes no additional gate. The destinations a grant may unlock are `DE`, `FR`, `SG`, and `CA`, each of which classifies as `TIER_2_LICENSE_REQUIRED` regardless of the product's declared density, while `US` classifies as `TIER_1_CLEARED` and `CN` as `TIER_3_PROHIBITED`. Each grant covers every deployment to that destination on the SKU.
+
+Performance density is computed from the product's `tdp_watts`. During the declared variant, used while a product is being created and before any deployment has activated on it, the declared density is the board power draw verbatim, and the band is `HIGH` when that figure is at least 1400 watts and `LOW` otherwise. During the computed variant, used at deployment activation, the density is the board power draw rounded up to the next whole multiple of 100 watts, and the band is `HIGH` when that result is at least 1400 and `LOW` otherwise. The difference is observable: a declared 1350 watts stays `LOW` at creation, while the computed variant of the same product yields 1400 watts and flips to `HIGH`, recording `export_performance_density` as 1400.
+
+### 2.6. Supply Pool Temperature, Friction and Band Compliance
+
+A `SupplyNode` is a supplier pool that serves exactly one SKU. Each pool carries a `requested_hotness_tier` declared by its creator — one of `COOL`, `WARM`, `HOT`, or `SCALDING` — which is the intended temperature the derived tier is compared against. The derived `hotness_tier` is recomputed on every allocation mutation and at every epoch advance, and each tier is defined by a committed-rate threshold on the pool: `SCALDING` at a `total_committed_rate` of at least 10.5, `HOT` at at least 7.0, `WARM` at at least 2.0, and `COOL` below 2.0. The comparisons are inclusive at their boundaries, so a pool sitting at exactly 7.0 is `HOT` while one at 6.999 is `WARM`, and a pool at exactly 10.5 is `SCALDING`. The `total_committed_rate` is the sum of `committed_rate_v2` over the pool's holds whose state is `COMMITTED` or `REQUESTED`; holds that were `RECLAIMED`, `CANCELLED`, or `EXPIRED` stop contributing to the pool temperature.
+
+The pool's `temp_band_ceiling` is the maximum friction tier the pool currently accepts, and it is derived from the hotness tier by a deliberately non-monotonic mapping: a `SCALDING` pool has a ceiling of `COOL`, a `HOT` pool has a ceiling of `WARM`, a `WARM` pool has a ceiling of `COOL`, and a `COOL` pool has a ceiling of `COOL`. A hotter pool therefore never grants a hotter ceiling.
+
+A `SupplyNode` also carries a `stage` — one of `OPEN`, `FRICTION_HOLD`, `DRAINING`, or `BINDING`. A pool in `DRAINING` or `BINDING` refuses allocation-creating requests with `ERR_NODE_NOT_OPEN_FOR_ALLOCATION` and HTTP 409. Friction is tracked through the `friction_penalty_score` accumulated from the pool's penalties; it decays at every epoch advance and is reset to 0.0 when the pool returns to `OPEN` from `BINDING`.
+
+### 2.7. Allocation Prioritisation and Displacement Ordering
+
+When a pool cannot satisfy an incoming hold from unheld capacity, the system ranks the competing claimants rather than queueing them by arrival. The candidate set is every hold on the same SKU that is still in `REQUESTED` state and whose `hold_friction_tier` ranks at or below the parent pool's `temp_band_ceiling`; holds that are `COMMITTED`, `CANCELLED`, `RECLAIMED`, or `EXPIRED` are excluded, and the candidate set is empty when no `REQUESTED` hold exists on the SKU. Friction tiers rank in the order `COOL` lowest, then `WARM`, then `HOT`, then `SCALDING` highest.
+
+Each candidate's score is the confirm-variant value of the request, minus one half of the estimate-variant value of the same request, minus a penalty of 5.0 points for each recorded qualification attempt on the candidate's partner. Terms whose product is exactly zero are omitted from the sum rather than written as an explicit zero addend, so a candidate whose partner carries no qualification attempts carries no penalty term at all. Candidates are ordered by score descending; ties are broken by the earliest creation timestamp among the candidate's holds on that SKU ascending, and any remaining tie is broken by the hold's own creation timestamp ascending. The random `id` field is never consulted at any level of the ranking. A score of exactly 0.0 is representable and is what a candidate carries when both value variants resolve to zero and the penalty term is omitted.
+
+Displacement consumes that ranking from the lowest score upward, accumulating quantities until the accumulated total is at least the incoming request's quantity, and every member of that prefix becomes `RECLAIMED`; an incoming hold that displaces such a prefix lands directly in `COMMITTED`, stepping into the capacity its displacement freed rather than resting in `REQUESTED`. The displaced client is expected to resubmit at a later epoch. The evaluation order is pinned and must not be revisited part-way: each candidate partner's committed volume is read once as a snapshot taken before the incoming hold row exists, the ranking is evaluated once against that snapshot, and the incoming hold's quantity is added to its partner's committed volume only after the displaced set has been frozen and the reclaimed rows written. The order is explicit because committed volume feeds the ranking itself, so allowing the final step to run early would re-rank the very candidates being displaced.
+
+### 2.8. Ledger Conservation: Capacity and Entitlement
+
+Two conserved quantities run through the system, and only the transitions enumerated below move them.
+
+The partner's `capacity_ledger_net` is a signed cumulative figure measuring supplier capacity units granted minus capacity units reclaimed. It moves by exactly these deltas: a hold's reservation from `REQUESTED` to `COMMITTED` adds the hold's quantity; a reclaim of a committed hold subtracts the quantity; a cancellation from either `REQUESTED` or `COMMITTED` subtracts the quantity; consumption of a pool reservation subtracts the quantity. An expiry of a committed hold leaves this ledger deliberately untouched, so an expiry leaves more held capacity on the partner's ledger than the pool actually holds. Every other transition in the system leaves the field alone.
+
+The partner's `entitlement_units_held` is the sum of visible units generated by active allocations. It moves by exactly these deltas: activating a subscription adds the bound stack's `entitlement_units`; terminating a deployment subtracts the first step of the release computation described in the subscription section. Suspending a subscription, reinstating it, reclaiming it, expiring it, activating a deployment, and returning a terminated deployment to the pending pool all leave this ledger unchanged. The practical consequence is that reclaiming a subscription never returns entitlement units: only the deployment termination path releases them, so a partner whose subscriptions were suspended and then reinstated must show an unchanged `entitlement_units_held`.
+
+### 2.9. Subscription Billing, Settlement and Seat Bounds
+
+Support subscriptions are billed in integer cents against three seat tiers. The per-seat annual fee is 12000 cents for `BASIC`, 36000 cents for `BUSINESS`, and 90000 cents for `ENTERPRISE`.
+
+Two computations read the same inputs and deliberately disagree. The forward-looking provisional fee, written when a subscription reaches `ACTIVE`, charges every declared seat: the annual fee field records the per-seat fee for the tier, and the billed fee is the declared `seat_count` multiplied by that per-seat fee. No floor, cap, or historical adjustment is applied. The chronological settled fee, written when a subscription is reclaimed or expired and on every settle pass, applies both bounds: the billable seat count is the declared `seat_count` clamped upward to a minimum of 40 and downward to a maximum of 1000, and the settled fee is that billable count multiplied by the per-seat fee. Seats above 1000 are never billed, and the floor of 40 is always billed even when fewer seats were declared. The two therefore diverge for any subscription below the floor — a 25-seat `BUSINESS` subscription settles at 1440000 cents while its provisional figure was 900000 cents.
+
+The `support_credit_units` field uses the same seat floor as an inclusive threshold. Below 40 seats the credit is the seat count multiplied by 3; at 40 seats or above it is the seat count multiplied by 5. The boundary is inclusive at 40, giving 200 credit units at exactly 40 seats and 117 at 39 seats.
+
+### 2.10. Common Resource Properties and Nested Path Resolution
+
+Every top-level resource — including `PartnerAccount`, `AcceleratorProduct`, `SupplyNode`, `SolutionBlueprint`, `AllocationHold`, `ValidationEvidence`, `EnterpriseSubscription`, `HardwareDeployment`, `SoftwareStackLicense`, `DeveloperProgramMembership`, `PreviewSoftwareGrant`, `ConfidentialityAcknowledgement`, `DemandForecast`, `EvaluationLoan`, `ProofOfConceptMilestone`, `LifecycleCommitment`, `FrictionPenalty`, `AllocationEpoch`, `AuditTrailEntry`, `ExportLicenseGrant`, and `SupplyContract` — carries a standard set of system-managed fields. The `id` field is a server-minted UUID with no type prefix. The `created_at` field is an ISO 8601 UTC timestamp with three fractional digits. The `updated_at` field is an ISO 8601 UTC timestamp recording the last modification and is refreshed on every mutation. The `version` field is an integer that increments on every modification and is the basis for the concurrency rules below. All twenty-one entities in this system declare the full common-field set, so `updated_at` and `version` are present on every one of them.
+
+Paths that name a resource resolve their identifiers left to right, before any body field is examined. A request addressing an unknown parent path segment reports the path error even when its body also names an unknown reference. Paths under the partner collection report `ERR_PARTNER_NOT_FOUND` with HTTP 404 when the named partner does not exist; every other collection reports `ERR_RESOURCE_NOT_FOUND` with HTTP 404. Body-declared references are resolved next, in the order the endpoint's input list declares them left to right, so when two body references on one request both fail to resolve the earlier field's error wins. A body-declared blueprint reference that does not resolve reports `ERR_BLUEPRINT_NOT_FOUND` with HTTP 404.
+
+### 2.11. Precision, Rounding and the Logical Clock
+
+Numeric results are rounded half-even, and the declared precision is part of the contract rather than an implementation choice. Monetary results are expressed as integer cents, with the per-allocation rounding performed before any summation: the commitment fee is rounded half-even to whole cents per allocation and only then summed, and summing first and rounding once afterwards is explicitly not the required semantics because it produces a different total. Unit quantities are integers, with the exception of the value scores, which are carried to one decimal place, and the late-fee and forfeit-rate figures, which are carried to one decimal place and four decimal places respectively.
+
+The system runs on a logical clock that reads exactly `2026-09-01T00:00:00Z` at server start-up and must never fall back to real wall-clock time. A dedicated administrative capability rewinds or advances the clock to a supplied `current_utc` instant. All temporal rules — horizon bands, eligibility deadlines, grace windows, late fees, and subscription anniversaries — are evaluated against this clock, which makes them deterministic and reproducible.
+
+### 2.12. Optimistic Concurrency, Allocation Guards and Request Evaluation Order
+
+Three endpoints are guarded by an optimistic-concurrency token on their parent entity, and each takes the token as a required input field. A new allocation hold submitted against a `PartnerAccount` must carry `expected_partner_version`; if the partner's version has moved past the value the client last observed, the submission is rejected with `ERR_STALE_PARTNER_VERSION` and HTTP 412. A new demand forecast must likewise carry `expected_partner_version`, because the forecast ceiling is evaluated against the partner's committed volume at the moment the request is applied, and a submission carrying a superseded version is rejected with `ERR_STALE_PARTNER_VERSION` and HTTP 412. The subscription evaluation path must carry `expected_subscription_version`, and an evaluation carrying a superseded observation of the subscription is rejected with `ERR_STALE_SUBSCRIPTION_VERSION` and HTTP 412. Endpoints not named here — including the two product-version tokens on loan approval and lifecycle grant, which are described with their own workflows — do not take a partner or subscription version field, and no endpoint takes a version token it is not specified to take.
+
+The allocation path carries a second, deliberately different guard. An allocation request must also echo the product's observed `allocated_units` in `expected_allocated_units`; a mismatch is rejected with `ERR_ALLOCATED_UNITS_CHANGED` and HTTP 412, whatever the product's row version happens to be. This guard is not optimistic concurrency on the product's version: bumping the product version while leaving `allocated_units` unchanged must not trip it, and changing `allocated_units` while leaving the version untouched must.
+
+Requests are evaluated against a fixed precedence order, and the ordering is normative rather than incidental — a caller relying on the wrong error being reported first will observe a different failure than expected. The order is:
+
+1. Both `X-User-ID` and `X-User-Role` present and carrying a declared role, otherwise `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER`.
+2. The caller's role permitted for the endpoint, otherwise `ERR_FORBIDDEN_FOR_ROLE`.
+3. The resource named in the path exists, otherwise `ERR_PARTNER_NOT_FOUND` for partner paths and `ERR_RESOURCE_NOT_FOUND` elsewhere.
+4. Body-declared foreign keys resolve left to right, otherwise `ERR_BLUEPRINT_NOT_FOUND` or the corresponding not-found error.
+5. The target resource's current state admits the requested trigger, otherwise `ERR_INVALID_STATE`.
+6. Export control classification is clear or licensed, otherwise `ERR_EXPORT_CONTROL_RESTRICTED` or `ERR_EXPORT_LICENSE_REQUIRED`.
+7. Confidentiality acknowledgement is bound where a preview stack is involved, otherwise `ERR_NDA_NOT_BOUND`.
+8. The deployment termination chain is operated by a different actor from the activator; a match reports `ERR_SAME_ACTOR_DEPLOYMENT_CHAIN`.
+9. The hold friction tier ranks at or below the pool's ceiling, otherwise `ERR_HOLD_TIER_EXCEEDS_BAND`. This band rule applies both to the licence hold group and to a single allocation hold, and the single-hold path raises it only when the hold's tier ranks above the pool's ceiling and the pool cannot supply the hold from its unheld capacity; a single over-ceiling hold that the pool can still supply from unheld capacity takes the friction path of §3.3 instead of this refusal.
+10. The pool is open for allocation, otherwise `ERR_NODE_NOT_OPEN_FOR_ALLOCATION`.
+11. An open allocation epoch exists, otherwise `ERR_NO_OPEN_EPOCH`.
+12. A deployment group is fully satisfied before dispatch, otherwise `ERR_GROUP_NOT_SATISFIED`.
+13. A named forecast supports the hold, otherwise `ERR_FORECAST_NOT_COMMITTED`.
+14. Supply contract month windows do not overlap, otherwise `ERR_CONTRACT_WINDOW_OVERLAP`.
+15. Preview grant windows do not overlap across the buffer, otherwise `ERR_PREVIEW_GRANT_WINDOW_OVERLAP`.
+16. Confidentiality acknowledgement windows do not overlap, otherwise `ERR_NDA_WINDOW_OVERLAP`.
+17. A forecast commit arrives strictly before the eligibility deadline, otherwise `ERR_FORECAST_DEADLINE_PASSED`.
+18. A lifecycle horizon clears the grace floor, otherwise `ERR_LIFECYCLE_HORIZON_TOO_SHORT`.
+19. A subscription's covering deployment is not terminated, otherwise `ERR_NO_COVERING_SUBSCRIPTION`.
+20. Every licence group member resolves to a stack license on the same SKU, otherwise `ERR_LICENSE_GROUP_UNRESOLVED`.
+21. The entitlement ceiling is not breached, otherwise `ERR_ENTITLEMENT_UNITS_EXCEEDED`.
+22. The partner's committed-volume ceiling is not breached, otherwise `ERR_SUPPLY_CEILING_EXCEEDED`.
+23. Evaluation units are ring-fenced, otherwise `ERR_RESERVED_FOR_EVALUATION`.
+24. Lifecycle units are available, otherwise `ERR_LIFECYCLE_UNITS_UNCOMMITTED`.
+25. A displacing allocation finds a non-empty candidate set, otherwise `ERR_NO_ALLOCATION_CANDIDATE`; the candidate check precedes any capacity comparison.
+26. The observed allocated units are unchanged, otherwise `ERR_ALLOCATED_UNITS_CHANGED`.
+27. The partner version is current, otherwise `ERR_STALE_PARTNER_VERSION`.
+28. The subscription version is current, otherwise `ERR_STALE_SUBSCRIPTION_VERSION`.
+29. The request shape is valid — required fields present, enum members known, integer fields non-negative, and `quantity_units` strictly positive — otherwise `ERR_INVALID_REQUEST`.
+30. The partner is certified for the program, otherwise `ERR_QUALIFICATION_NOT_MET`.
+31. The blueprint accepts new evidence, otherwise `ERR_BLUEPRINT_NOT_CERTIFIED`.
+32. The recorded evidence minutes are sufficient, otherwise `ERR_EVIDENCE_INSUFFICIENT`.
+
+Two ordering consequences are called out explicitly because the scaffolder has pinned them. The separation-of-duties check on deployment termination sits below the covering-subscription constraint, so a deployment with no covering subscription reports `ERR_NO_COVERING_SUBSCRIPTION` rather than the same-actor error, while a deployment that does have a covering subscription and is terminated by its own activator reports `ERR_SAME_ACTOR_DEPLOYMENT_CHAIN`. The export-control gate likewise sits below the separation-of-duties gate in the description of termination, so a terminating request is evaluated for exit licensing before the actor comparison.
+
+## 3. Business Logic & Workflows
+
+### 3.1. The Accelerator Catalog and SKU Lifecycle
+
+Everything in the system hangs off the product catalog, so the catalog's own lifecycle comes first. A `PlatformAdmin` creates an accelerator SKU by supplying its `sku_code` — a unique product code such as one naming the model and its host interface — along with its `product_family`, one of `DATACENTER`, `WORKSTATION`, `EMBEDDED`, or `CONSUMER`; its `form_factor`, one of `SXM`, `PCLE`, or `MCM`; its `hbm_capacity_gb` memory capacity in gigabytes; its `tdp_watts` board power draw; its `supply_ceiling_units`, the maximum number of units the supplier may ever allocate for that SKU; and its `long_term_availability_through`, the promised availability horizon that is folded in when the SKU reaches the mature stage. The SKU opens at `lifecycle_stage` `PREVIEW` with its `available_units` initialised to its full supply ceiling, its `lifecycle_min_remaining_days` at 0, and its export performance density is set by the declared variant described in §2.5.
+
+The catalog is also adjustable and readable. An operator may adjust a SKU's supply ceiling or its promised availability horizon, which re-derives the available units without re-running any hold ranking, and may read a single SKU including its derived free units and density figures. The lifecycle itself advances one stage at a time — `PREVIEW` to `GENERAL_AVAILABILITY` to `MATURE` to `END_OF_LIFE` — and the advance is refused from `END_OF_LIFE` with `ERR_INVALID_STATE`. The consequential step is the promotion into `GENERAL_AVAILABILITY`, because that is where the evaluation ring-fence is created: the product's `reserved_evaluation_units` are set from 10 percent of its supply ceiling, rounded up, as described in §3.8, and the promotion also re-runs the density band and the lifecycle floor for the SKU. An operator override is available for the case where a partner needs a larger evaluation pool than the ratio-derived floor, setting the reserved evaluation units to a supplied `units` value directly and re-deriving the available units; the override is the only supported way to size that pool outside the ratio.
+
+A SKU's remaining unit count is what every allocation decision ultimately consumes. The available units are the supply ceiling minus the allocated units minus the reserved evaluation units, and the figure is floored at zero so that an over-committed SKU reports no availability rather than a negative one.
+
+### 3.2. Partner Onboarding, Qualification and Standing
+
+A `PartnerAccount` enters the system when a partner registers, supplying its `legal_name`, its `partner_type` — one of `CLOUD_PROVIDER`, `SYSTEM_BUILDER`, `ENTERPRISE_OEM`, `EMBEDDED_VENDOR`, or `DIRECT_ENTERPRISE` — the `destination_country` it ships and accesses product from, its `export_restriction_tier` (defaulting to `LICENSE_EXCEPTION` when omitted, and otherwise one of `LICENSE_EXCEPTION`, `LICENSE_REQUIRED`, or `PROHIBITED`), and its `origin_epoch_index`. That last field records the epoch at which the relationship began and is what selects between the two committed-rate variants described with allocation pricing. The committed rate a hold bears depends on which of those two variants the partner's relationship selects. Partners whose relationship began before the cutover epoch index of 3 are billed under the time-based model, which charges every unit the flat base rate of 1.75, so the rate is identical regardless of how many units are requested. Partners at or above that cutover are billed under the unit-based model, which prices each successive block of 100 units one step higher: the first block is charged at 1.75 per unit and each subsequent block adds 0.25 to the per-unit rate, capped at a ceiling of 4.5 per unit. The rate is the weighted average of those block prices over the requested quantity, rounded half-even to four decimal places, and the corresponding fee in cents is the same block total scaled to cents and rounded half-even to a whole cent. A request for 250 units therefore bears a rate of 1.95 under the unit-based model, while the time-based model still charges 1.75 for the same quantity. Registration places the account in `APPLIED` qualification with `ACTIVE` standing and an `UNQUALIFIED` priority class.
+
+Reference architectures are defined separately from the partners who certify against them. A `SupplyPlanner` defines a `SolutionBlueprint` by supplying its `blueprint_code`, its `blueprint_type` — one of `TRAINING_CLUSTER`, `INFERENCE_SERVER`, `EDGE_BOX`, or `WORKSTATION` — the `target_tdp_watts` aggregate board power the design is validated at, the `required_validation_minutes` a partner must accumulate to certify against it, and the `evaluation_deadline_days` window within which a proof-of-concept loan against it must record a result. A blueprint opens with `blueprint_status` `DRAFT` and an `era_index` of 1, is promoted to `CERTIFIED` so that partners may file evidence against it, and may later be `RETIRED`. The era index is the blueprint's current round: it is incremented on each major revision and on each loss of a blueprint's only accepted evidence, and evidence accumulates only within the current era.
+
+Qualification runs through a validation pipeline. A `PartnerProgramManager` files a validation evidence pack — recording `validation_minutes`, `test_count`, and the `blueprint_id` of the reference architecture it certifies against — which creates a `ValidationEvidence` whose `evidence_pack_status` is `SUBMITTED` and moves the partner from `APPLIED` to `IN_VALIDATION`. That first transition is refused unless the partner's standing is `ACTIVE` rather than `SUSPENDED` or `TERMINATED`, and the target blueprint must already be in `CERTIFIED` blueprint status. Filing evidence does not increment the partner's attempt counter. Evidence may only be filed against a blueprint that is `CERTIFIED` or `DRAFT`; a `RETIRED` blueprint refuses new evidence with `ERR_BLUEPRINT_NOT_CERTIFIED`, and a pack whose recorded minutes fall short of the blueprint's `required_validation_minutes` is refused at acceptance with `ERR_EVIDENCE_INSUFFICIENT`.
+
+Accepting a pack is a `PartnerProgramManager` action on the evidence itself, moving it from `SUBMITTED` to `ACCEPTED`, and rejecting one moves it from `SUBMITTED` to `REJECTED`. A pack is only acceptable while it is still `SUBMITTED`. The partner then qualifies through a separate action that requires at least one of its evidence packs to be `ACCEPTED`, requires that accepted pack's blueprint to be `CERTIFIED`, and requires every accepted pack's blueprint type to be one the partner's declared `partner_type` supports. Qualifying a partner moves it from `IN_VALIDATION` to `QUALIFIED`, increments its `version`, and appends an audit entry recording the qualification. The partner's `allocation_priority_class` is not written at qualification; it is re-derived at the next epoch advance.
+
+Rejection is the roll-back path. A `PartnerProgramManager` rejection moves the partner from `IN_VALIDATION` back to `APPLIED` — refused when the partner is somehow already `APPLIED` — and cascades in two depths. At the first depth, every one of the partner's evidence packs still in `SUBMITTED` shape is set to `REJECTED`. At the second depth, for each blueprint that lost its only `ACCEPTED` evidence in its current era, the blueprint's `era_index` is incremented, which invalidates the remaining evidence filed under the previous era. The rejection also increments the partner's `qualification_attempt_count`, and that counter is preserved across any later re-application.
+
+Suspension is a standing change, not a certification change. A `PartnerProgramManager` may suspend a partner that is both `QUALIFIED` and `ACTIVE`. The transition sets the partner's `qualification_status` to `SUSPENDED` and its `status` to `SUSPENDED`, and then cascades three depths: at the first depth every enterprise support subscription belonging to that partner that is `ACTIVE` becomes `SUSPENDED`; at the second depth each covered deployment has its service readiness recomputed, becoming false when no remaining active subscription covers it; at the third depth a deployment whose readiness flipped false while it was `ACTIVATED` is moved to `TERMINATED`, which itself triggers the entitlement release described later. The partner's `entitlement_units_held` is deliberately not reduced by suspension. Reinstatement is a `PlatformAdmin` action that lifts a suspension, returning the partner from `SUSPENDED` to `QUALIFIED` with `ACTIVE` standing; it does not auto-reactivate the suspended subscriptions, each of which must be reinstated individually.
+
+Termination is available from two places. From `QUALIFIED`, a `PlatformAdmin` may terminate a partner only once every subscription covering it that is in `ACTIVE` state has been reclaimed or expired; from `SUSPENDED`, termination requires that the partner has at least one recorded qualification attempt. Both routes return the partner body and release no allocations. A terminated partner may re-apply, but only when it holds no `ACTIVE` allocation; re-application returns the partner to `APPLIED` with `ACTIVE` standing and preserves its attempt counter, which closes the cycle — a partner may move `APPLIED` to `IN_VALIDATION` and back to `APPLIED` indefinitely.
+
+Each of these transitions is gated by the certification prerequisites described in §2.4, so a partner that is not `QUALIFIED` cannot accumulate allocations, subscriptions, memberships, loans, or lifecycle commitments, and the attempt is refused with `ERR_QUALIFICATION_NOT_MET`. A partner's failed attempts also carry a forward cost: the priority re-ranking described in §2.7 charges 5.0 points per recorded attempt, capped at 20 points, so recordings of four and of five attempts both carry the full 20-point penalty.
+
+### 3.3. Supply Pools: Temperature, Friction and Stage Lifecycle
+
+A `SupplyPlanner` opens a supplier pool by registering a `SupplyNode` with a `node_code`, the `product_sku_id` it will serve, a `node_region` of either `AMERICAS`, `EMEA`, or `APAC`, a `capacity_units` figure, and a `requested_hotness_tier`. The pool opens in `OPEN` stage with zero held units, and the declared hotness tier is applied immediately so that a temperature ceiling is available before any hold exists against the pool. The pool's `held_units` and `committed_fee_cents` both begin at zero and are re-derived as holds are created: the held units are the sum of held units over the pool's active holds, and the commitment fee is the sum, over those same holds, of each hold's fee rounded half-even to whole cents before the sum is taken — rounding once after summing is not equivalent. An individual hold's fee is its committed rate multiplied by its quantity, multiplied by the commitment multiplier for the horizon band of the forecast confirming it: 0.2 for `SHORT`, 0.35 for `MEDIUM`, and 0.5 for `LONG`, scaled to cents.
+
+Temperature and friction are recomputed continuously. Each allocation mutation on the pool re-derives the hotness tier from the sum of committed rates over its holds in `COMMITTED` and `REQUESTED` state, re-derives the ceiling from the non-monotonic band mapping described in §2.6, and re-derives the pool's penalty score over its active penalties only. At every epoch advance the pool's penalties decay by half-life, and any penalty whose score reaches zero becomes `DECAYED` and stops contributing; a pool sitting in `FRICTION_HOLD` returns to `OPEN` at that point provided its accumulated penalty score is below 4.0.
+
+Friction itself is recorded as a `FrictionPenalty` against the pool that was engaged above its temperature band. Each penalty names the `partner_id` that over-committed, the `hold_id` that produced it, a `penalty_reason` of either `BAND_VIOLATION` or `LATE_CANCEL`, and a computed `score` that is the base score of 1.0 scaled by two raised to the number of tiers by which the engaged tier sits above the pool's ceiling — a penalty at or below the ceiling is a single base point, and each tier of overshoot doubles the score from there. Scores are rounded half-even to one decimal place. A penalty begins with `penalty_state` `ACTIVE` and can become `DECAYED` through epoch decay or `SETTLED` when its parent pool enters `BINDING`.
+
+The stage machine on the pool is cyclic. A pool opens in `OPEN`. A hold created against it with a friction tier ranked strictly above its temperature ceiling does not reject the request: the hold commits, a `BAND_VIOLATION` penalty is created in `ACTIVE` state, the penalty's score is added to the pool's friction score, the offending hold's quantity is never counted toward the pool's held units, and the pool moves into `FRICTION_HOLD`. A `SupplyPlanner` drains a pool by moving it to a supplied `target_stage` of `DRAINING`, which requires that the pool is `OPEN` and that its held units are zero. From `DRAINING` the pool may be bound, moving to `BINDING` provided its friction score does not exceed 4.0; entering `BINDING` settles every active penalty on the pool. Both `DRAINING` and `BINDING` refuse new allocations, as noted in §2.12. The cycle closes when an epoch advance returns a `FRICTION_HOLD` pool to `OPEN` or returns a `BINDING` pool to `OPEN` with its friction score reset to zero. Because both loops are repeatable, a pool revisits `OPEN` indefinitely.
+
+The review surface for ranking is an explicit capability on the pool that returns the ordered candidate list without mutating anything, so the ordering and its tie-breaks are directly observable. An empty candidate set returns an empty array at that surface rather than an error; the error case belongs to the allocation path, which reports `ERR_NO_ALLOCATION_CANDIDATE` when a displacing request has nobody to displace.
+
+### 3.4. Allocation Holds, Value Scoring and Preemptive Displacement
+
+Allocation is a two-step commitment: a partner first requests units, and later commits the request into held capacity. A `PartnerOps` caller creates an `AllocationHold` against a pool on behalf of its own partner account, supplying the `product_sku_id`, the `supply_node_id`, the `quantity_units`, and optionally a `hold_friction_tier` (defaulting to `COOL`), a `forecast_id`, and a `preempt_lower_tier` flag. The request must also echo the partner's observed version in `expected_partner_version` and the product's observed allocation state in `expected_allocated_units`; a mismatch on either is rejected as described in §2.12. Creating the hold itself advances the partner account by one version, which is why a partner submitting several holds must re-read its version between them; the bulk form of this request reserves for several SKUs at once, creating one hold per `members` entry all in `REQUESTED` state, advancing the partner by a single version for the whole batch, and recomputing the pool's commitment fee and temperature once; a member entry that names no explicit quantity reserves a single unit, and a member given as a bare value is read as its quantity. The payload for hold creation is bound to a fixed positional key order rather than to field names, so the values are read as `product_sku_id`, then `supply_node_id`, then `quantity_units`, then `hold_friction_tier`, then `forecast_id`, then `preempt_lower_tier`, then `expected_partner_version`, then `expected_allocated_units`.
+
+A hold begins with its `state` at `REQUESTED`, its `committed_rate_v2` computed by the pricing model, and its `economic_tag` emitted by comparing the estimate-variant value against the confirm-variant value of the same request: when the confirm-variant value exceeds the estimate-variant value the hold is tagged `HIGH_VALUE`, and otherwise it is tagged `LOW_VALUE`. The value scoring reads the partner's `eligibility_deadline_at` and the request's `quantity_units`: the gap in days between the deadline and the logical clock, never negative, is multiplied by a weight of 10.0 and added to the quantity weighted at 1.0, with the result rounded half-even to one decimal place. The two variants differ in how they treat a long ramp. The estimate variant caps the gap at 30 days and caps the quantity at 500 units before weighting, so elapsed time beyond 30 days is discarded. The confirm variant leaves the gap uncapped and caps only the quantity at 500. The divergence is material: with a gap of 45 days and 500 units, the estimate resolves to 800.0 while the confirm resolves to 950.0.
+
+If a `forecast_id` is named, the referenced forecast must be in `ACTIVE` or `COMMITTED` tracking status for the same partner and SKU, otherwise the request is refused with `ERR_FORECAST_NOT_COMMITTED`. The request is also refused with `ERR_SUPPLY_CEILING_EXCEEDED` when the partner's committed volume plus the requested quantity would exceed the partner's committed volume plus its held entitlement units plus the configured supply-ceiling headroom of 1000 units; the comparison uses the strict form, so a request landing exactly on the ceiling is accepted. A hold whose friction tier ranks above the target pool's ceiling is handled by the band-violation path described in §3.3 rather than rejected outright — the hold still commits.
+
+When a pool lacks unheld capacity and the incoming hold asks to preempt, displacement runs as specified in §2.7 and the displaced prefix is marked `RECLAIMED`; the displaced partner's capacity ledger is debited, while the pool's held units are untouched because those reservations were never committed. The incoming hold's tier must still satisfy the ceiling ranking that defines the candidate set. The allocation path also refuses with `ERR_HOLD_TIER_EXCEEDS_BAND` when a hold's friction tier ranks above the pool's ceiling and the request is being evaluated through a path that treats tier overshoot as a hard constraint rather than the friction path; for a single allocation hold that hard constraint applies exactly when the pool cannot cover the hold from its unheld capacity, whereas the licence hold group treats every tier overshoot as that hard constraint; the two behaviours are distinguished by whether the request commits into `FRICTION_HOLD` or is refused.
+
+Committing a requested hold is a `PartnerOps` action that moves it from `REQUESTED` to `COMMITTED`, provided the target pool is not in `DRAINING` or `BINDING`. A commit adds the hold's quantity to the partner's capacity ledger and to the pool's held units, and recomputes the pool's temperature, ceiling, committed rate and commitment fee. The commit endpoint also accepts an optional `consume_reservation` flag, which selects the reservation-consumption path for the hold's units.
+
+Cancellation before commit is free: a hold in `REQUESTED` may be cancelled by its partner, moving it to `CANCELLED` without touching the pool's held units because no reservation had been committed, and recording an audit entry for the cancellation. Cancellation after commit is not free. A hold in `COMMITTED` may be cancelled, moving it to `CANCELLED` and debiting both the partner's capacity ledger and the pool's held units, and when the logical clock is strictly after the confirming forecast's acknowledgement instant plus its `cancellation_notice_days`, the hold's `cancellation_forfeit_units` is written from the forecast's `forfeit_rate`. The cancellation endpoint accepts an optional `as_user_id` field recording the acting operator on the audit entry.
+
+Two operator paths close a committed hold without the partner's involvement. A `PlatformAdmin` reclaim moves a committed hold to `RECLAIMED`, debits the partner's capacity ledger and the pool's held units, and recomputes the pool temperature. An expiry moves a committed hold to `EXPIRED` and releases the pool's held units but deliberately leaves the partner's capacity ledger untouched, so the partner's ledger reports more held capacity than the pool actually holds. An expiry is used when a hold's confirming forecast fell away.
+
+### 3.5. Demand Forecasting, Horizon Bands and Forfeit Exposure
+
+Forecasting is how a partner converts an intention into an enforceable claim. A `PartnerOps` caller raises a `DemandForecast` by naming the `product_sku_id` and the `requested_quantity_units` it wants as its ceiling, together with the `expected_partner_version` it last observed; a stale version is rejected with `ERR_STALE_PARTNER_VERSION` and the request is refused outright. Creating a forecast increments the partner's `version` by one, because the forecast ceiling will later be evaluated against the partner's committed volume on the same account record. The new forecast sits at `tracking_status` `DRAFT`, and neither its `horizon_band` nor the partner's `eligibility_deadline_at` exists until acknowledgement.
+
+A `PartnerProgramManager` acknowledges the forecast, moving it from `DRAFT` to `FORECAST_SUBMITTED`. Acknowledgement requires a requested quantity greater than zero and a partner in `QUALIFIED` qualification, and it stamps the acknowledgement instant from the logical clock. The acknowledgement is also the moment the `horizon_band` is set, by a rule anchored to the third Saturday of the acknowledgement month. The boundary is found by starting at day 15 of the month and advancing forward one day at a time until a Saturday is reached. If the acknowledgement falls on day 15 or later and no later than the day after that boundary, the band is `SHORT` and the partner's eligibility deadline is the day after the boundary. Otherwise, if the acknowledgement falls no later than seven days after the boundary, the band is `MEDIUM` and the deadline is 45 days after the acknowledgement. Otherwise the band is `LONG` and the deadline is 90 days after the acknowledgement. So an acknowledgement at the very start of 2026-09-01, before the 15th, lands on a boundary of 2026-09-19 and, sitting within the seven-day window, takes the `MEDIUM` band with a deadline of 2026-10-16. An acknowledgement on 2026-09-18 — day 18, at or past the 15th and no later than 2026-09-20 — sits in the first branch and takes `SHORT` with a deadline of 2026-09-20. The forfeit rate is left unset at zero through acknowledgement.
+
+Committing quantity closes the gap. The commit action moves the forecast from `FORECAST_SUBMITTED` to `ACTIVE` and requires three things: the logical clock strictly before the partner's eligibility deadline — a commit arriving exactly on the deadline instant is late and is refused with `ERR_FORECAST_DEADLINE_PASSED` — a committed quantity no greater than the requested quantity, and the existence of an open allocation epoch, without which the commit is refused with `ERR_NO_OPEN_EPOCH`. The partner's `cancellation_forfeit_rate` is set at that same confirmation from the acknowledged horizon band. Committing sets the forecast's `committed_quantity_units` from the request, adds that quantity to the partner's `committed_volume_units`, and fixes the cancellation terms. The notice period follows the band: 14 days for `SHORT`, 30 days for `MEDIUM`, and 60 days for `LONG`. The forfeit rate is derived from the band together with an overage surcharge: the base rate is 0.1 for `SHORT` and 0.25 for both `MEDIUM` and `LONG`; the excess is whatever part of the partner's committed volume snapshot, taken before this commit is applied, exceeds the requested ceiling, divided by the larger of one and the requested ceiling; a surcharge of 0.05 is added for that excess, the total is capped at 0.75, and the result is rounded half-even to four decimal places. The `MEDIUM` boundary is inclusive, so that band yields exactly 0.25 when there is no excess, and the `SHORT` band yields exactly 0.10 when the partner's committed volume does not exceed the requested ceiling. Only after commit may allocation holds reference the forecast; before commit, any hold naming it is refused with `ERR_FORECAST_NOT_COMMITTED`.
+
+Cancellation of an active forecast is available once every allocation hold referencing it has reached a terminal state — `CANCELLED`, `RECLAIMED`, or `EXPIRED`. Cancelling moves the forecast to `CANCELLED` and subtracts the committed quantity from the partner's committed volume. A penalty is recorded only when the cancellation is received strictly after the acknowledgement instant plus the notice period, in which case the forfeited units are computed against the forecast's forfeit rate. The cancellation action accepts an optional `as_user_id` field, which records the acting operator on the audit entry it appends.
+
+A cancelled forecast is not dead. A revision returns it from `CANCELLED` to `FORECAST_SUBMITTED`, provided the partner is still `QUALIFIED`, and re-stamps the acknowledgement instant from the current logical clock, which re-derives both the horizon band and the eligibility deadline. Because a cancelled forecast may be revised and cancelled again, the sequence active, cancelled, submitted, active repeats. The other exit is automatic: when the logical clock reaches the partner's eligibility deadline, the epoch checkpoint moves any `ACTIVE` forecast to `COMMITTED`, freezing its forfeit rate, after which cancellation is no longer accepted at all.
+
+### 3.6. Software Stacks, Developer Programs and Confidential Preview Access
+
+A `SupplyPlanner` defines a `SoftwareStackLicense` by supplying its `license_code`, the `product_sku_id` it targets, a human-readable `stack_name`, the `entitlement_units` it grants per bound deployment at release, the `min_package_version` a deployment must be at to bind it, and a `preview_stack_flag` that marks preview software. The license opens with `license_state` `DRAFT` and a `bound_deployment_count` of zero, re-derived later from the deployment graph. Releasing it moves it from `DRAFT` to `RELEASED` and requires a non-empty minimum package version. Retiring it moves it from `RELEASED` to `RETIRED` and requires that nothing is bound to it — its bound deployment count must be zero.
+
+Developer program memberships are the route to early access, technical support, and preview hardware. A `PartnerOps` caller requests a membership at a `requested_tier` of either `COMMUNITY`, `REGISTERED`, `PREFERRED`, or `ELITE`, but the tier actually held — the `stored_tier` — always begins at `COMMUNITY` regardless of what was requested, and the membership opens in `REQUESTED` status. This distinction is load-bearing: every provisioning figure and every eligibility test in the program is evaluated against the stored tier, never against the requested tier, so an `ELITE` request from a `REGISTERED` membership provisions for `REGISTERED`.
+
+Opening the evaluation window is a `PartnerProgramManager` action moving the membership from `REQUESTED` to `UNDER_EVALUATION`, and it requires a `QUALIFIED` partner with at least one accepted evidence pack. It also sets the membership's `evaluation_deadline_at` to the logical clock plus the membership grace period, and provisions two fields against the stored tier. The `preview_kit_units` figure is the tier's kit allowance plus one kit for each whole 600 minutes of accepted validation evidence the partner has accumulated in the current blueprint era, with any partial block rounded up. The `support_incidents_included` figure is the tier's incident allowance plus one incident for each whole 100 support credit units on the partner's most recently activated subscription, with any remainder discarded. The tier allowances are zero kits and zero incidents at `COMMUNITY`, two kits and one incident at `REGISTERED`, six kits and three incidents at `PREFERRED`, and twelve kits and eight incidents at `ELITE`.
+
+Renewal is what lifts the stored tier, and it only runs once the window has elapsed. Renewing a membership moves it from `UNDER_EVALUATION` to `ACTIVE`, requires the logical clock to be at or after the evaluation deadline and the partner to still hold an accepted evidence pack, and advances the stored tier by exactly one tier toward the requested tier before recomputing the two provisioning figures. A renewal attempted before the deadline is refused with `ERR_INVALID_STATE`. Lapsing is the failure path: a `PartnerProgramManager` may lapse an `ACTIVE` membership, moving it to `LAPSED` and leaving its granted preview kits provisioned until the next renewal, while cascading at the first depth so that every preview software grant under that membership still in `OPEN` status becomes `REVOKED`. A lapsed membership may be renewed back into `UNDER_EVALUATION` once the clock is at or after the deadline, which re-arms the grace window and closes the cycle active, lapsed, under evaluation, active. A membership can also be revoked outright by a `SupplyComplianceOfficer`: revocation sets the status to `REVOKED` and zeroes the preview kit count. Separately, the system itself revokes a membership when one of its bound preview grants has been revoked for a confidentiality breach — the membership moves from `ACTIVE` to `REVOKED`, its preview kit count is set to zero, and at the first depth every one of its remaining `OPEN` grants becomes `REVOKED` as well.
+
+Preview software moves under an explicit grant. A `PartnerProgramManager` opens a `PreviewSoftwareGrant` naming the `stack_license_id` being granted, the `device_serial` of the evaluation device it is loaded onto, the `commitment_boundary_at` that opens the grant's window, the `commitment_expires_at` that closes it — a span of 60 days from the boundary — and the `confidentiality_ack_id` of the acknowledgement backing it. The grant opens in `OPEN` status. Two gates guard it: a grant whose referenced stack carries the preview flag must be backed by a `BOUND` confidentiality acknowledgement, otherwise it is refused with `ERR_NDA_NOT_BOUND`, and a grant whose window collides with an existing grant for the same partner and SKU is refused with `ERR_PREVIEW_GRANT_WINDOW_OVERLAP`. The collision test treats the windows as closed day spans from the boundary to the expiry, applying a 30-day buffer to the existing grant's end, and a new grant whose start falls on the buffered end minus one day counts as an overlap.
+
+A `SupplyComplianceOfficer` binds a `ConfidentialityAcknowledgement` by naming the `membership_id` it binds to, the `stack_license_id` it covers, and the `acknowledged_at` instant the acknowledgement was accepted; the acknowledgement opens with `ack_status` `BOUND`. Two acknowledgements for the same stack license are compared as open month windows that permit a single month of adjacency: the collision is refused with `ERR_NDA_WINDOW_OVERLAP` only when the new window starts strictly before the existing window's end month minus one. An acknowledgement advances to `FULFILLED` only when the grant bound to it closes with `FULFILLED`; it stays `BOUND` if the grant is revoked, and only the membership revocation closes it later.
+
+The grant itself has three exits from `OPEN`. It is fulfilled by the system when its bound deployment completes activation, and the backing acknowledgement is fulfilled with it. It is revoked by a `SupplyComplianceOfficer`, which sets the grant to `REVOKED` and cascades at the first depth so that its parent membership becomes `REVOKED`. It expires by the system at an epoch advance once the logical clock passes the grant's expiry instant. Note that binding happens eagerly, not lazily: when a subscription is created, every member of its licence group is bound immediately, including preview stacks that carry the preview flag, so the confidentiality gate is enforced at deployment activation rather than deferred to it.
+
+### 3.7. Hardware Deployments, Export Gating, Subscriptions and the Entitlement Ledger
+
+A `SupportAccountManager` registers a `HardwareDeployment` by supplying the `product_sku_id` it runs, the `partner_id` of the partner operating the deployment — the very account the activation qualification gate, the confidentiality gate and the suspension and termination cascades all read — the `destination_country_code` it ships to — one of `US`, `DE`, `FR`, `CN`, `SG`, or `CA` — and a `stack_manifest` listing the stack components, each carrying a `license_id` and its `entitlement_units`, bound at activation. The registration resolves this operating-partner reference last among the request's references and raises `ERR_PARTNER_NOT_FOUND` when it does not resolve to a `PartnerAccount`. The deployment opens with its `activation_state` at `PENDING`, and its export classification is resolved at registration from the destination together with the product's density band, before any activation occurs. The registration gate also evaluates the export-control classification for the destination before that operating-partner reference is resolved, so a registration against a destination whose classification is `TIER_3_PROHIBITED`, or `TIER_2_LICENSE_REQUIRED` with no active grant, is refused with the corresponding export error ahead of any `ERR_PARTNER_NOT_FOUND`. Every manifest entry's licence group is also resolved against the SKU at create time, so a licence group naming a stack license whose product SKU does not match the deployment's SKU is refused with `ERR_LICENSE_GROUP_UNRESOLVED` at HTTP 422.
+
+Activation applies four gates in the order fixed by §2.12. The partner must be `QUALIFIED`; the parent product must have a positive allocated unit count; the export classification must not be `TIER_3_PROHIBITED`; and where the classification is `TIER_2_LICENSE_REQUIRED`, an active export licence grant for the deployment must exist. Each manifest stack that carries the preview flag must have a confidentiality acknowledgement for the acting partner in `BOUND` status. Passing the gates moves the deployment from `PENDING` to `ACTIVATED` and sets its `bound_stack_ids` to the manifest stack ids that cleared the confidentiality gate — entries without an accepted acknowledgement are dropped from the bound set rather than causing the whole request to be rejected. Service readiness is not set by activation itself: the deployment's `service_ready` becomes true only once at least one subscription bound to it reaches `ACTIVE`. Activation then cascades three depths: at the first depth every preview grant referenced by a bound stack and still `OPEN` becomes `FULFILLED`; at the second depth each fulfilled grant's acknowledgement becomes `FULFILLED`; at the third depth each fulfilled grant's membership has its included incident allowance recomputed against the newer accepted-evidence count. Activation also re-runs the computed variant of the density band for the product and appends an audit entry recording the activation together with the acting `X-User-ID`.
+
+The export licence that unlocks a restricted destination is filed by a `SupplyComplianceOfficer`, naming the `product_sku_id`, the `destination_country_code`, and the `granted_units` it authorises. The grant opens in `ACTIVE` status and covers every deployment to that destination on the SKU. It may be revoked, moving it to `REVOKED`, after which any operation depending on it falls back to the `TIER_2_LICENSE_REQUIRED` refusal.
+
+Enterprise support subscriptions are created by a `SupportAccountManager` against a deployment, naming the `deployment_id` the subscription is bound to, the `support_tier` of `BASIC`, `BUSINESS`, or `ENTERPRISE`, the `seat_count`, the `licence_group` of stack licenses the subscription will cover, and a `trial_flag`. The subscription opens with its `status` at `DRAFT` and its `annual_fee_cents` provisioned by the forward-looking computation described in §2.9. A subscription may only be created against a deployment that exists and is still `PENDING` or `ACTIVATED`; a subscription whose covering deployment is `TERMINATED` is refused with `ERR_NO_COVERING_SUBSCRIPTION`, and the same error is emitted when a deployment that has no subscription bound to it at all is terminated. A deployment that does carry at least one bound subscription terminates even when that subscription has already been `RECLAIMED` or `EXPIRED`, because the bind relationship alone satisfies the covering requirement; only the `ACTIVE` and `SUSPENDED` rows move to `RECLAIMED` at the first depth. A licence group that names the same stack license twice is refused with `ERR_LICENSE_GROUP_DUPLICATE_MEMBER`.
+
+Activation is the point at which the entitlement ledger moves. Activating a subscription requires its covering deployment to be `ACTIVATED`, its referenced stack license to be `RELEASED`, and both a positive seat count and a true trial flag. On activation the subscription moves from `DRAFT` to `ACTIVE`, its `annual_fee_cents`, `billed_fee_cents`, and `support_credit_units` are computed, the bound stack's entitlement units are added to the partner's held entitlement, and the partner's `version` increments by one. The covering deployment's service readiness is recomputed to true, and at the first depth the partner's priority class is scheduled for re-derivation at the next epoch advance because a deployment under that partner has become service-ready. Activation is also refused with `ERR_ENTITLEMENT_UNITS_EXCEEDED` when adding those entitlement units would push the partner's held entitlement above the entitlement ceiling of 100000 units. An audit entry records the activation.
+
+Suspension and reinstatement mirror the partner-level standing change but do not touch the entitlement ledger. When the covering partner transitions out of qualification into suspension, each `ACTIVE` subscription bound to it becomes `SUSPENDED`, the bind relationship is preserved so that reinstatement can restore it, the partner's held entitlement is unchanged, and the settled fee stops accruing while the subscription is suspended. A `SupportAccountManager` reinstates a suspended subscription once the partner is `QUALIFIED` again and the covering deployment is `ACTIVATED`, returning it to `ACTIVE`, recomputing the deployment's readiness to true, and restamping the settlement anchor so that settlement resumes from the reinstatement instant. Reclamation is available from both `ACTIVE` and `SUSPENDED`; it moves the subscription to `RECLAIMED` and finalises its `settled_fee_cents` by the chronological computation, and it deliberately leaves the partner's held entitlement unchanged, because the stack entitlement is only returned by the deployment termination cascade. Expiry is the system's own path: at an epoch advance that passes the subscription's anniversary, an `ACTIVE` subscription becomes `EXPIRED` with its settled fee finalised, without touching the parent product's penalty set — expiry is a subscription event, not a pool event. Separately, a `PlatformAdmin` may score a subscription against the account record through the OCC-guarded evaluation path, which increments the subscription's `version` by one and re-derives its support credit units; an evaluation carrying a superseded observation of the subscription is rejected with `ERR_STALE_SUBSCRIPTION_VERSION` at HTTP 412.
+
+Termination of a deployment is the only path that releases entitlement units, and it is the most heavily cascaded operation in the system. The acting `SupportAccountManager` may terminate a deployment that is `ACTIVATED`. The transition moves it to `TERMINATED`, sets its service readiness to false, and cascades three depths. At the first depth, every subscription bound to the deployment whose status is `ACTIVE` or `SUSPENDED` becomes `RECLAIMED`. At the second depth, the partner's held entitlement is reduced by the released entitlement computed for the SKU: the released amount is the sum of the bound stack's entitlement units across every subscription that was `ACTIVE` or `SUSPENDED` at the instant of termination, subscriptions already `RECLAIMED` or `EXPIRED` contributing nothing. At the third depth, the deployment's `termination_effect_units` is the smaller of the released entitlement and the product's allocated units, and the product's allocated units are reduced by that effect, which re-derives its available units and re-runs the computed density band in its final variant for the product.
+
+Two rules constrain that termination. The first is a hard separation-of-duties gate: the `X-User-ID` terminating the deployment must differ from the `X-User-ID` recorded on the audit entry for that deployment's activation, and a match is rejected with `ERR_SAME_ACTOR_DEPLOYMENT_CHAIN` at HTTP 409 with no state changes applied. This gate is ordered below the export-control gate, so a deployment terminated without a covering subscription reports `ERR_NO_COVERING_SUBSCRIPTION` instead of the same-actor error. The second is a deliberate asymmetry: because the entitlement release runs only on deployment termination, suspending a subscription never releases entitlements, so a partner whose subscriptions were suspended and then reinstated must still show an unchanged held entitlement. The suspension cascade terminates the deployment and releases its entitlement, but it does not reclaim the subscription: the bind relationship is preserved exactly as the mirrored subscription-suspension path preserves it, so the subscription stays `SUSPENDED` and an individual reinstatement can still restore it. When the operator who activated a deployment rolls off, the separation-of-duties gate is satisfied by a `SupportAccountManager` handover, which replaces the deployment's `activation_actor_user_id` with the acting `X-User-ID` and takes a `handover_reason`; it appends an audit entry recording the handover. A terminated deployment may be returned to `PENDING` provided no subscription bound to it is `ACTIVE`, but the allocation subtract performed at termination is not reversed — the product's allocated units stay where the termination left them — and the cycle pending, activated, terminated, pending may repeat.
+
+Deployment groups batch the same discipline across several deployments. A group with an unsatisfied group flag must not ship: dispatching a group whose members have not all been satisfied is refused with `ERR_GROUP_NOT_SATISFIED`, and every member valuation must be satisfied before the group may be dispatched.
+
+### 3.8. Evaluation Hardware Loans and Proof-of-Concept Milestones
+
+Evaluation hardware is a ring-fenced pool inside each SKU. When a product advances into `GENERAL_AVAILABILITY`, the system reserves a portion of its supply ceiling for evaluation by taking 10 percent of the ceiling rounded up to a whole unit. A `PartnerOps` caller requests an `EvaluationLoan` naming the `product_sku_id` it wants to borrow, the `blueprint_id` of the reference architecture under evaluation, and the `loan_units` it needs; the loan opens with its `loan_state` at `REQUESTED`. A loan's units must be positive and must not exceed the SKU's reserved evaluation units.
+
+Approval is a `PartnerProgramManager` action moving the loan from `REQUESTED` to `APPROVED`. It requires a `QUALIFIED` partner, a requested quantity no greater than the product's reserved evaluation units, and an `expected_product_version` that matches the product's current version — a mismatch is a stale-write rejection, and the token is required rather than optional. Approval adds the loan's units to the product's reserved evaluation units, which re-derives its available units, sets its `required_return_at` to the logical clock plus the blueprint's `evaluation_deadline_days`, and increments the product's `version` by one. A loan that exceeds the reservation is refused with `ERR_RESERVED_FOR_EVALUATION`. A loan in `REQUESTED` may also be reclaimed directly, moving to `RECLAIMED` without having taken any ring-fence, so the reserved evaluation units are unchanged.
+
+Starting an approved loan moves it from `APPROVED` to `ACTIVE` and creates a `ProofOfConceptMilestone` naming the `loan_id` it belongs to, of type `KICKOFF`, with `milestone_state` `OPEN`; the `milestone_type` values the system recognises are `KICKOFF`, `BENCHMARK`, `INTEGRATION`, and `ACCEPTANCE`. A milestone recorded by a `PartnerProgramManager` carries a `milestone_type` and a `milestone_result` of either `PASSED`, `FAILED`, or `INCONCLUSIVE`, and only a passing result advances the bound loan. Recording a milestone creates it with `milestone_state` `RECORDED` and its `recorded_at` stamped from the logical clock.
+
+A passing milestone on an active loan is what returns the hardware by the system's own action. The loan moves from `ACTIVE` to `RETURNED`, the product's reserved evaluation units are reduced by the loan's units — re-deriving available units — and the bound milestone's state becomes `RECORDED` with its `milestone_triggered_at` stamped. The round trip therefore nets a zero ring-fence delta.
+
+Overdue is the failure path. At an epoch advance where the logical clock is strictly after the required return instant and the loan is still `ACTIVE` with its bound milestone still `OPEN`, the loan moves to `OVERDUE`, the bound milestone becomes `LATE`, the loan's `late_fee_units` is computed as half a unit for each whole day elapsed since the required return instant, capped at 15.0 units and rounded half-even to one decimal place, and at the first depth a friction penalty is created against the loan's supply node with reason `LATE_CANCEL` in `ACTIVE` state. The cap binds at 30 days, so 30 and 31 days late both yield 15.0. An overdue loan may be returned by a `PartnerProgramManager`, moving it to `RETURNED` and releasing the ring-fence — accruing the full round trip's zero delta — with the accrued late fee frozen and not reversed. It may also be reclaimed, moving to `RECLAIMED` with the same zero net delta, in which case the bound milestone stays `LATE` and its friction penalty stays `ACTIVE`. The reclaim action is also available from `REQUESTED` and `APPROVED`, and it releases the ring-fence for every state other than the requested one.
+
+Because approvals and round trips are additive on a conserved field, two invariants hold and are directly testable from the read surfaces. Approving a loan of some quantity and then returning or reclaiming it leaves the product's reserved evaluation units exactly where they started. And because reclaiming a subscription is forbidden from touching the entitlement ledger, confirming a subscription and then reclaiming it leaves the partner's held entitlement exactly unchanged.
+
+### 3.9. Supply Contracts and Long-Term Availability Commitments
+
+Embedded customers buy availability, not just units, and the system represents that with a monthly supply contract and a lifecycle commitment.
+
+A `LifecycleProgramManager` records a `SupplyContract` against a SKU by naming the `product_sku_id` it covers, the `partner_id` that holds it, the `start_month` that opens the contracted window, the `end_month` that closes it, and the `contracted_units` per month. Both months are formatted as a four-digit year and two-digit month. The window is half-open: it runs from the first day of the start month inclusive to the first day of the month after the end month exclusive. The contract opens with `window_status` `OPEN`. Two contracts for the same SKU collide when their half-open windows intersect, and the adjacent case — a new contract whose start month is exactly the existing contract's end month plus one month — is legal rather than an overlap, since the half-open windows then share no month.
+
+A lifecycle commitment is the request side of the same idea. A `LifecycleProgramManager` requests one by naming the `product_sku_id` whose availability is being committed, the `embedded_partner_id` receiving the commitment, the `availability_through` horizon requested, and the `covered_units` the commitment protects, which must not exceed the SKU's available units. The commitment opens with `commitment_status` `REQUESTED`. The request itself is accepted whenever the SKU and the embedded partner resolve and the horizon is a parseable instant; the horizon grace floor and the unit-availability bound are evaluated only when the commitment is granted, never at request time, so a horizon inside the grace window or a covered-units figure above the SKU's availability may still be filed and only fails on the grant call. Granting it moves it to `GRANTED` and requires three conditions: the embedded partner is `QUALIFIED`; the requested horizon is at or after the logical clock plus the lifecycle grace period of 365 days, with a shorter horizon refused as `ERR_LIFECYCLE_HORIZON_TOO_SHORT` at HTTP 422; and the covered units do not exceed the product's available units, with an excess refused as `ERR_LIFECYCLE_UNITS_UNCOMMITTED`. Granting also takes an `expected_product_version` that must match the product's current version; a mismatch is a stale-write rejection. The grant writes the commitment's `commitment_floor_days` and the product's `lifecycle_min_remaining_days` by a pinned four-step evaluation order that must not be reordered. First, the requested floor in days is the number of whole days from the logical clock to the requested horizon, taken as the largest whole number of days not exceeding that span and computed before any clamping. Second, an extension of 730 days applies if the partner's type is `EMBEDDED_VENDOR` and zero otherwise. Third, the commitment floor is the larger of the requested floor and the sum of the 1825-day minimum floor and the extension. Fourth, the product's minimum remaining days is the commitment floor when the product's lifecycle stage is `MATURE` or `END_OF_LIFE`, and otherwise the commitment floor clamped down to a ceiling of 1825 days. The ordering matters: for an embedded vendor at the mature stage, the third step produces 2555 days and the fourth step's cap does not apply because the mature stage is exempt, while the same commitment taken at general availability is capped back to 1825. Granting also sets the embedded partner's `lifecycle_floor_expires_at` to the requested horizon and increments the product's `version` by one. Declining a commitment moves it from `REQUESTED` to `DECLINED` and returns its covered units to the product's uncommitted pool.
+
+### 3.10. Epochs, Checkpoint Sweeps and the Audit Trail
+
+The allocation epoch is the system's heartbeat. A `PlatformAdmin` advances it through an administrative capability that moves the currently open epoch's `epoch_status` to `CLOSED` and opens its successor at the current logical clock, with the successor's `epoch_index` one higher than its predecessor's, its `opened_at` taken from the logical clock, and its `half_life_next` band derived from the scheduled plan as the band the pool's committed rate would occupy after three epochs of exponential half-life decay. Closing an epoch advances the closed epoch's own version. Closing an epoch requires that no other epoch is open. The advance runs the whole checkpoint pass in one operation, and each sweep is independent of the others.
+
+The pass re-derives the hotness tier and ceiling for every supply pool; returns friction-hold pools whose accumulated penalty score is below 4.0 to `OPEN`, and returns binding pools to `OPEN` with their friction score reset to zero. It also re-checks each pool's standing holds against the freshly re-derived ceiling: an `OPEN` pool whose `REQUESTED` or `COMMITTED` hold now ranks strictly above that ceiling enters `FRICTION_HOLD` and takes a fresh `BAND_VIOLATION` penalty in `ACTIVE` state, exactly as the band-violation path of §3.3 would, and no such re-flagged hold takes a second penalty on later advances. It applies half-life decay to every active penalty, marking those that reach zero as `DECAYED` and re-scoring each affected pool over its remaining active penalties only. It sweeps evaluation loans that are `ACTIVE` and past their required return instant into `OVERDUE`, recomputing their late fees, and moves proof-of-concept milestones that are still open on an overdue loan into `LATE` while creating the corresponding late-cancellation penalty against the loan's supply node. It auto-commits every demand forecast that is `ACTIVE` and whose partner eligibility deadline has been reached. And it re-derives the priority class for every qualified partner by the tier rule in §2.4.
+
+The epoch is also a posture gate, not merely a clock. While no epoch has `OPEN` status, every allocation-creating endpoint — creating an allocation hold, committing a demand forecast, qualifying a partner, and creating a licence hold group — is refused with `ERR_NO_OPEN_EPOCH`. The collection-level cycle is deliberate: closing an epoch supersedes it with a fresh open one, so the open posture recurs on every advance. An advance requested against an epoch that is already closed is refused with `ERR_EPOCH_ALREADY_CLOSED`.
+
+Every mutating operation leaves a trace. The audit trail is a chain of entries, each filed under the `partner_id` it belongs to and naming the actor in `actor_user_id` and `actor_role`, the operation's stable `action_code`, the mutated resource in `subject_entity` and `subject_id`, and the instant it was appended in `recorded_at`. Each entry also carries an `entry_digest` computed over its predecessor entries, forming a tamper-evident chain. Action codes include the partner qualification and rejection events, hold cancellation, subscription activation, forecast cancellation, deployment activation, and deployment handover. The acting user recorded on the deployment activation entry is the value the separation-of-duties gate compares against at termination, and the acting user recorded on a cancellation is the value supplied through the optional acting-operator field on the cancellation payloads.
+
+### 3.11. Licence Hold Groups and Grouped Deployment Dispatch
+
+Two batching surfaces sit alongside the single-resource paths. A licence hold group bundles several licence hold `members` into one reservation request under a `PartnerOps` caller, and it is subject to the same gates as a single allocation: the caller must be `QUALIFIED`; the group's product references must be unchanged from what the client observed, in `expected_allocated_units`, otherwise it is refused with `ERR_ALLOCATED_UNITS_CHANGED`; the friction tier must rank at or below the target pool's ceiling, otherwise `ERR_HOLD_TIER_EXCEEDS_BAND`; the pool must be open for allocation, otherwise `ERR_NODE_NOT_OPEN_FOR_ALLOCATION`; an open epoch must exist, otherwise `ERR_NO_OPEN_EPOCH`; the group names each product reference at most once, on pain of `ERR_LICENCE_GROUP_DUPLICATE_MEMBER`; the export-control gate applies, refusing with `ERR_EXPORT_CONTROL_RESTRICTED` or `ERR_EXPORT_LICENSE_REQUIRED`; the dislodging path requires a non-empty candidate set, otherwise `ERR_NO_ALLOCATION_CANDIDATE`; and the body references resolve left to right before any of this. A deployment group bundles several deployments and is dispatched only once every member valuation has been satisfied; dispatching an unsatisfied group is refused with `ERR_GROUP_NOT_SATISFIED`.
+
+## 4. Endpoint Definitions
+
+Every operation in this section is served under the top-level path `/accelerators`. Operations that create a new stand-alone resource or add a distinct resource to a collection return `201 Created`; operations that modify an existing resource, or that drive an action against one, return `200 OK`. The table below lists the HTTP contract only — the request shapes, response shapes, cascades and gates for each operation are defined by the workflow narratives in §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/accelerators/_clock/set_current_utc` | Set the logical clock to a supplied instant | PlatformAdmin |
+| POST | `/accelerators/_ops/advance_epoch` | Close the open allocation epoch and run the checkpoint pass | PlatformAdmin |
+| POST | `/accelerators/allocations` | Create an accelerator SKU in the allocation catalog | PlatformAdmin |
+| GET | `/accelerators/allocations` | List every accelerator SKU in the catalog | PlatformAdmin |
+| GET | `/accelerators/allocations/{id}` | Read one accelerator SKU | PlatformAdmin |
+| PUT | `/accelerators/allocations/{id}` | Adjust a SKU's supply ceiling or availability horizon | PlatformAdmin |
+| POST | `/accelerators/allocations/{id}/advance_lifecycle` | Advance a SKU one lifecycle stage | PlatformAdmin |
+| POST | `/accelerators/allocations/{id}/promote_evaluation_pool` | Set a SKU's reserved evaluation units directly | PlatformAdmin |
+| POST | `/accelerators/supply-nodes` | Create a supplier pool for one SKU | SupplyPlanner |
+| GET | `/accelerators/supply-nodes` | List supplier pools | SupplyPlanner |
+| GET | `/accelerators/supply-nodes/{id}` | Read one supplier pool | SupplyPlanner |
+| POST | `/accelerators/supply-nodes/{id}/rank` | Rank the eligible holds competing for a pool | SupplyPlanner |
+| POST | `/accelerators/supply-nodes/{id}/stage` | Advance a pool's stage | SupplyPlanner |
+| POST | `/accelerators/partners` | Register a partner account | PartnerOps |
+| GET | `/accelerators/partners/{id}` | Read one partner account | PartnerOps |
+| GET | `/accelerators/partners/{id}/audit-entries` | List the audit entries filed under a partner | SupplyComplianceOfficer |
+| POST | `/accelerators/partners/{id}/validations` | File a validation evidence pack against a blueprint | PartnerProgramManager |
+| POST | `/accelerators/partners/{id}/qualify` | Qualify a partner | PartnerProgramManager |
+| POST | `/accelerators/partners/{id}/reject` | Reject a validation round and roll the partner back | PartnerProgramManager |
+| POST | `/accelerators/partners/{id}/suspend` | Suspend a qualified partner | PartnerProgramManager |
+| POST | `/accelerators/partners/{id}/reinstate` | Lift a partner suspension | PlatformAdmin |
+| POST | `/accelerators/partners/{id}/terminate` | Terminate a partner account | PlatformAdmin |
+| POST | `/accelerators/partners/{id}/reapply` | Re-open a terminated partner at the start of the pipeline | PlatformAdmin |
+| POST | `/accelerators/blueprints` | Define a reference architecture | SupplyPlanner |
+| GET | `/accelerators/blueprints/{id}` | Read one reference architecture | SupplyPlanner |
+| POST | `/accelerators/blueprints/{id}/certify` | Certify a reference architecture | SupplyPlanner |
+| GET | `/accelerators/validations` | List validation evidence packs | PartnerProgramManager |
+| GET | `/accelerators/validations/{id}` | Read one validation evidence pack | PartnerProgramManager |
+| POST | `/accelerators/validations/{id}/accept` | Accept a submitted evidence pack | PartnerProgramManager |
+| POST | `/accelerators/validations/{id}/reject` | Reject a submitted evidence pack | PartnerProgramManager |
+| POST | `/accelerators/allocation-holds` | Request accelerator units from a supply pool | PartnerOps |
+| GET | `/accelerators/allocation-holds` | List allocation holds | PartnerOps |
+| GET | `/accelerators/allocation-holds/{id}` | Read one allocation hold | PartnerOps |
+| POST | `/accelerators/allocation-holds/bulk` | Reserve units for several SKUs in one request | PartnerOps |
+| POST | `/accelerators/allocation-holds/{id}/commit` | Commit a requested hold | PartnerOps |
+| POST | `/accelerators/allocation-holds/{id}/cancel` | Cancel a hold | PartnerOps |
+| POST | `/accelerators/allocation-holds/{id}/reclaim` | Reclaim a committed hold as an operator | PlatformAdmin |
+| POST | `/accelerators/allocation-holds/{id}/expire` | Expire a committed hold | PlatformAdmin |
+| POST | `/accelerators/demand-forecasts` | Create a demand forecast against a SKU | PartnerOps |
+| GET | `/accelerators/demand-forecasts` | List demand forecasts | PartnerOps |
+| GET | `/accelerators/demand-forecasts/{id}` | Read one demand forecast | PartnerOps |
+| POST | `/accelerators/demand-forecasts/{id}/acknowledge` | Acknowledge a forecast and stamp its horizon band | PartnerProgramManager |
+| POST | `/accelerators/demand-forecasts/{id}/commit` | Commit quantity against an acknowledged forecast | PartnerOps |
+| POST | `/accelerators/demand-forecasts/{id}/cancel` | Cancel an active forecast | PartnerOps |
+| POST | `/accelerators/demand-forecasts/{id}/revise` | Return a cancelled forecast to the submitted pool | PartnerOps |
+| POST | `/accelerators/stack-licenses` | Define a software stack license | SupplyPlanner |
+| GET | `/accelerators/stack-licenses` | List software stack licenses | SupplyPlanner |
+| GET | `/accelerators/stack-licenses/{id}` | Read one software stack license | SupplyPlanner |
+| POST | `/accelerators/stack-licenses/{id}/release` | Release a stack license | SupplyPlanner |
+| POST | `/accelerators/stack-licenses/{id}/retire` | Retire a stack license | SupplyPlanner |
+| POST | `/accelerators/export-licenses` | File an export licence grant | SupplyComplianceOfficer |
+| GET | `/accelerators/export-licenses` | List export licence grants | SupplyComplianceOfficer |
+| GET | `/accelerators/export-licenses/{id}` | Read one export licence grant | SupplyComplianceOfficer |
+| POST | `/accelerators/export-licenses/{id}/revoke` | Revoke an export licence grant | SupplyComplianceOfficer |
+| POST | `/accelerators/deployments` | Register a hardware deployment | SupportAccountManager |
+| GET | `/accelerators/deployments` | List hardware deployments | SupportAccountManager |
+| GET | `/accelerators/deployments/{id}` | Read one deployment | SupportAccountManager |
+| POST | `/accelerators/deployments/{id}/activate` | Activate a deployment | SupportAccountManager |
+| POST | `/accelerators/deployments/{id}/terminate` | Terminate a deployment and release entitlements | SupportAccountManager |
+| POST | `/accelerators/deployments/{id}/reinstate` | Return a terminated deployment to the pending pool | SupportAccountManager |
+| POST | `/accelerators/deployments/{id}/handover` | Hand over operational responsibility for a deployment | SupportAccountManager |
+| POST | `/accelerators/deployment-groups` | Create a deployment group | SupportAccountManager |
+| POST | `/accelerators/deployment-groups/{groupId}/dispatch` | Dispatch a deployment group | SupportAccountManager |
+| GET | `/accelerators/deployment-groups/{id}` | Read one deployment group | SupportAccountManager |
+| POST | `/accelerators/subscriptions` | Create an enterprise support subscription | SupportAccountManager |
+| GET | `/accelerators/subscriptions` | List enterprise support subscriptions | SupportAccountManager |
+| GET | `/accelerators/subscriptions/{id}` | Read one subscription | SupportAccountManager |
+| POST | `/accelerators/subscriptions/{id}/activate` | Activate a subscription | SupportAccountManager |
+| POST | `/accelerators/subscriptions/{id}/reinstate` | Reinstate a suspended subscription | SupportAccountManager |
+| POST | `/accelerators/subscriptions/{id}/reclaim` | Reclaim a subscription | SupportAccountManager |
+| POST | `/accelerators/subscriptions/{id}/evaluate` | Score a subscription against the account record | PlatformAdmin |
+| POST | `/accelerators/developer-memberships` | Request a developer program membership | PartnerOps |
+| GET | `/accelerators/developer-memberships` | List developer program memberships | PartnerProgramManager |
+| GET | `/accelerators/memberships` | List memberships with their grants and acknowledgements | PartnerProgramManager |
+| GET | `/accelerators/developer-memberships/{id}` | Read one membership | PartnerProgramManager |
+| POST | `/accelerators/developer-memberships/{id}/evaluate` | Open a membership evaluation window | PartnerProgramManager |
+| POST | `/accelerators/developer-memberships/{id}/renew` | Advance the stored tier one step | PartnerProgramManager |
+| POST | `/accelerators/developer-memberships/{id}/lapse` | Lapse an active membership | PartnerProgramManager |
+| POST | `/accelerators/developer-memberships/{id}/revoke` | Revoke a membership outright | SupplyComplianceOfficer |
+| POST | `/accelerators/preview-grants` | Open a preview software grant | PartnerProgramManager |
+| GET | `/accelerators/preview-grants` | List preview software grants | PartnerProgramManager |
+| GET | `/accelerators/preview-grants/{id}` | Read one preview software grant | PartnerProgramManager |
+| POST | `/accelerators/preview-grants/{id}/revoke` | Revoke a preview software grant | SupplyComplianceOfficer |
+| POST | `/accelerators/confidentiality-acks` | Bind a confidentiality acknowledgement | SupplyComplianceOfficer |
+| GET | `/accelerators/confidentiality-acks` | List confidentiality acknowledgements | SupplyComplianceOfficer |
+| GET | `/accelerators/confidentiality-acks/{id}` | Read one confidentiality acknowledgement | SupplyComplianceOfficer |
+| POST | `/accelerators/evaluation-loans` | Request an evaluation hardware loan | PartnerOps |
+| GET | `/accelerators/evaluation-loans` | List evaluation loans | PartnerOps |
+| GET | `/accelerators/evaluation-loans/{id}` | Read one evaluation loan | PartnerOps |
+| POST | `/accelerators/evaluation-loans/{id}/approve` | Approve a loan and ring-fence its units | PartnerProgramManager |
+| POST | `/accelerators/evaluation-loans/{id}/start` | Start an approved loan | PartnerProgramManager |
+| POST | `/accelerators/evaluation-loans/{id}/return` | Return a loan's hardware | PartnerProgramManager |
+| POST | `/accelerators/evaluation-loans/{id}/reclaim` | Reclaim a loan's hardware | PartnerProgramManager |
+| POST | `/accelerators/evaluation-loans/{id}/milestones` | Record a proof-of-concept milestone | PartnerProgramManager |
+| GET | `/accelerators/milestones` | List proof-of-concept milestones | PartnerProgramManager |
+| GET | `/accelerators/milestones/{id}` | Read one proof-of-concept milestone | PartnerProgramManager |
+| POST | `/accelerators/lifecycle-commitments` | Request a long-term availability commitment | LifecycleProgramManager |
+| GET | `/accelerators/lifecycle-commitments` | List lifecycle commitments | LifecycleProgramManager |
+| GET | `/accelerators/lifecycle-commitments/{id}` | Read one lifecycle commitment | LifecycleProgramManager |
+| POST | `/accelerators/lifecycle-commitments/{id}/grant` | Grant a commitment | LifecycleProgramManager |
+| POST | `/accelerators/lifecycle-commitments/{id}/decline` | Decline a commitment request | LifecycleProgramManager |
+| POST | `/accelerators/supply-contracts` | Record a monthly supply contract | LifecycleProgramManager |
+| GET | `/accelerators/supply-contracts` | List supply contracts | LifecycleProgramManager |
+| GET | `/accelerators/supply-contracts/{id}` | Read one supply contract | LifecycleProgramManager |
+| GET | `/accelerators/friction-penalties` | List friction penalties | SupplyPlanner |
+| GET | `/accelerators/friction-penalties/{id}` | Read one friction penalty | SupplyPlanner |
+| GET | `/accelerators/audit-entries` | List audit trail entries across partners | SupplyComplianceOfficer |
+| GET | `/accelerators/audit-entries/{id}` | Read one audit trail entry | SupplyComplianceOfficer |
+| POST | `/accelerators/license-hold-groups` | Create a licence hold group | PartnerOps |
+| GET | `/accelerators/license-hold-groups/{groupId}` | Read one licence hold group | PartnerOps |
+| GET | `/accelerators/license-holds/{holdId}` | Read one licence hold member line | PartnerOps |
+| POST | `/accelerators/license-hold-groups/{groupId}/preempt` | Dislodge competitors for a licence hold group | PlatformAdmin |
+| POST | `/accelerators/epochs/{epochId}/close` | Close an allocation epoch | PlatformAdmin |
+| POST | `/accelerators/blueprints/{blueprintId}/retire` | Retire a reference architecture | SupplyPlanner |
+
+## 5. Error Code Catalogue
+
+The error identifiers below are the complete set the API may emit. The conditions that trigger each one are defined with the workflows they guard in §2 and §3, not in this table.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` | 400 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_FORBIDDEN_FOR_ROLE` | 403 |
+| `ERR_EXPORT_CONTROL_RESTRICTED` | 403 |
+| `ERR_EXPORT_LICENSE_REQUIRED` | 403 |
+| `ERR_NDA_NOT_BOUND` | 403 |
+| `ERR_PARTNER_NOT_FOUND` | 404 |
+| `ERR_RESOURCE_NOT_FOUND` | 404 |
+| `ERR_BLUEPRINT_NOT_FOUND` | 404 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_HOLD_TIER_EXCEEDS_BAND` | 409 |
+| `ERR_NODE_NOT_OPEN_FOR_ALLOCATION` | 409 |
+| `ERR_NO_OPEN_EPOCH` | 409 |
+| `ERR_GROUP_NOT_SATISFIED` | 409 |
+| `ERR_FORECAST_NOT_COMMITTED` | 409 |
+| `ERR_FORECAST_DEADLINE_PASSED` | 409 |
+| `ERR_CONTRACT_WINDOW_OVERLAP` | 409 |
+| `ERR_PREVIEW_GRANT_WINDOW_OVERLAP` | 409 |
+| `ERR_NDA_WINDOW_OVERLAP` | 409 |
+| `ERR_LIFECYCLE_UNITS_UNCOMMITTED` | 409 |
+| `ERR_NO_COVERING_SUBSCRIPTION` | 409 |
+| `ERR_ENTITLEMENT_UNITS_EXCEEDED` | 409 |
+| `ERR_SUPPLY_CEILING_EXCEEDED` | 409 |
+| `ERR_RESERVED_FOR_EVALUATION` | 409 |
+| `ERR_NO_ALLOCATION_CANDIDATE` | 409 |
+| `ERR_SAME_ACTOR_DEPLOYMENT_CHAIN` | 409 |
+| `ERR_EPOCH_ALREADY_CLOSED` | 409 |
+| `ERR_LICENSE_GROUP_DUPLICATE_MEMBER` | 409 |
+| `ERR_BLUEPRINT_NOT_CERTIFIED` | 409 |
+| `ERR_ALLOCATED_UNITS_CHANGED` | 412 |
+| `ERR_STALE_PARTNER_VERSION` | 412 |
+| `ERR_STALE_SUBSCRIPTION_VERSION` | 412 |
+| `ERR_QUALIFICATION_NOT_MET` | 422 |
+| `ERR_LIFECYCLE_HORIZON_TOO_SHORT` | 422 |
+| `ERR_LICENSE_GROUP_UNRESOLVED` | 422 |
+| `ERR_EVIDENCE_INSUFFICIENT` | 422 |

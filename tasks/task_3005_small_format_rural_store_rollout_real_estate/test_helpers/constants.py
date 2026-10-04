@@ -1,0 +1,85 @@
+"""Domain thresholds — numeric constants from the PRD's calculation narratives."""
+
+# The logical clock reads this exact instant until a PROGRAM_ADMIN advances it.
+CLOCK_DEFAULT = "2026-09-01T00:00:00Z"
+
+# Trade-area scoring (PRD §3.2)
+SCORE = {
+    "WEIGHT_GAP": 0.35,
+    "WEIGHT_INCOME": 0.25,
+    "WEIGHT_DRIVE": 0.20,
+    "WEIGHT_HH": 0.20,
+    "QUALIFY_SCORE_MIN": 40.0,
+    "DRIVE_TIME_MAX": 30,
+    "HH_MIN": 650,
+    "INCOME_MIN_CENTS": 3500000,
+    "GAP_MIN": 12,
+}
+
+# Format selection (PRD §3.3)
+FORMAT = {
+    "REV_PER_HH_TRADITIONAL": 420,
+    "REV_PER_HH_DG_FRESH": 560,
+    "REV_PER_HH_DG_MARKET": 640,
+    "MIN_REVENUE_TRADITIONAL_CENTS": 40000000,
+    "MIN_REVENUE_DG_FRESH_CENTS": 90000000,
+    "MIN_REVENUE_DG_MARKET_CENTS": 220000000,
+    "BUILD_COST_TRADITIONAL_CENTS": 350000000,
+    "BUILD_COST_DG_FRESH_CENTS": 500000000,
+    "BUILD_COST_DG_MARKET_CENTS": 700000000,
+    "WEEKLY_CASES_TRADITIONAL": 900,
+    "WEEKLY_CASES_DG_FRESH": 1400,
+    "WEEKLY_CASES_DG_MARKET": 2600,
+}
+
+# Stem cost (PRD §3.5)
+STEM = {
+    "COST_PER_MILE_CENTS": 285,
+    "SUB_TRUCKLOAD_CASES": 1800,
+    "LOW_VOLUME_MULTIPLIER": 1.25,
+}
+
+# Delivery penalty accrual (PRD §3.4)
+PENALTY = {
+    "DAILY_PENALTY_CENTS": 500000,
+    "BONUS_START_DAY": 60,
+    "ACCRUAL_STOP_DAY": 180,
+    "PENALTY_CAP_CENTS": 45000000,
+}
+
+# Route planning (PRD §3.5)
+ROUTE = {
+    "TRUCK_CAPACITY_CASES": 1800,
+    "PER_STOP_CENTS": 35000,
+    "LOW_FILL_THRESHOLD_PCT": 55,
+    "LOW_FILL_SURCHARGE_CENTS": 15000,
+}
+
+# Grand-opening labour (PRD §3.6)
+LABOR = {
+    "BASE_HOURS_TRADITIONAL": 220,
+    "BASE_HOURS_DG_FRESH": 340,
+    "BASE_HOURS_DG_MARKET": 520,
+    "PEAK_MULTIPLIER": 1.15,
+    "LABOR_RATE_CENTS": 2400,
+}
+
+# Cannibalization bands (PRD §3.7)
+CANNIBALIZATION = {
+    "ENTRY_BLOCK_PCT": 20,
+    "ENTRY_MITIGATE_PCT": 12,
+    "AGG_BLOCK_PCT": 15,
+    "AGG_MITIGATE_PCT": 8,
+    "DEFAULT_COEFFICIENT": 0.40,
+}
+
+# Capital scoring (PRD §3.8)
+CAPITAL = {
+    "MULTIPLIER_REMODEL": 1.1,
+    "MULTIPLIER_RELOCATION": 0.9,
+    "MULTIPLIER_NEW_BUILD": 1.0,
+    "NPV_YEARS": 3,
+}
+
+# Developer capacity (PRD §3.4)
+DEVELOPER_MAX_ACTIVE_AGREEMENTS = 3

@@ -1,0 +1,58 @@
+"""Domain thresholds — numeric constants from PRD §3."""
+
+FEE_ENGINE = {
+    # BROADCASTER marginal tiers over reported_revenue_cents (PRD §3.4)
+    "BCAST_T1_CAP_CENTS": 500000000000,
+    "BCAST_T1_RATE": 0.0160,
+    "BCAST_T2_CAP_CENTS": 2000000000000,
+    "BCAST_T2_RATE": 0.0140,
+    "BCAST_T3_RATE": 0.0110,
+    "BCAST_MIN_FEE_CENTS": 25000000,
+    # DIGITAL_SERVICE
+    "DIG_T1_CAP_CENTS": 100000000000,
+    "DIG_T1_RATE": 0.0175,
+    "DIG_T2_RATE": 0.0150,
+    "PER_STREAM_MICRO_CENTS": 20,
+    "DIG_MIN_FEE_CENTS": 10000000,
+    # VENUE
+    "VENUE_RATE": 0.0080,
+    "VENUE_PER_EVENT_CENTS": 15000,
+    "VENUE_MIN_FEE_CENTS": 5000000,
+}
+
+# PRD §3.7 credit weighting factors
+MEDIUM_FACTORS = {
+    "TERRESTRIAL_RADIO": 1.0,
+    "NETWORK_TV": 2.5,
+    "CABLE_TV": 1.5,
+    "DIGITAL_STREAMING": 0.6,
+    "LIVE_VENUE": 1.2,
+}
+DAYPART_FACTORS = {
+    "PRIME": 2.0,
+    "DAY": 1.0,
+    "LATE_NIGHT": 0.7,
+    "OVERNIGHT": 0.4,
+}
+FEATURE_BONUS_MULT = 1.1
+
+# PRD §3.7 sampling frame
+SAMPLING_FRAME_UNITS = 52
+
+# PRD §3.8 pool formation
+ADMIN_RATE = 0.15
+DAYS_IN_YEAR = 365
+
+# PRD §3.9 administration fee and claims window
+ADMIN_WITHHOLD_RATE = 0.05
+CLAIMS_WINDOW_DAYS = 90
+
+# PRD §3.10 audit delinquency
+LICENSEE_DELINQUENCY_THRESHOLD_CENTS = 1000000
+AUDIT_LOOKBACK_DAYS = 1095
+
+# PRD §3.11 escheatment
+ESCHEAT_GRACE_DAYS = 30
+
+# PRD §2.8 logical clock default
+DEFAULT_CLOCK_ISO = "2026-09-01T00:00:00Z"

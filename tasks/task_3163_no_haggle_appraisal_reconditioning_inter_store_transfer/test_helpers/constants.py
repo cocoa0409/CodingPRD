@@ -1,0 +1,77 @@
+"""Domain thresholds and numeric constants from PRD calculation rules."""
+
+# PRD 3.1 — appraisal offer computation
+AGE_DEPRECIATION_CENTS = 80000          # $800 per full model-year of age
+MILEAGE_DEPRECIATION_CENTS = 1500       # $15 per 1000 excess miles
+MILEAGE_ALLOWANCE_PER_YEAR = 12000      # 12,000 miles per year of age
+MIN_OFFER_CENTS = 50000                 # $500 floor on any appraisal offer
+RECON_HAIRCUT_NUM = 1
+RECON_HAIRCUT_DEN = 2                   # final offer subtracts 50% of recon cost
+APPRAISAL_VALID_DAYS = 7
+
+# PRD 3.3 — algorithmic repricing
+RETAIL_MARKUP_PCT = 12
+MARKDOWN_TIER_1_DAYS = 30
+MARKDOWN_TIER_2_DAYS = 45
+MARKDOWN_TIER_3_DAYS = 60
+MARKDOWN_TIER_1_PCT = 3
+MARKDOWN_TIER_2_PCT = 5
+MARKDOWN_TIER_3_PCT = 8
+
+# PRD 3.4 — transfer shipping fee
+LANE_BASE_0 = 15000                     # same region
+LANE_BASE_1 = 45000                     # adjacent region
+LANE_BASE_2 = 90000                     # cross-country
+EXPEDITE_NUM = 3
+EXPEDITE_DEN = 2
+ENCLOSED_CARRIER_SURCHARGE = 20000
+
+# PRD 3.7 — returns
+RETURN_WINDOW_DAYS = 7
+RETURN_MILEAGE_CAP = 400
+PER_MILE_CENTS = 50
+
+# PRD 3.8 — auction reserve
+WHOLESALE_BOOK_PCT = 85
+RECON_RECOVERY_PCT = 50
+RELIST_DECAY_PCT = 90
+MIN_RESERVE_CENTS = 100000
+AUCTION_MAX_ROUNDS = 3
+
+# PRD 3.6 — financing tier scoring
+DTI_CAP = 0.5
+TIER_1_MIN = 0.8000
+TIER_2_MIN = 0.6000
+TIER_3_MIN = 0.4000
+FINANCE_OFFER_VALID_DAYS = 3
+APR_BPS = {
+    "LENDER_A": {"TIER_1": 490, "TIER_2": 690, "TIER_3": 990},
+    "LENDER_B": {"TIER_1": 515, "TIER_2": 740, "TIER_3": 1040},
+    "LENDER_C": {"TIER_1": 540, "TIER_2": 780, "TIER_3": 1090},
+}
+
+# PRD 3.9 — associate compensation
+FLAT_COMMISSION_CENTS = 25000
+VOLUME_TIER_1 = 5
+VOLUME_TIER_2 = 10
+VOLUME_TIER_3 = 20
+BONUS_TIER_1 = 50000
+BONUS_TIER_2 = 150000
+BONUS_TIER_3 = 400000
+
+# Logical clock default (PRD 2.5)
+CLOCK_DEFAULT = "2026-09-01T00:00:00Z"
+CURRENT_YEAR = 2026
+
+# Store defaults (PRD 2.11)
+DEFAULT_RETAIL_THRESHOLD_PCT = 0.20
+DEFAULT_TRANSFER_HOLD_DAYS = 7
+
+# Canonical test scenario expected values (used by fixture-level comments)
+VEHICLE_A_PROVISIONAL_OFFER = 1680000
+VEHICLE_A_FINAL_OFFER = 1605000
+VEHICLE_A_INITIAL_LIST_PRICE = 1797600
+VEHICLE_B_FINAL_OFFER = 285500
+VEHICLE_C_ROUND_1_RESERVE = 900000
+VEHICLE_C_ROUND_2_RESERVE = 810000
+VEHICLE_C_ROUND_3_RESERVE = 729000

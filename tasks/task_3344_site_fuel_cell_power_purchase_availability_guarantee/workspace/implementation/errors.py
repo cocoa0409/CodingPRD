@@ -1,0 +1,115 @@
+"""Error catalog for the On-Site Fuel Cell Power Purchase API.
+
+Every identifier and HTTP status is taken verbatim from PRD.md section 5 and
+from the scaffold error table.
+"""
+
+
+class ApiError(Exception):
+    """Carries the error_id, message and HTTP status of a refused request."""
+
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+# --- authentication / authorization -----------------------------------------
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"          # 401
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"                # 403
+
+# --- not found ---------------------------------------------------------------
+ERR_SITE_NOT_FOUND = "ERR_SITE_NOT_FOUND"            # 404
+ERR_PPA_NOT_FOUND = "ERR_PPA_NOT_FOUND"              # 404
+ERR_CUSTOMER_NOT_FOUND = "ERR_CUSTOMER_NOT_FOUND"    # 404
+ERR_REFERENCE_NOT_FOUND = "ERR_REFERENCE_NOT_FOUND"  # 404
+
+# --- invalid request ---------------------------------------------------------
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"          # 400
+ERR_TERM_COMMITMENT_INVALID = "ERR_TERM_COMMITMENT_INVALID"    # 422
+ERR_EFFICIENCY_INVALID = "ERR_EFFICIENCY_INVALID"              # 422
+ERR_ESCALATOR_OUT_OF_RANGE = "ERR_ESCALATOR_OUT_OF_RANGE"      # 422
+ERR_FUEL_SOURCING_MODE_INVALID = "ERR_FUEL_SOURCING_MODE_INVALID"  # 422
+
+# --- state -------------------------------------------------------------------
+ERR_INVALID_STATE = "ERR_INVALID_STATE"              # 409
+ERR_ALREADY_TERMINAL = "ERR_ALREADY_TERMINAL"        # 409
+ERR_SITE_FROZEN = "ERR_SITE_FROZEN"                  # 409
+ERR_RENEWAL_STAGE_INVALID = "ERR_RENEWAL_STAGE_INVALID"    # 409
+ERR_REVERSAL_WINDOW_CLOSED = "ERR_REVERSAL_WINDOW_CLOSED"  # 409
+ERR_TRANSFER_BLOCKED = "ERR_TRANSFER_BLOCKED"        # 409
+
+# --- business safety ---------------------------------------------------------
+ERR_WINDOW_VIOLATION = "ERR_WINDOW_VIOLATION"        # 422
+ERR_FOOTPRINT_EXCEEDED = "ERR_FOOTPRINT_EXCEEDED"    # 422
+
+# --- business constraints ----------------------------------------------------
+ERR_CONFIRM_TOO_EARLY = "ERR_CONFIRM_TOO_EARLY"      # 422
+ERR_SITE_DEMAND_LIMIT = "ERR_SITE_DEMAND_LIMIT"      # 422
+ERR_INSUFFICIENT_DRAW_POSITION = "ERR_INSUFFICIENT_DRAW_POSITION"  # 422
+ERR_DRAW_POSITION_BELOW_RESUME = "ERR_DRAW_POSITION_BELOW_RESUME"  # 422
+ERR_CUSTOMER_SOURCING_UNVERIFIED = "ERR_CUSTOMER_SOURCING_UNVERIFIED"  # 422
+ERR_SETTLEMENT_PERIOD_INVALID = "ERR_SETTLEMENT_PERIOD_INVALID"    # 422
+ERR_SETTLEMENT_PERIOD_OVERLAP = "ERR_SETTLEMENT_PERIOD_OVERLAP"    # 422
+ERR_SETTLEMENT_PERIOD_BEFORE_ACTIVATION = "ERR_SETTLEMENT_PERIOD_BEFORE_ACTIVATION"  # 422
+ERR_EXIT_WINDOW_CONFLICT = "ERR_EXIT_WINDOW_CONFLICT"      # 422
+ERR_DELIVERY_WINDOW_OVERLAP = "ERR_DELIVERY_WINDOW_OVERLAP"  # 422
+ERR_OUT_OF_ORDER = "ERR_OUT_OF_ORDER"                # 422
+ERR_ALLOCATION_LIMIT = "ERR_ALLOCATION_LIMIT"        # 422
+ERR_NO_ELIGIBLE_ACCRUAL = "ERR_NO_ELIGIBLE_ACCRUAL"  # 422
+ERR_CREDIT_TIER_INELIGIBLE = "ERR_CREDIT_TIER_INELIGIBLE"  # 422
+
+# --- business fiscal ---------------------------------------------------------
+ERR_GUARANTEE_FLOOR_BREACH = "ERR_GUARANTEE_FLOOR_BREACH"  # 422
+ERR_BUMPER_EXCEEDED = "ERR_BUMPER_EXCEEDED"                # 422
+ERR_ACCRUAL_UNBALANCED = "ERR_ACCRUAL_UNBALANCED"          # 422
+
+# --- optimistic concurrency --------------------------------------------------
+ERR_STALE_VERSION = "ERR_STALE_VERSION"              # 412
+
+
+HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_SITE_NOT_FOUND: 404,
+    ERR_PPA_NOT_FOUND: 404,
+    ERR_CUSTOMER_NOT_FOUND: 404,
+    ERR_REFERENCE_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_TERM_COMMITMENT_INVALID: 422,
+    ERR_EFFICIENCY_INVALID: 422,
+    ERR_ESCALATOR_OUT_OF_RANGE: 422,
+    ERR_FUEL_SOURCING_MODE_INVALID: 422,
+    ERR_INVALID_STATE: 409,
+    ERR_ALREADY_TERMINAL: 409,
+    ERR_SITE_FROZEN: 409,
+    ERR_RENEWAL_STAGE_INVALID: 409,
+    ERR_REVERSAL_WINDOW_CLOSED: 409,
+    ERR_TRANSFER_BLOCKED: 409,
+    ERR_WINDOW_VIOLATION: 422,
+    ERR_FOOTPRINT_EXCEEDED: 422,
+    ERR_CONFIRM_TOO_EARLY: 422,
+    ERR_SITE_DEMAND_LIMIT: 422,
+    ERR_INSUFFICIENT_DRAW_POSITION: 422,
+    ERR_DRAW_POSITION_BELOW_RESUME: 422,
+    ERR_CUSTOMER_SOURCING_UNVERIFIED: 422,
+    ERR_SETTLEMENT_PERIOD_INVALID: 422,
+    ERR_SETTLEMENT_PERIOD_OVERLAP: 422,
+    ERR_SETTLEMENT_PERIOD_BEFORE_ACTIVATION: 422,
+    ERR_EXIT_WINDOW_CONFLICT: 422,
+    ERR_DELIVERY_WINDOW_OVERLAP: 422,
+    ERR_OUT_OF_ORDER: 422,
+    ERR_ALLOCATION_LIMIT: 422,
+    ERR_NO_ELIGIBLE_ACCRUAL: 422,
+    ERR_CREDIT_TIER_INELIGIBLE: 422,
+    ERR_GUARANTEE_FLOOR_BREACH: 422,
+    ERR_BUMPER_EXCEEDED: 422,
+    ERR_ACCRUAL_UNBALANCED: 422,
+    ERR_STALE_VERSION: 412,
+}
+
+
+def fail(error_id, message=None):
+    """Raise an ApiError using the catalogued status for the identifier."""
+    raise ApiError(error_id, message or error_id, HTTP_STATUS[error_id])

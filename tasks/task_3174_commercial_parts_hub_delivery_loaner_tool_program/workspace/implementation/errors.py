@@ -1,0 +1,168 @@
+"""Error catalogue for the commercial parts hub API.
+
+Every identifier in PRD section 5 is registered here with the HTTP status it is
+carried in.  Nothing in the application invents an error identifier that is not
+in this table.
+"""
+
+_HTTP_400 = [
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER",
+    "ERR_INVALID_REQUEST",
+    "ERR_INVALID_DELIVERY_WINDOW",
+    "ERR_FITMENT_YEAR_RANGE_INVALID",
+    "ERR_HAZARDOUS_PART_NOT_DELIVERABLE",
+    "ERR_INVALID_RETURN_CONDITION",
+    "ERR_STOP_WINDOW_BEFORE_DEPARTURE",
+    "ERR_INVALID_LINE_REFERENCE",
+    "ERR_DESTINATION_MISMATCH",
+]
+
+_HTTP_403 = [
+    "ERR_INSUFFICIENT_PERMISSIONS",
+]
+
+_HTTP_404 = [
+    "ERR_COMMERCIAL_ACCOUNT_NOT_FOUND",
+    "ERR_PART_ORDER_NOT_FOUND",
+    "ERR_TOOL_LOAN_NOT_FOUND",
+    "ERR_CORE_RETURN_NOT_FOUND",
+    "ERR_SERVICE_ROUTE_NOT_FOUND",
+    "ERR_ROUTE_STOP_NOT_FOUND",
+    "ERR_STORE_NOT_FOUND",
+    "ERR_PART_NOT_FOUND",
+    "ERR_VEHICLE_NOT_FOUND",
+    "ERR_SALES_REP_NOT_FOUND",
+    "ERR_COVERAGE_NOT_FOUND",
+    "ERR_TOOL_CATALOG_NOT_FOUND",
+    "ERR_INVENTORY_ITEM_NOT_FOUND",
+]
+
+_HTTP_402 = [
+    "ERR_CREDIT_LIMIT_EXCEEDED",
+    "ERR_RECEIVABLE_BALANCE_OUTSTANDING",
+    "ERR_DEPOSIT_BELOW_MINIMUM",
+]
+
+_HTTP_412 = [
+    "ERR_STALE_ACCOUNT_VERSION",
+    "ERR_STALE_ROUTE_VERSION",
+]
+
+_HTTP_409 = [
+    "ERR_ORDER_NOT_DRAFT",
+    "ERR_ORDER_NOT_CONFIRMED",
+    "ERR_ORDER_NOT_ALLOCATED",
+    "ERR_ORDER_NOT_PICKING",
+    "ERR_ORDER_NOT_DISPATCHED",
+    "ERR_ORDER_NOT_DELIVERED",
+    "ERR_ORDER_NOT_VOIDABLE",
+    "ERR_ORDER_ALREADY_DELIVERED",
+    "ERR_ORDER_NOT_ON_ROUTE",
+    "ERR_LOAN_NOT_REQUESTED",
+    "ERR_LOAN_NOT_CHECKED_OUT",
+    "ERR_LOAN_NOT_OUT",
+    "ERR_LOAN_NOT_RETURNED",
+    "ERR_LOAN_NOT_INSPECTED",
+    "ERR_LOAN_NOT_CLOSABLE",
+    "ERR_DEPOSIT_NOT_HELD",
+    "ERR_DEPOSIT_AMOUNT_EXCEEDS_CHARGE",
+    "ERR_INSUFFICIENT_TOOL_WEAR",
+    "ERR_INVALID_TOOL_WEAR_BAND",
+    "ERR_INVALID_ACCOUNT_POSTURE",
+    "ERR_CREDIT_LIMIT_STILL_EXCEEDED",
+    "ERR_ACCOUNT_NOT_OPEN",
+    "ERR_ACCOUNT_CLOSED",
+    "ERR_OPEN_ORDERS_EXIST",
+    "ERR_OPEN_LOANS_EXIST",
+    "ERR_OPEN_CORE_RETURNS_EXIST",
+    "ERR_CORE_RETURN_NOT_INITIATED",
+    "ERR_CORE_RETURN_NOT_IN_TRANSIT",
+    "ERR_CORE_RETURN_NOT_INSPECTED",
+    "ERR_CORE_RETURN_NOT_REJECTABLE",
+    "ERR_CORE_QUANTITY_EXCEEDS_PURCHASE",
+    "ERR_ROUTE_NOT_DRAFT",
+    "ERR_ROUTE_NOT_PLANNED",
+    "ERR_ROUTE_NOT_DISPATCHED",
+    "ERR_ROUTE_NOT_CANCELLABLE",
+    "ERR_ROUTE_STOP_NOT_ACTIVE",
+    "ERR_ROUTE_STOP_NOT_TERMINAL",
+    "ERR_ROUTE_STOPS_UNRESOLVED",
+    "ERR_ROUTE_HAS_NO_STOPS",
+    "ERR_ROUTE_ORDERS_NOT_PICKED",
+    "ERR_ROUTE_SLICE_INCOMPLETE",
+    "ERR_SHIFT_END_EXCEEDED",
+    "ERR_WINDOW_EXPIRED",
+    "ERR_STOP_NOT_EN_ROUTE",
+    "ERR_STOP_NOT_REJECTABLE",
+    "ERR_STOP_PAST_WINDOW",
+    "ERR_STOP_WINDOW_OVERLAP",
+    "ERR_DRIVER_ROUTE_CONFLICT",
+    "ERR_PART_ALREADY_SUPERSEDED",
+    "ERR_PART_NOT_SUPERSEDED",
+    "ERR_PART_NOT_RETURNABLE",
+    "ERR_SUPERSEDING_PART_NOT_FOUND",
+    "ERR_SUPERSEDING_PART_NOT_TERMINAL",
+    "ERR_SUPERSESSION_CYCLE",
+    "ERR_ARCHIVE_BLOCKED_BY_OPEN_REFERENCE",
+    "ERR_FITMENT_MISMATCH",
+    "ERR_INSUFFICIENT_STOCK",
+    "ERR_NO_FULFILLMENT_SOURCE",
+    "ERR_SAME_DAY_SLOT_TAKEN",
+    "ERR_CAPACITY_EXCEEDED",
+    "ERR_RETURN_WINDOW_CLOSED",
+    "ERR_WARRANTY_EXPIRED",
+    "ERR_RESTOCKING_FEE_MISAPPLIED",
+    "ERR_ACCOUNT_TIER_MISMATCH",
+    "ERR_DELIVERY_ADDRESS_MISMATCH",
+    "ERR_TOOL_ALREADY_ON_LOAN",
+    "ERR_RETURN_DESK_STOP_MISSING",
+    "ERR_COVERAGE_NOT_STARTED",
+    "ERR_COVERAGE_STILL_OPEN",
+    "ERR_COVERAGE_NOT_EXPIRED",
+    "ERR_COVERAGE_NOT_ENDABLE",
+    "ERR_COVERAGE_EXTENSION_NOT_FORWARD",
+    "ERR_COVERAGE_OVERLAP",
+]
+
+ERROR_HTTP = {}
+for _e in _HTTP_400:
+    ERROR_HTTP[_e] = 400
+for _e in _HTTP_403:
+    ERROR_HTTP[_e] = 403
+for _e in _HTTP_404:
+    ERROR_HTTP[_e] = 404
+for _e in _HTTP_402:
+    ERROR_HTTP[_e] = 402
+for _e in _HTTP_412:
+    ERROR_HTTP[_e] = 412
+for _e in _HTTP_409:
+    ERROR_HTTP[_e] = 409
+
+ERROR_IDS = sorted(ERROR_HTTP.keys())
+
+
+class ApiError(Exception):
+    """Carries the machine readable identifier and the HTTP status."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        if http_status is None:
+            http_status = ERROR_HTTP.get(error_id, 400)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message if message is not None else _default_message(error_id)
+        super().__init__(self.message)
+
+
+def _default_message(error_id):
+    text = error_id
+    if text.startswith("ERR_"):
+        text = text[4:]
+    return text.replace("_", " ").capitalize() + "."
+
+
+def fail(error_id, message=None, http_status=None):
+    raise ApiError(error_id, message=message, http_status=http_status)
+
+
+def bad_request(message=None):
+    raise ApiError("ERR_INVALID_REQUEST", message=message)

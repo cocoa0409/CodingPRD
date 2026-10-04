@@ -1,0 +1,49 @@
+"""Domain thresholds and pinned constants used by the pricing and capacity rules."""
+
+# --- Pinned constants from the pricing and capacity rules -------------------
+ROOM_FEE_ACTUATION_CENTS = 1400
+DAY_PASS_BASE_CENTS = 4200
+DAY_PASS_VOLUME_THRESHOLD_UNITS = 10
+DAY_PASS_VOLUME_BLOCK_UNITS = 10
+DAY_PASS_VOLUME_BLOCK_CENTS = 1000
+ACTIVITY_BULK_DISCOUNT_CENTS = 500
+ACTIVITY_REFUND_RATE = 0.375
+GROUP_DEPOSIT_PER_MEMBER_CENTS = 500
+BIRTHDAY_PARTY_MINIMUM_MEMBERS = 1
+LIFEGUARD_MAX_CONSECUTIVE_MINUTES = 120
+LIFEGUARD_DAILY_SHIFT_CAP = 3
+LIFEGUARD_ROTATION_BUFFER_MINUTES = 30
+ACTIVITY_TIER_UNIT_MULTIPLIER = {"STANDARD": 1, "PREMIUM": 2, "VIP": 3}
+
+# --- Safe / plausibility windows for water readings -------------------------
+SAFE_PH_MIN = 7.2
+SAFE_PH_MAX = 7.8
+SAFE_CHLORINE_MIN = 1.0
+SAFE_CHLORINE_MAX = 3.0
+SAFE_TURBIDITY_MAX = 1.0
+PLAUSIBLE_PH_MIN = 0.0
+PLAUSIBLE_PH_MAX = 14.0
+PLAUSIBLE_CHLORINE_MIN = 0.0
+PLAUSIBLE_CHLORINE_MAX = 10.0
+PLAUSIBLE_TURBIDITY_MIN = 0.0
+PLAUSIBLE_TURBIDITY_MAX = 50.0
+
+# --- The logical clock ------------------------------------------------------
+DEFAULT_CURRENT_UTC = "2026-09-01T00:00:00Z"
+DEFAULT_SERVICE_DATE = "2026-09-01"
+DEFAULT_HOLD_EXPIRES_AT = "2026-09-01T00:00:00Z"
+
+# --- Service-date horizon ---------------------------------------------------
+SERVICE_DATE_HORIZON_DAYS = 365
+
+# --- Convenience defaults used across fixtures ------------------------------
+TEST_DEFAULTS = {
+    "PARK_CAPACITY_OCCUPANCY_UNITS": 30,
+    "DAY_PASS_CAP_UNITS": 20,
+    "ARCADE_CREDIT_RATE_CENTS_PER_UNIT": 250,
+    "ROOM_TYPE_CODE": "WOLF",
+    "MAX_OCCUPANCY": 8,
+    "BASE_RATE_CENTS": 18900,
+    "DOMESTIC_SERVICE_DATE": "2026-09-03",
+    "SERVICE_DATE_END": "2026-09-05",
+}

@@ -1,0 +1,385 @@
+# Private Student Loan Origination API — Product Requirements Document
+
+## 1. Introduction
+
+This document specifies the product requirements for the Private Student Loan Origination API, a servicing platform that takes a private (non-federal) education loan from a borrower's first application through underwriting, school certification, disbursement, in-school interest, repayment, delinquency and cosigner release. Private education lending is a multi-party arrangement: no money moves until a borrower, an optional creditworthy cosigner, an eligible institution and an internal underwriting and servicing team have each played their part. The product must therefore coordinate an approval chain — the borrower applies, an underwriter decides, the school certifies enrollment and cost of attendance, and a servicer disburses — while keeping every derived balance, accrual and aging figure consistent with the underlying ledger.
+
+The operational pressure here is asymmetric. Origination is optimistic: a provisional price is quoted the moment a file opens, then re-priced at decision time under a stricter, dilution-aware formula. Servicing is unforgiving: private loans carry their own grace, deferment and forbearance rules that deliberately differ from the federal programs borrowers often assume apply, cosigner-notification duties are legally binding once arrears cross a threshold, and a cosigner's release is an entitlement that must be earned through a qualifying payment run and an independent re-underwriting of the borrower alone. Throughout, the platform must keep denormalized totals reconciled against the ledger rows that produced them, and it must reject writes made against a stale view of a loan.
+
+The API exposes a single REST surface mounted under `/private-student-loans`, covering reference data (borrowers, cosigners, schools, product policies), the application and certification workflow, disbursement and school-refund handling, interest accrual, repayment plans, payments, relief administration, delinquency and default, and cosigner release. All time-dependent behaviour is driven by a logical clock rather than wall-clock time, so every deadline, grace window and aging rule is deterministic and reproducible.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers: `X-User-ID`, identifying the acting party, and `X-User-Role`, naming that party's operational capacity. A request that omits either header, or that presents an `X-User-Role` value that is not one of the six declared roles, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). The six recognized roles are `Borrower`, `Cosigner`, `School`, `Underwriter`, `Servicer`, and `PlatformAdmin`.
+
+Role authorization is enforced before business logic. When the acting role is not permitted to perform the requested operation, the request is rejected with `ERR_FORBIDDEN` (HTTP 403). In addition, several operations are ownership-scoped, and for those the acting `X-User-ID` must equal the identifier of the entity that owns the resource; a mismatch is also an `ERR_FORBIDDEN`.
+
+The meaning of `X-User-ID` depends on the role, and the platform resolves it as follows.
+
+- When `X-User-Role` is `Borrower`, `X-User-ID` is the `id` of the acting `Borrower`; ownership checks on any resource that references a `Borrower` compare the resource's foreign-key field to `X-User-ID`. This applies to cancelling and re-considering a loan application, to re-applying for and withdrawing a cosigner release application, and to the borrower's own loan operations.
+- When `X-User-Role` is `Cosigner`, `X-User-ID` is the `id` of the acting `Cosigner`; ownership checks on any resource that references a `Cosigner` — including a re-underwriting request and a release application filed on that cosigner's behalf — compare the resource's foreign-key field to `X-User-ID`.
+- When `X-User-Role` is `School`, `X-User-ID` is the `id` of the acting `School`; ownership checks on any resource that references a `School` — such as filing or re-filing a certification, recording an enrollment change, certifying an amount, rejecting a request, or returning an over-disbursement — compare the resource's foreign-key field to `X-User-ID`.
+- When `X-User-Role` is `Underwriter`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it but does not compare it to any entity's `id`.
+- When `X-User-Role` is `Servicer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it but does not compare it to any entity's `id`.
+- When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it but does not compare it to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` caps how many items a page may contain; it defaults to 10, and its accepted range is a minimum of 1 and a maximum of 100. `offset` skips that many items from the start of the result set and defaults to 0. Unless a specific list endpoint states otherwise, results are ordered by creation timestamp ascending.
+
+The `meta` object of a list response carries four pagination fields: `limit`, `offset`, `total_count`, and `has_more`. `total_count` reflects the total number of matching records irrespective of the page window, and `has_more` indicates whether further pages exist.
+
+### 2.4. Party Identity and File Ownership
+
+The platform distinguishes borrowing parties from operating parties, and resource ownership is always resolved through an explicit foreign key rather than through custom claims. A borrower is the natural person who owes the debt; a cosigner is a creditworthy third party who backs one or more loans and who may later seek release from that obligation; a school is an eligible institution that certifies enrollment and cost of attendance and returns over-disbursements. Every application names its applicant through the `borrower_id` it carries, and a cosigner who is added to a file is linked back to their borrower through the `borrower_id` on the cosigner record itself.
+
+Ownership-scoped actions are the ones that mutate a party's own file at that party's initiative: an application may be re-considered or cancelled only by the borrower who owns it, a cosigner release application may be re-applied for or withdrawn only by the borrower who owns the underlying loan, and a cosigner may refresh its own figures only when the acting cosigner is the record addressed. When the acting identity does not match the owning entity, the request fails with `ERR_FORBIDDEN`.
+
+### 2.5. The Logical Clock
+
+All date-sensitive behaviour in this platform is evaluated against a server-controlled logical clock, never against wall-clock time. Before any clock-setting call is made, the clock reads the fixed server default `2026-09-01T00:00:00Z`, and it never falls back to the host's real time, so every deadline, grace window, expiry sweep and aging computation is reproducible run to run.
+
+An administrative capability lets an authorized operator advance the clock by supplying `to_iso8601`. The supplied value must be a well-formed ISO 8601 UTC instant that is not earlier than the fixed start-of-time default `2026-09-01T00:00:00Z`; a malformed value, or one that precedes that default, is rejected with `ERR_INVALID_CLOCK` (HTTP 400). Advancing the clock is not a passive state change: advancing past a payment's `scheduled_due_date` plus the product's notice threshold matures that payment to `MISSED`, advancing past a certification's period end plus thirty days matures the certification to `EXPIRED`, and advancing across a delinquency boundary re-evaluates the loan's aging stage. The successful clock-set response reports the resulting instant as `current_utc`.
+
+### 2.6. Common Resource Properties
+
+Every top-level resource in this API — `Borrower`, `Cosigner`, `School`, `LoanPolicy`, `LoanApplication`, `SchoolCertification`, `Loan`, `Disbursement`, `RepaymentPlan`, `Payment`, `ForbearanceDeferment`, and `CosignerReleaseApplication` — carries a standard set of system-managed fields:
+
+- `id`: a unique, server-minted identifier formatted as a UUID with no type prefix.
+- `created_at`: an ISO 8601 UTC timestamp with three fractional digits, recording when the resource was created.
+- `updated_at`: an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of the resource.
+- `version`: an integer that begins at 1 and increments by one on every mutation of the resource.
+
+Two exceptions to this convention deserve emphasis. The `InterestAccrualEntry` ledger row is created without the common fields beyond its identifier and creation instant: it carries only `id` and `created_at`, and it has neither an `updated_at` nor a `version` field. Its lifecycle is expressed solely through its `entry_status`. A resource that is immutable after creation likewise does not expose a mutable version, and any derived quantity recomputed on a parent (for example a loan's balance figures) is a mutation that refreshes the parent's `updated_at` and increments the parent's `version`.
+
+### 2.7. Monetary Amounts, Rates and Rounding
+
+All monetary values are integer counts of cents. Wherever a calculation produces a monetary result, the final value is rounded half up to a whole cent, and any intermediate decimal arithmetic is carried at two decimal places before that final rounding. Percentage and rate fields preserve the precision at which they were supplied, with one exception: the derived `effective_rate_pct` is expressed to four decimal places, rounded half up. Scores and day counts are whole numbers; `combined_credit_score` and every release-score component are rounded half up to zero decimal places, and day counts are whole days with any fractional part discarded.
+
+Round-half-up means that a value whose discarded portion is exactly one half is rounded away from zero to the next cent or next integer, not to the nearer even value.
+
+### 2.8. Optimistic Concurrency Control on Loan Writes
+
+Two write operations are guarded against stale views of a loan. Submitting a repayment plan against a loan and scheduling a disbursement against a loan each require the request body to carry `expected_loan_version`, the value of the loan's `version` that the client last observed. This field is required — it is not optional — on both operations. If the supplied `expected_loan_version` no longer equals the loan's current `version`, the request is rejected with `ERR_STALE_VERSION` (HTTP 412), and no part of the operation is applied.
+
+The guard exists because both operations depend on a capitalization of the loan's state that is invalidated by other writers. A repayment plan that is submitted against a stale loan view might be built on a principal balance or an active plan that another writer has already moved, and a disbursement scheduled against a stale view might be sized against certification headroom that a release or a school refund has already consumed. Endpoints that are not guarded by a concurrency rule do not accept an `expected_loan_version` field and must not have one supplied.
+
+### 2.9. Nested Path Validation and Existence Precedence
+
+Whenever a request path addresses a resource through one or more enclosing identifiers, the platform validates those identifiers strictly from left to right and stops at the first failure. It resolves the outer resource before it resolves the inner one, so a request addressing a child under a non-existent parent fails on the parent rather than on the child. This ordering also governs creation and modification: the parent's existence, and where applicable the parent's status, is established before any child-level rule is evaluated.
+
+The existence failures each carry their own identifier and an HTTP 404 status. An unresolved borrower yields `ERR_BORROWER_NOT_FOUND`; an unresolved cosigner — or one already in `RELEASED` status, which is no longer addressable for backing purposes — yields `ERR_COSIGNER_NOT_FOUND`; an unresolved school yields `ERR_SCHOOL_NOT_FOUND`; an unresolved policy yields `ERR_POLICY_NOT_FOUND`; an unresolved application yields `ERR_APPLICATION_NOT_FOUND`; an unresolved loan yields `ERR_LOAN_NOT_FOUND`; and an unresolved certification yields `ERR_CERTIFICATION_NOT_FOUND`. When the resource addressed is a loan child — a repayment plan, a payment, a disbursement or a cosigner release application — and it either does not exist or belongs to a different loan than the one named in the path, the failure is `ERR_LOAN_CHILD_NOT_FOUND`.
+
+### 2.10. Cross-Aggregate Propagation and Derived Totals
+
+Many operations in this platform mutate more than one aggregate. When a child resource changes state, the parent's derived totals are recomputed in the same transaction, and the parent's `updated_at` and `version` are refreshed as part of that recomputation. The loan's `certified_amount_cents` is the running total of its certifications in `CERTIFIED` or `PARTIAL_CERTIFIED` status, recomputed whenever a certification is certified, rejected, re-filed or expired; the loan's `disbursed_amount_cents` is the running total of released disbursements net of any school refund credited back; and the loan's `principal_cents` and `current_balance_cents` are re-derived from the disbursement ledger whenever that ledger moves.
+
+Propagation also runs in the other direction, reverting a parent when its children no longer justify its state. If every certification on an application ends in `REJECTED` or `EXPIRED`, the application returns to `APPROVED` so that a fresh certification may be filed. When a sibling plan is activated, any plan already `ACTIVE` on that loan is superseded. When a cosigner is released, the cosigner reference is cleared on every loan that carried that cosigner, while the loan's principal is deliberately left untouched.
+
+### 2.11. The Interest Ledger and Conserved Quantities
+
+Interest is tracked as a ledger of `InterestAccrualEntry` rows rather than only as a running figure, and each row carries its `loan_id` back to the loan it accrues against. Each row records the logical `entry_date` it is booked for, the `accrued_amount_cents` it carries, the `entry_status` it holds, and the `source_event` that produced it. A row is created by periodic accrual (`PERIOD_ACCRUAL`), by capitalization at repayment entry (`CAPITALIZATION`), or by a payment reversal (`PAYMENT_REVERSAL`), and its status progresses through `ACCRUED`, `CAPITALIZED`, `UNPAID_DUE` or `WRITTEN_OFF`.
+
+Two conservation invariants govern this ledger. First, the loan's `lifetime_capitalized_interest_cents` is a denormalized figure that must always equal the sum of the `accrued_amount_cents` of every ledger row in `CAPITALIZED` status — the two must never drift. Second, the loan's `lifetime_accrued_interest_cents` is the sum of the `accrued_amount_cents` of every row in `ACCRUED` or `CAPITALIZED` status; a row in `UNPAID_DUE` or `WRITTEN_OFF` status contributes to neither total. Similarly, `lifetime_on_time_payment_count` on a borrower is a conserved, monotonic quantity: it counts every qualifying payment ever made and is never reduced by a later reversal or a later late payment. The loan's `lifetime_principal_reduction_cents` is likewise conserved, accumulating the principal reductions caused by rate changes and automatic-debit incentives.
+
+### 2.12. Validation Cascade and Precedence
+
+When several rules could apply to one request, they are evaluated in a fixed precedence order and the first failing rule determines the response. This ordering is a contract, not an implementation detail: a caller that supplies both a malformed body and a resource in the wrong state must receive the failure of the higher-priority rule.
+
+Authentication runs first: `ERR_UNAUTHENTICATED`, then authorization and ownership, `ERR_FORBIDDEN`. Existence follows, in the left-to-right order described in §2.9. Request shape is next: a missing required body field or an enum-valued field carrying a value outside its declared set yields `ERR_INVALID_REQUEST`, and — for the clock-setting capability only — a malformed or too-early instant yields `ERR_INVALID_CLOCK`. State preconditions then apply: an operation that is not a declared transition out of the resource's current state, including any operation attempted on a resource already in a terminal state, yields `ERR_INVALID_STATE`, and a stale `expected_loan_version` yields `ERR_STALE_VERSION`.
+
+Business-safety and compliance checks follow the state checks, and they run before all fiscal checks: a blocked disbursement yields `ERR_DISBURSEMENT_BLOCKED`, an unsatisfied cosigner notification obligation blocks a release approval with `ERR_NOTICE_OBLIGATION_PENDING`, and an overlapping disbursement window or relief window yields `ERR_DISBURSEMENT_WINDOW_OVERLAP` or `ERR_FORBEARANCE_OVERLAP` respectively. Referential business constraints come next, covering the requirement of an active plan before repayment entry (`ERR_PLAN_REQUIRED`), the requirement of an eligible cosigner (`ERR_COSIGNER_NOT_ELIGIBLE`), the standalone-borrower policy check (`ERR_COSIGNER_REQUIRED`), the certified amount ceiling (`ERR_CERTIFICATION_LIMIT_EXCEEDED`), the per-period school capacity ceiling (`ERR_SCHOOL_CAPACITY_EXCEEDED`), and the one-certification-per-period rule (`ERR_CERTIFICATION_PERIOD_CONFLICT`). Fiscal checks are evaluated last. They include a declined credit outcome (`ERR_CREDIT_DECLINED`), an out-of-range money amount (`ERR_AMOUNT_OUT_OF_RANGE`), a release exceeding certification headroom (`ERR_DISBURSEMENT_OVER_CERTIFIED`), a deferment that would breach the product cap (`ERR_DEFERMENT_CAP_EXCEEDED`), an unsupported product shape (`ERR_PRODUCT_RULE_UNSUPPORTED`), an insufficient release payment run (`ERR_RELEASE_RUN_INSUFFICIENT`), a failed independent release underwriting (`ERR_RELEASE_UNDERWRITING_FAILED`), and a default declared before its threshold (`ERR_DEFAULT_THRESHOLD_NOT_MET`). A loan that is `DELINQUENT` or `DEFAULT` cannot accept a cosigner-release approval or an automatic-debit enrolment, which is `ERR_LOAN_DELINQUENT`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Borrowers, Cosigners and Combined Credit Underwriting
+
+Origination begins with reference data. A `PlatformAdmin` registers a student borrower, supplying the borrower's `full_name`, a unique login and notification `email`, a two-letter `state_code`, and a `program_level` that is either `UNDERGRADUATE` or `GRADUATE`. The registration also captures the borrower's own credit figures, the `credit_score` and the debt-to-income `dti_ratio` that the combined underwriting will later consume. On creation the borrower receives a `status` of `ACTIVE`, and it may later be placed in `LOCKED`. The borrower record also carries an `enrollment_status` that is used by the accrual and grace rules and that is maintained from school-certified changes; its possible values are `IN_SCHOOL`, `LESS_THAN_HALF_TIME`, `GRADUATED`, and `WITHDRAWN`. Two payment-run counters are maintained on the borrower: `on_time_payment_run_count`, which measures the length of the *current* unbroken run of consecutive qualifying payments ending at the most recent due period and which resets to zero on any missed or late payment, and `lifetime_on_time_payment_count`, which is the monotonic count of qualifying payments ever made and is never decremented by a later late payment. Both start at 0.
+
+An institution is registered by a `PlatformAdmin` with its legal `name`, a unique six-digit `school_code`, a `state_code`, and its `certification_capacity_per_period_cents` — the maximum aggregate amount the school will certify in a single academic period across all of its certifications — together with an `active` flag that defaults to true and marks whether the institution is currently an eligible lender-partner school. A product policy is published by a `PlatformAdmin` with a `product_code` such as `SM-UG-2026` and the `program_level` of `UNDERGRADUATE` or `GRADUATE` that it underwrites, alongside the servicing parameters that shape the product: the release gates `cosigner_release_min_on_time_payments` (defaulting to 24), `cosigner_release_min_credit_score` (defaulting to 660) and `cosigner_release_max_dti_ratio` (defaulting to 0.45); the automatic-debit parameters `autodebit_rate_reduction_pct` (defaulting to 0.25) and `autodebit_min_payments_before_reduction` (defaulting to 24); `extended_term_months` (defaulting to 120); `capitalized_interest_cap_pct` (defaulting to 0.10); the relief caps `in_school_max_deferment_months` (defaulting to 48) and `repayment_max_deferment_months` (defaulting to 24); the `delinquency_notice_threshold_days` (defaulting to 5); and the `allows_standalone_borrower` flag (defaulting to false).
+
+A cosigner may be invited for a borrower by supplying the cosigner's `full_name`, `email`, `state_code`, a `relationship` to the borrower drawn from `PARENT`, `GRANDPARENT`, `SIBLING`, `SPOUSE` or `OTHER`, a `credit_score` at invitation, the length of the cosigner's credit history in `credit_history_months`, and the cosigner's `dti_ratio`. The cosigner record is linked to its borrower through its `borrower_id`, and its `underwriting_status` begins at `INVITED`. A cosigner may be in `INVITED`, `UNDER_REVIEW`, `ELIGIBLE`, `INELIGIBLE`, or `RELEASED`; once a cosigner is `RELEASED` it is no longer addressable as an active backing party.
+
+The combined credit evaluation is the pricing heart of origination, and it exists in two variants that share one tier ladder. An eligible cosigner is one whose record is referenced by the application and whose `underwriting_status` is `ELIGIBLE`; a cosigner in `INVITED`, `INELIGIBLE` or `RELEASED` status is excluded from the evaluation entirely — a released cosigner contributes nothing even though the loan once carried them. When an eligible cosigner is present, the *provisional* variant, used for the price quoted the moment a file opens, takes the better of the two credit scores: the combined score is whichever of the borrower's `credit_score` and the cosigner's `credit_score` is higher. When no eligible cosigner is present, the provisional combined score is simply the borrower's own `credit_score`. The *final* variant, used at decision time, blends rather than takes the maximum: with an eligible cosigner present, the combined score is fifty-five percent of the cosigner's score plus forty-five percent of the borrower's score, with the result rounded half up to a whole number; with no eligible cosigner, the final combined score is the borrower's score reduced by the twenty-five-point standalone penalty. Both variants then map the combined score to a `tier` and a `margin_rate_pct`: tier `A` for a combined score of at least 750, tier `B` for at least 700, tier `C` for at least 650, tier `D` for at least 600, and `DECLINED` for anything below 600. The assigned margin is 2.75 percent for tier `A`, 3.75 percent for tier `B`, 5.50 percent for tier `C`, and 7.25 percent for tier `D`; a `DECLINED` file carries no margin at all and its `margin_rate_pct` is null.
+
+Because the two variants behave differently — the provisional variant lets a strong cosigner price the file at the cosigner's own tier, while the final variant dilutes a strong cosigner with a weak borrower so the tier can move down — a file can be quoted at one tier and decided at another. This is intended.
+
+A cosigner's own standing is established by a combined underwriting pass. A fresh cosigner moves from `INVITED` to `UNDER_REVIEW` when it consents or when an authorized first re-underwriting pass is run, and at that point the cosigner's `credit_score` and `dti_ratio` are refreshed from the submitted values. The pass then resolves to `ELIGIBLE` when the cosigner's `credit_score` is at least sixty points below the product's `cosigner_release_min_credit_score` and the cosigner's `dti_ratio` is at most the product's `cosigner_release_max_dti_ratio`; otherwise it resolves to `INELIGIBLE`. In other words, a cosigner clears the backing gate on a credit score that may be up to sixty points *below* the release threshold — the backing gate is deliberately more permissive than the release gate. An `INELIGIBLE` cosigner may re-present itself with fresh figures, at which point it returns to `UNDER_REVIEW`; a cosigner that reaches `ELIGIBLE` stays there until it is `RELEASED`.
+
+### 3.2. Application Submission, Underwriting and Reconsideration
+
+A `Borrower` submits a loan application by naming the `school_id` it is for and the `policy_id` it is to be priced against, requesting a `requested_amount_cents`, stating a `cost_of_attendance_cents` and any `other_aid_cents` already received (which defaults to 0), selecting an in-school `interest_accrual_option` of `DEFERRED`, `INTEREST_ONLY` or `IMMEDIATE`, requesting a `repayment_term_months`, and optionally attaching a `cosigner_id`. The application's `borrower_id` is taken from the acting borrower. Submission is not a resting state: the application is created in `SUBMITTED` and immediately advances to `UNDER_REVIEW`, and the provisional combined underwriting runs at once, setting `combined_credit_score`, `tier` and `margin_rate_pct` from the client-stated figures. The application's `decision_path` is set to `COSIGNER_PRIMARY` whenever a `cosigner_id` is present and to `BORROWER_STANDALONE` otherwise, and its `certification_limit_cents` is fixed at this point as the cost of attendance minus other aid, floored at zero.
+
+An `Underwriter` decides the file by supplying a `decision`. Choosing `APPROVE` requires three things to hold together: the application is still `UNDER_REVIEW`, the final combined underwriting does not land on tier `DECLINED`, and the approved amount does not fall below the one-thousand-dollar floor (100000 cents). If the final tier is `DECLINED`, the approval is refused with `ERR_CREDIT_DECLINED`. If the amount falls below the floor, the approval is refused with `ERR_AMOUNT_OUT_OF_RANGE`. An application that names no cosigner at all may only be approved when the product policy permits a standalone file — that is, when the policy's `allows_standalone_borrower` is true, which defaults to false; otherwise the approval is refused with `ERR_COSIGNER_REQUIRED`.
+
+A successful approval re-prices the file under the final variant, sets `approved_amount_cents` to the lesser of the requested amount and the certification limit, and creates the `Loan`. The new loan opens in `APPROVED` — its `loan_status` — takes its `certification_limit_cents` frozen from the application, and copies across the application's `interest_accrual_option`. Choosing `DENY` instead records the first failing underwriting gate in `denial_reason`, one of `CREDIT_SCORE`, `DTI`, `INSUFFICIENT_HISTORY` or `POLICY_ERROR`, and — when the file carried a cosigner — sets that cosigner's `underwriting_status` to `INELIGIBLE`.
+
+Denial is not final. A denied file may be re-presented by the borrower who owns it, which returns the application from `DENIED` to `UNDER_REVIEW`, re-runs the provisional pricing, and resets the attached cosigner from `INVITED` to `UNDER_REVIEW`. Cancellation is likewise a borrower action, allowed only by the owning borrower, and is available from `SUBMITTED` or from `UNDER_REVIEW`; cancelling any application in `REQUESTED` certification state expires those certification requests. An application's `application_status` runs through `SUBMITTED`, `UNDER_REVIEW`, `SCHOOL_CERT_PENDING`, `APPROVED`, `DENIED`, `CANCELLED`, `DISBURSED` and `CLOSED`; `CANCELLED` and `CLOSED` are terminal.
+
+### 3.3. School Certification and the Cost-of-Attendance Ceiling
+
+The `School` named on an approved application files a certification request for an academic period. The request carries an `academic_period_label` such as `2026-FALL`, the `certified_amount_cents` the school proposes for that period, a `certified_enrollment_status` of `IN_SCHOOL`, `LESS_THAN_HALF_TIME`, `GRADUATED` or `WITHDRAWN`, and the period's `period_end_date`. Filing a request moves the application from `APPROVED` to `SCHOOL_CERT_PENDING` and creates the certification in `REQUESTED` status — its `certification_status`. Certification requests in `REQUESTED` may subsequently be expired, and `EXPIRED` is the terminal certification state.
+
+Certification itself is a two-outcome decision by the school. When the school certifies the amount it requested, the certification moves from `REQUESTED` to `CERTIFIED`. When the school certifies an amount strictly below the amount the application requested for that period, the certification moves from `REQUESTED` to `PARTIAL_CERTIFIED`. Both outcomes are gated by the same set of conditions: the parent application must be `APPROVED` or `SCHOOL_CERT_PENDING`, the acting school must be the certification's own school, the school's `active` flag must be true, and the certified amount, added to the amounts already certified for that same period, must not exceed the school's `certification_capacity_per_period_cents`. On either outcome the `certified_date` is stamped from the logical clock and the aggregate certified totals are recomputed upward through the application and the originating loan.
+
+Three further constraints guard the certify operation, and they are evaluated in the order given in §2.12. First, a single certification may never certify more than the application's `certified_limit_cents`; this is a standalone check on the certification's own amount, and an amount that would exceed the application's whole ceiling is refused with `ERR_CERTIFICATION_LIMIT_EXCEEDED`. Second, the sum of certified amounts across all of one school's `CERTIFIED` and `PARTIAL_CERTIFIED` certifications sharing an `academic_period_label` may not exceed that school's `certification_capacity_per_period_cents`; breaching it is `ERR_SCHOOL_CAPACITY_EXCEEDED`. Third, an application may hold at most one `CERTIFIED` or `PARTIAL_CERTIFIED` certification per `academic_period_label`, and a second certification for a label already carrying a live sibling is refused outright rather than silently summed, because the certified aggregate would otherwise double-count a single period; this is `ERR_CERTIFICATION_PERIOD_CONFLICT`.
+
+The certified total itself is the output of a waterfall allocation that is pinned by evaluation order, because the application-level ceiling and the children's certified amounts are mutually referential and the order below is the only well-defined one. The application's ceiling is first computed as the cost of attendance minus other aid, floored at zero. The eligible children — those in `CERTIFIED` or `PARTIAL_CERTIFIED` status, excluded of anything `REJECTED` or `EXPIRED` — are then walked in ascending `certified_date` order, breaking ties by ascending `created_at`, and each child's certified amount is allocated against the remaining ceiling: each child keeps the lesser of its own certified amount and the remaining ceiling, and the ceiling is reduced by whatever that child was allocated. The loan's `certified_amount_cents` is then the post-allocation sum of the children's certified amounts, and the loan's remaining headroom is the certified total minus the disbursed total, floored at zero.
+
+The allocation order has a visible consequence. When the sum of the requested certifications exceeds the ceiling, the *last* child in that ordered walk absorbs the shortfall, which is why a child in that position is recorded `PARTIAL_CERTIFIED`; two certifications of the same nominal amount can therefore land differently depending on where they fall in the order. When the requested certifications fit at or below the ceiling, every child keeps its full amount and the headroom simply equals the ceiling minus the disbursed total.
+
+A rejected certification reverts the application so that a fresh request may be filed. It is driven by a `rejection_reason` drawn from the declared set — `NOT_ENROLLED`, `COST_EXCEEDED`, `PROGRAM_INELIGIBLE`, or `SCHOOL_INACTIVE` — and it recomputes the application's certified total over the non-rejected, non-expired children. When every sibling certification on the application is `REJECTED` or `EXPIRED`, the application reverts from `SCHOOL_CERT_PENDING` to `APPROVED`. A rejected certification may be re-filed: the request returns it to `REQUESTED`, clears its `rejection_reason` to null, and resets its `certified_amount_cents` to 0. Certifications also expire on their own. When the logical clock passes the certification's period end plus thirty days, a `CERTIFIED` or `PARTIAL_CERTIFIED` certification becomes `EXPIRED`, and the loan's certified total is recomputed to exclude it.
+
+### 3.4. Disbursement Scheduling, Release and School Refunds
+
+A `Servicer` schedules a disbursement against a loan by supplying the `academic_period_label`, the `period_start_date` and `period_end_date` that bound the academic period, the `scheduled_date` the funds are to be sent to the school, and the `amount_cents` to release. The loan's current `version` must be supplied as `expected_loan_version`, and a mismatch is refused with `ERR_STALE_VERSION` as described in §2.8. A newly scheduled disbursement opens in `SCHEDULED` — its `disbursement_status` — and that field progresses to `CANCELLED`, `RELEASED` or `FAILED`; `RELEASED` and `CANCELLED` are terminal.
+
+Releasing a scheduled disbursement requires that the loan is `APPROVED` or `IN_SCHOOL`, that the loan is not blocked, that the certification covering the disbursement's `academic_period_label` is `CERTIFIED` or `PARTIAL_CERTIFIED`, and that the resulting released total, net of refunds, does not exceed the loan's `certified_amount_cents`. When the release would push the released total above the certified total, the overage is flagged by setting the disbursement's `refund_status` to `REFUND_DUE`; the field otherwise reads `NOT_APPLICABLE` until a refund is actually recorded, at which point it becomes `REFUNDED`. A release stamps `released_date` from the logical clock, recomputes the loan's `disbursed_amount_cents` over released children net of refunds, and re-derives the loan's `principal_cents` and `current_balance_cents`. The very first release on a loan is also the event that advances the loan from `APPROVED` to `IN_SCHOOL` and, equivalently, advances the application to `DISBURSED` once the first release is recorded while a certification is live.
+
+The release amount is capped by headroom. Headroom is the loan's certified total minus its disbursed total, floored at zero, and a release whose amount would exceed that headroom is refused with `ERR_DISBURSEMENT_OVER_CERTIFIED`.
+
+Two blocking conditions protect the disbursement ledger. A disbursement may not be scheduled or released while the loan's `disburse_blocked` flag is true, which it is whenever any disbursement child carries `refund_status` of `REFUND_DUE` or whenever the loan is `DEFAULT` or `FORBEARANCE_DEFERMENT`; a blocked attempt is refused with `ERR_DISBURSEMENT_BLOCKED`. A disbursement may also not be scheduled when its academic period window, from `period_start_date` to `period_end_date` inclusive, overlaps an existing non-cancelled disbursement on the same loan; this is `ERR_DISBURSEMENT_WINDOW_OVERLAP`, and an adjacency with zero gap — one period beginning exactly where another ends — counts as an overlap and is rejected.
+
+A scheduled disbursement may be cancelled, in which case its `disbursement_status` moves to `CANCELLED` and the loan's blocked flag is recomputed. A scheduled disbursement may also fail when the school rejects the transmitted funds, which sets the `disbursement_status` to `FAILED` and sets `disburse_blocked` to true. A failed disbursement can be re-scheduled with a fresh `scheduled_date` that is not in the past relative to the logical clock; its `disbursement_status` returns to `SCHEDULED`, and `disburse_blocked` is recomputed to false once no other blocker remains.
+
+Over-disbursement is handled by the school returning the excess. A released disbursement accepts a school refund that records the returned `remainder_credited_cents`; the refund requires the disbursement to be `RELEASED`, requires that no refund has already been credited (`remainder_credited_cents` equal to zero), and requires that the credited amount does not exceed the disbursement's own `amount_cents` — a credit above that amount is refused with `ERR_AMOUNT_OUT_OF_RANGE`. A successful refund sets the disbursement's `refund_status` to `REFUNDED`, stores the `remainder_credited_cents`, recomputes the loan's `disbursed_amount_cents` net of the refund, re-derives the loan's `principal_cents`, `current_balance_cents` and `certified_amount_cents`, and recomputes `disburse_blocked` to false once no `REFUND_DUE` disbursement remains. The recorded certification is deliberately *not* reduced by the returned amount — the excess is credited against principal without shrinking the certified ceiling.
+
+### 3.5. In-School Interest Accrual and Repayment Entry
+
+Interest accrues while a loan is outstanding, and it does so under the dual accrual rule whose two variants are chosen by context rather than by the caller. Both variants share the same inputs: the loan's `principal_cents`, its `effective_rate_pct`, and the accrual window expressed in `window_months`. The annual rate is the effective rate divided by one hundred, and the monthly rate is that annual rate divided by twelve.
+
+The *per-period* variant, which is used to book ledger rows and to serve the live unpaid-interest figure, rounds each month independently and then sums. For each month of the window, in order, the interest for that single month is the principal multiplied by the monthly rate, rounded half up to a whole cent; the unpaid interest is the sum of those per-month roundings across the window. The *consolidated* variant, which is used for projections only, rounds exactly once over the whole window: the unpaid interest is the principal multiplied by the annual rate, multiplied by the window length in months, divided by twelve, and then rounded half up to a whole cent — a single rounding for the entire window. Because one rounds many times and the other once, the two variants are never equal whenever the principal-times-monthly-rate product has a fractional part. Neither variant may include a month already covered by an `InterestAccrualEntry` in `CAPITALIZED` status, because capitalization zeroes the un-capitalized balance and restarts the accrual window.
+
+The borrower or the servicer may ask for a forward projection of unpaid interest over a hypothetical relief window by supplying `window_months`; this projection is answered under the consolidated variant, books nothing, and reports the projected figure as `projected_unpaid_interest_cents` alongside the `projection_variant` that produced it. Booking an actual accrual entry requires an `entry_date` and a `window_months`, creates an `InterestAccrualEntry` in `ACCRUED` status sourced from `PERIOD_ACCRUAL`, and recomputes the loan's `unpaid_interest_cents` under the per-period variant together with `current_balance_cents`.
+
+Repayment entry is the capitalization event. The servicer moves a loan from `GRACE` into `REPAYMENT`, which requires that the loan is in `GRACE` and that at least one repayment plan child is `ACTIVE`; entering repayment without an active plan is refused with `ERR_PLAN_REQUIRED`. The transition stamps `repayment_entered_date` from the logical clock and books a single capitalization: the loan's `unpaid_interest_cents` as of the transition is compared against a cap equal to ten percent of the loan's disbursed principal, rounded half up to the cent, and the amount actually capitalized is the lesser of the two. At the exact boundary, when the unpaid interest equals the cap, the whole unpaid amount is capitalized — the comparison is inclusive at the cap. Whatever is capitalized is added to the loan's `principal_cents` and to its `lifetime_capitalized_interest_cents`, and the `unpaid_interest_cents` is reduced by the capitalized amount. Any excess beyond the cap is *not* capitalized: it remains in `unpaid_interest_cents` and continues to accrue. The capitalization is booked as an `InterestAccrualEntry` with `entry_status` `CAPITALIZED` and `source_event` `CAPITALIZATION`, and the loan's `current_balance_cents` is recomputed as the principal plus the unpaid interest. The loan's `max_allowed_capitalization_cents` exposes the same cap as a derived field, the capitalization fraction times the disbursed amount rounded half up to the cent.
+
+The loan's in-school interest treatment is expressed on two fields. The `interest_accrual_option`, copied from the application at approval, is the treatment in force and is one of `DEFERRED`, `INTEREST_ONLY` or `IMMEDIATE`. The `repayment_option` is the in-school repayment obligation actually in force; it defaults to `DEFERRED` and follows the interest accrual option unless a deferment supersedes it, and it is drawn from the same three values. The loan also tracks `earned_capitalization_count`, the number of capitalization events already applied, which starts at 0.
+
+### 3.6. Repayment Plans, Payments, Delinquency and Default
+
+A repayment plan fixes the shape of repayment. The borrower or a servicer submits a plan by choosing a `plan_type` of `STANDARD`, `GRADUATED`, `EXTENDED` or `INCOME_BASED`, a `term_months`, and the loan's current `version` as `expected_loan_version`. At submission the plan freezes a `principal_snapshot_cents` from the loan's principal and a `rate_snapshot_pct` from the loan's `effective_rate_pct`, and it solves the level payment from those frozen figures. The snapshot is read *first*, from the loan as of submission, and only then is the payment solved; a later automatic-debit change moves the loan's live rate but must never move this plan's payment. A plan opens in `PENDING_APPROVAL` — its `plan_status` — and `SUPERSEDED` and `DECLINED` are its terminal states.
+
+The level monthly payment is the standard annuity instalment that amortizes the pinned principal at the pinned monthly rate over the requested term. The pinned annual rate is divided by one hundred and then by twelve to obtain the monthly rate; the payment is the product of the pinned principal and the monthly rate, divided by one minus the quantity one plus the monthly rate raised to the negative of the term in months; the intermediate quotient is carried to two decimal places and the resulting payment is rounded half up to a whole number of cents. A plan whose solved `monthly_payment_cents` falls below the five-thousand-cent floor cannot be activated, and the attempt is refused with `ERR_AMOUNT_OUT_OF_RANGE`.
+
+Activation is a servicer action that requires the loan to be `IN_SCHOOL`, `GRACE`, `REPAYMENT` or `FORBEARANCE_DEFERMENT`, requires the solved payment to be at least five thousand cents, and — when the `plan_type` is `EXTENDED` — requires the requested `term_months` to be no longer than the product's `extended_term_months`, whose default is 120. An `EXTENDED` plan whose term exceeds that ceiling is rejected outright rather than silently clamped, with `ERR_PRODUCT_RULE_UNSUPPORTED`; the same error covers a relief type outside the four the private product offers. Activating a plan supersedes any sibling plan already `ACTIVE`, sets the loan's `active_plan_type` to the newly activated plan's `plan_type`, and increments the loan's `version`. A pending plan may instead be declined, which leaves the loan's `active_plan_type` unchanged. At most one plan may be `ACTIVE` on a loan at any time, and the loan's `active_plan_type` mirrors the `plan_type` of that single active child or is null when none is active.
+
+Generating the payment schedule for a loan's active plan creates one `Payment` row per due period for the requested number of `periods`. Due period k, counting from 1, carries a server-stamped `scheduled_due_date` equal to the loan's `repayment_entered_date` advanced by k calendar months, and each row opens in `SCHEDULED` status. A payment is recorded against a `due_period_index` with a `paid_date` and an `amount_cents`, and its `payment_status` settles as one of `PAID_ON_TIME`, `PAID_LATE`, `MISSED` or `REVERSED`.
+
+On-time settlement requires the payment's `paid_date` to be no later than the period's `scheduled_due_date` plus the product's `delinquency_notice_threshold_days`, whose default is 5 — so a payment landing within the grace window is still on time — and requires the loan to be `REPAYMENT`, `DELINQUENT` or `FORBEARANCE_DEFERMENT`. An on-time payment records `arrear_days` of 0, sets its `is_qualifying` flag to true, increments both the borrower's `on_time_payment_run_count` and the borrower's `lifetime_on_time_payment_count`, and reduces the loan's `current_balance_cents` by the paid amount. Late settlement is the mirror image: the payment's `paid_date` must be later than the period's `scheduled_due_date` plus the notice threshold, and the loan must be `REPAYMENT` or `DELINQUENT`. A late payment records its `arrear_days` as the whole-day gap between the scheduled due date and the paid date, sets `is_qualifying` to false, resets the borrower's `on_time_payment_run_count` to zero, and triggers recomputation of the loan's `days_past_due` and `delinquency_stage`; when the resulting arrears reach the notice threshold, the loan's `notice_obligation_status` — which rests at its default `NONE` until an obligation arises — is set to `PENDING`, and it may later be recorded as `SATISFIED` once the notification duty has been discharged. A payment left uncleared is matured to `MISSED` once the logical clock passes its `scheduled_due_date` plus the notice threshold; that resets the borrower's run to zero, recomputes arrears, and advances the loan from `REPAYMENT` to `DELINQUENT`. A settled payment may be reversed by a servicer with a `reason`; reversal sets the payment to `REVERSED` and non-qualifying, recomputes the borrower's run to exclude it, and increases the loan's `current_balance_cents` by the reversed amount — but the borrower's `lifetime_on_time_payment_count` is deliberately left unchanged, because it is conserved.
+
+Delinquency is aged by a projection that also exists in two variants. The base figure counts the whole days from the oldest open due date — the earliest `scheduled_due_date` among payments that are `MISSED` or `PAID_LATE`, with `PAID_ON_TIME` and `REVERSED` payments never contributing — to the current logical clock; if no such payment exists, the arrears are zero. The `as_of_clock` variant, used for live reads and for every payment write, counts every elapsed day, so a period three days past due already reports three days. The `at_period_close` variant, used by the period-close booking, first subtracts the five-day period-close lag and reports zero unless the raw gap exceeds five days; the same six-day gap therefore reports one day under the period-close variant while the live read reports six. The day counts are whole days with any fractional part discarded. The derived `delinquency_stage` then reads from the arrears figure: `CURRENT` at exactly zero days, `LATE` at 29 days or fewer, `DELINQUENT` at 119 days or fewer, and `DEFAULT_ELIGIBLE` beyond that.
+
+A delinquent loan may cure back to `REPAYMENT` once every missed period has been superseded — that is, once every payment that had settled as `MISSED` has had a cleared payment, on time or late, recorded against the same `due_period_index`. Curing recomputes `days_past_due` to 0, recomputes `delinquency_stage` to `CURRENT`, and rebuilds the borrower's `on_time_payment_run_count` as the unbroken run ending at the most recent cleared due period; the borrower's lifetime counter is *not* restored, because it is conserved.
+
+Default is declared by a servicer once the loan is `DELINQUENT` and its `days_past_due`, under the live as-of-clock variant, has reached 120 days. Declaring default before that threshold is refused with `ERR_DEFAULT_THRESHOLD_NOT_MET`. Declaring default sets the loan's `notice_obligation_status` to `PENDING`, sets the backing cosigner's `underwriting_status` to `INELIGIBLE`, declines every open cosigner release application child with the `DELINQUENT_LOAN` deficiency reason, sets `disburse_blocked` to true, and reverts the loan's `effective_rate_pct` to its `margin_rate_pct` — the automatic-debit reduction is removed. Default is recoverable: a servicer may rehabilitate the loan by supplying a `rehabilitation_amount_cents` of at least three times the active plan's `monthly_payment_cents` — a smaller amount is refused with `ERR_AMOUNT_OUT_OF_RANGE` — which clears `disburse_blocked`, recomputes arrears to zero and the stage to `CURRENT`, and returns the loan to `REPAYMENT`. The active plan and principal are untouched by rehabilitation.
+
+A loan reaches `PAID_IN_FULL`, its terminal state, when its `current_balance_cents` reaches zero and every one of its payments is settled as `PAID_ON_TIME`, `PAID_LATE` or `REVERSED`. When an application had reached `DISBURSED`, its `application_status` then advances to `CLOSED`, and no further disbursement may be scheduled against it.
+
+### 3.7. Forbearance and Deferment Administration
+
+Private-loan relief is narrower than the federal programs and is administered by a servicer, though a borrower may also request it. A relief grant is requested by supplying a `relief_type`, a number of `months_requested`, an `interest_treatment` of `ACCRUES_UNPAID` or `INTEREST_ONLY`, and a `start_date`. The four relief types the private product offers are `IN_SCHOOL_DEFERMENT`, `RESIDENCY_DEFERMENT`, `ECONOMIC_HARDSHIP_FORBEARANCE`, and `ADMINISTRATIVE_FORBEARANCE`. A request naming a type outside that set is denied and changes nothing on the loan, and it is refused with `ERR_PRODUCT_RULE_UNSUPPORTED`.
+
+A relief grant is permitted only when the requested window is at least one month long, when the loan's current status admits relief — `IN_SCHOOL`, `GRACE`, `REPAYMENT` or `FORBEARANCE_DEFERMENT` — and when granting the relief would not push the loan's `cumulative_deferment_months` above the applicable product cap. The applicable cap depends on where the loan sits: while the loan is `IN_SCHOOL` or `GRACE` the cap is the policy's `in_school_max_deferment_months`, whose default is 48 months, and while it is `REPAYMENT` the cap is the policy's `repayment_max_deferment_months`, whose default is 24 months. A request that would breach the cap is refused with `ERR_DEFERMENT_CAP_EXCEEDED`.
+
+A relief window may not overlap an existing granted relief on the same loan, and a request whose window begins exactly on another grant's end boundary counts as an overlap and is rejected with `ERR_FORBEARANCE_OVERLAP`. When a grant succeeds, `months_granted` is the lesser of the requested months and the remaining headroom under the applicable cap — that is, the cap minus the months already granted — the loan's `cumulative_deferment_months` is increased by that granted figure, and the loan's status moves to `FORBEARANCE_DEFERMENT`. While the relief runs, the loan's `unpaid_interest_cents` is frozen for the granted window when relief is granted from `IN_SCHOOL`, and is revalued under the accrual rule when relief is granted from `REPAYMENT`.
+
+A granted relief that has not yet started — its `start_date` is not in the past relative to the logical clock — may be cancelled; the relief is addressed by the loan's identifier together with the relief's own `fid`. Cancelling reduces the loan's `cumulative_deferment_months` by the cancelled `months_granted` and restores the loan to the state it held before the relief: `IN_SCHOOL` when the relief interrupted in-school status and `REPAYMENT` when it interrupted repayment. A relief request may also be denied outright, in which case `cumulative_deferment_months` is left unchanged and no `months_granted` is recorded. The relief lifecycle is carried on `relief_status` — `REQUESTED`, `GRANTED`, `DENIED`, `CANCELLED` — with `DENIED` and `CANCELLED` terminal.
+
+### 3.8. Cosigner Release Underwriting
+
+A cosigner's release is the culminating workflow of the loan and it is deliberately strict. A release application is filed against a loan by naming a `cosigner_id` and submitting the borrower's `independent_credit_score` and `independent_dti_ratio` for the independent re-underwriting. Filing requires that the loan actually carries the named cosigner and that the cosigner's `underwriting_status` is `ELIGIBLE`; otherwise the filing is refused with `ERR_COSIGNER_NOT_ELIGIBLE`. Filing also requires that the borrower's qualifying payment run, as captured at submission, has already reached the product's `cosigner_release_min_on_time_payments`; a run short of that threshold is refused with `ERR_RELEASE_RUN_INSUFFICIENT`. The product's `cosigner_release_min_on_time_payments` defaults to 24 consecutive qualifying payments, its `cosigner_release_min_credit_score` defaults to 660, and its `cosigner_release_max_dti_ratio` defaults to 0.45.
+
+At submission the application freezes two snapshots: `payments_at_application`, the borrower's `on_time_payment_run_count` as of submission, and `run_at_submission`, the same unbroken run captured for the decision to read. It also freezes `required_min_payments` from the product policy. The application opens in `SUBMITTED` and advances immediately to `UNDER_REVIEW`; its `release_status` moves through `SUBMITTED`, `UNDER_REVIEW`, `APPROVED`, `DECLINED` and `WITHDRAWN`, of which `APPROVED` and `WITHDRAWN` are terminal. The decision reads the frozen `run_at_submission` snapshot and never the live borrower counter, so a payment run that moves after submission does not move the decision.
+
+Approval by an `Underwriter` requires four things to hold: the frozen `run_at_submission` is at least the application's `required_min_payments`, the submitted `independent_credit_score` is at least the policy's `cosigner_release_min_credit_score`, the submitted `independent_dti_ratio` is at most the policy's `cosigner_release_max_dti_ratio`, and the loan is neither `DELINQUENT` nor `DEFAULT`. In addition, approval may not be granted while the loan's `notice_obligation_status` is `PENDING`; the notification obligation must first be recorded as `SATISFIED`, and until it is, the attempt is refused with `ERR_NOTICE_OBLIGATION_PENDING`.
+
+The independent re-underwriting is scored, not merely gated. The release score is the sum of three components. The credit component is the submitted `independent_credit_score` reduced by 550, floored at zero and capped at 300. The debt-to-income component is the quantity 0.60 minus the submitted `independent_dti_ratio`, multiplied by one thousand and rounded half up, floored at zero and capped at 250. The payment-run component is 200 multiplied by the frozen `run_at_submission` and divided by the application's `required_min_payments`, rounded half up, floored at zero and capped at 200. Each component is rounded half up to a whole number before the three are summed, and the sum is compared as a whole number: a release score of at least 500 is required. A run that exceeds the required minimum pins the payment-run component at 200 and cannot compensate for a weak credit or debt-to-income component, and a run below the minimum is already rejected at the insufficient-payments gate before the score is consulted. A release that fails any of these gates is refused with `ERR_RELEASE_UNDERWRITING_FAILED`.
+
+A declined decision records its `deficiency_reason` as the first failing gate in the fixed order `INSUFFICIENT_PAYMENTS`, `CREDIT_SCORE`, `DTI`, `RELEASE_SCORE`, `DELINQUENT_LOAN`. A declined application may be re-presented by the borrower who owns the loan: re-applying refreshes `payments_at_application` and `run_at_submission` from the live borrower counter, clears the `deficiency_reason` to null, and returns the application to `SUBMITTED` before it advances again to `UNDER_REVIEW`. A release application that has not yet been decided may instead be withdrawn, which sets it to `WITHDRAWN` and leaves the loan's cosigner reference unchanged.
+
+A successful release propagates across every loan the cosigner backs. The cosigner's `underwriting_status` becomes `RELEASED`; the loan's `cosigner_id` is cleared to null; and the loan's `principal_cents` is deliberately left unchanged — release removes the guarantee, not the debt. Any remaining release application child is left `WITHDRAWN`. The loan's `version` is incremented as part of the release.
+
+### 3.9. Automatic Debit, Rate Reduction and Servicing Reads
+
+Automatic debit is an enrolment that a borrower controls. The borrower supplies an `enrolled` boolean; setting it true enrols automatic debit and setting it false cancels it, updating the loan's `autodebit_enrolled` flag and stamping or clearing `autodebit_enrolled_date`, and each change recomputes the loan's rate and its disclosure bound. A loan that is `DELINQUENT` or `DEFAULT` cannot accept an automatic-debit enrolment, which is refused with `ERR_LOAN_DELINQUENT`.
+
+The rate reduction earned by automatic debit is conditional on a payment milestone, and the milestone is measured on the conserved lifetime counter, never on the current run. The reduction applies only when automatic debit is enrolled *and* the borrower's `lifetime_on_time_payment_count` has reached 24 — the same floor the product policy publishes as `autodebit_min_payments_before_reduction`, which defaults to 24. Twenty-four qualifying payments earns the reduction; twenty-three does not. While the reduction is in force, the loan's `effective_rate_pct` is its `margin_rate_pct` minus 0.25 percentage points — the product's `autodebit_rate_reduction_pct`, which defaults to 0.25. While it is not in force, the `effective_rate_pct` equals the `margin_rate_pct` exactly. Because the milestone reads the lifetime counter, a run broken by a single late payment does not revoke a reduction the borrower has already earned; a default, however, does revoke it, reverting `effective_rate_pct` to the margin. The `effective_rate_pct` is expressed to four decimal places, rounded half up.
+
+The loan also exposes a conservative disclosure bound, `max_autodebit_waiver_benefit_cents`, which upper-bounds the benefit of the automatic-debit waiver. It is the loan's `current_balance_cents` multiplied by the rate reduction expressed as a fraction of one hundred and multiplied by the number of in-school months elapsed under immediate accrual treatment divided by twelve, rounded half up to a whole cent.
+
+A consolidated servicing read rolls the loan's figures together without mutating anything. It reports the loan's `current_balance_cents`, its `unpaid_interest_cents`, its `days_past_due` under the live as-of-clock variant, and a period-close arrears figure `period_close_days_past_due` under the period-close variant, together with its `delinquency_stage`, its `effective_rate_pct`, its `certified_headroom_cents`, a `release_eligible` flag, and its `notice_obligation_status`. Lists of borrowers, cosigners, schools and applications support optional filtering by `borrower_id`, `school_id`, `policy_id`, `application_id` and `cosigner_id` as applicable, alongside the standard `limit` and `offset` paging.
+
+## 4. Endpoint Definitions
+
+Operations that create a new stand-alone resource, or that add a new, distinct resource to a collection, return `201 Created`. Operations that modify an existing resource, including those that add data to, or advance the state of, an existing resource, return `200 OK`.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/private-student-loans/borrowers` | Register a student borrower | PlatformAdmin |
+| GET | `/private-student-loans/borrowers/{id}` | Read a borrower | PlatformAdmin, Borrower, Servicer |
+| GET | `/private-student-loans/borrowers` | List borrowers with pagination | PlatformAdmin, Servicer |
+| POST | `/private-student-loans/borrowers/{id}/cosigners` | Invite a cosigner for a borrower | Borrower, PlatformAdmin |
+| POST | `/private-student-loans/cosigners/{id}/reunderwrite` | Refresh a cosigner's figures and re-run combined underwriting | Cosigner |
+| GET | `/private-student-loans/cosigners/{id}` | Read a cosigner | Borrower, Cosigner, Underwriter, Servicer |
+| GET | `/private-student-loans/cosigners` | List cosigners, optionally filtered by borrower | PlatformAdmin, Servicer |
+| POST | `/private-student-loans/schools` | Register an eligible institution | PlatformAdmin |
+| GET | `/private-student-loans/schools/{id}` | Read a school | PlatformAdmin, School, Servicer, Underwriter |
+| GET | `/private-student-loans/schools` | List schools with pagination | PlatformAdmin, Servicer |
+| POST | `/private-student-loans/loan-policies` | Publish a private-loan product policy | PlatformAdmin |
+| GET | `/private-student-loans/loan-policies/{id}` | Read a product policy | PlatformAdmin, Underwriter, Servicer, Borrower |
+| GET | `/private-student-loans/loan-policies` | List product policies | PlatformAdmin, Servicer |
+| POST | `/private-student-loans/loan-applications` | Submit a private student loan application; advances directly to UNDER_REVIEW and prices the provisional tier | Borrower |
+| GET | `/private-student-loans/loan-applications/{id}` | Read an application | Borrower, Underwriter, School, Servicer |
+| GET | `/private-student-loans/loan-applications` | List applications, optionally filtered by borrower or school | Underwriter, Servicer, PlatformAdmin |
+| POST | `/private-student-loans/loan-applications/{id}/decision` | Underwrite the application: APPROVE creates the loan, DENY records the reason | Underwriter |
+| POST | `/private-student-loans/loan-applications/{id}/reconsider` | Re-present a denied application for underwriting | Borrower |
+| POST | `/private-student-loans/loan-applications/{id}/cancel` | Cancel a submitted or in-review application | Borrower |
+| POST | `/private-student-loans/loan-applications/{id}/school-certifications` | File a school certification request for an academic period | School |
+| GET | `/private-student-loans/loan-applications/{id}/school-certifications` | List an application's certification requests | Borrower, School, Servicer, Underwriter |
+| GET | `/private-student-loans/loan-applications/{id}/loans` | List loans opened from an application | Underwriter, Servicer, Borrower |
+| GET | `/private-student-loans/school-certifications/{id}` | Read a certification | Borrower, School, Servicer, Underwriter |
+| GET | `/private-student-loans/school-certifications` | List certifications, optionally filtered by application or school | School, Servicer, PlatformAdmin |
+| POST | `/private-student-loans/school-certifications/{id}/certify` | Certify enrollment and an amount; an amount below the requested amount records PARTIAL_CERTIFIED | School |
+| POST | `/private-student-loans/school-certifications/{id}/reject` | Reject a certification request | School |
+| POST | `/private-student-loans/school-certifications/{id}/refile` | Re-file a rejected certification request | School |
+| GET | `/private-student-loans/schools/{id}/certifications` | List a school's certifications | School, Servicer, PlatformAdmin |
+| GET | `/private-student-loans/loans/{id}` | Read a loan, including its derived balance, accrual and delinquency fields | Borrower, Cosigner, Servicer, Underwriter, School |
+| GET | `/private-student-loans/loans` | List loans, optionally filtered by borrower, cosigner, policy or application | Servicer, Underwriter, PlatformAdmin |
+| GET | `/private-student-loans/borrowers/{id}/loans` | List a borrower's loans | Borrower, Servicer, Underwriter |
+| GET | `/private-student-loans/cosigners/{id}/loans` | List the loans a cosigner currently backs | Cosigner, Servicer, Underwriter |
+| GET | `/private-student-loans/loan-policies/{id}/loans` | List loans written under a product policy | Servicer, PlatformAdmin |
+| GET | `/private-student-loans/borrowers/{id}/loan-applications` | List a borrower's applications | Borrower, Underwriter, Servicer |
+| GET | `/private-student-loans/cosigners/{id}/loan-applications` | List the applications a cosigner backs | Cosigner, Underwriter, Servicer |
+| GET | `/private-student-loans/schools/{id}/loan-applications` | List the applications naming a school | School, Underwriter, Servicer |
+| GET | `/private-student-loans/loan-policies/{id}/loan-applications` | List the applications priced against a policy | Underwriter, Servicer, PlatformAdmin |
+| GET | `/private-student-loans/borrowers/{id}/cosigners` | List a borrower's cosigners | Borrower, Underwriter, Servicer |
+| GET | `/private-student-loans/cosigners/{id}/release-applications` | List a cosigner's release applications | Cosigner, Underwriter, Servicer |
+| POST | `/private-student-loans/loans/{id}/enrollment-status` | Record a school-certified change in the borrower's enrollment standing; GRADUATED or WITHDRAWN starts the six-month grace period | School |
+| POST | `/private-student-loans/loans/{id}/enter-repayment` | Move a loan from grace into repayment, capitalizing interest subject to the product cap | Servicer |
+| POST | `/private-student-loans/loans/{id}/autodebit` | Enrol or cancel automatic debit; the rate reduction is applied only once the borrower's lifetime qualifying payment count reaches the product floor | Borrower |
+| POST | `/private-student-loans/loans/{id}/deferment-projection` | Project unpaid interest over a hypothetical relief window under the consolidated accrual variant, without booking anything | Borrower, Servicer |
+| POST | `/private-student-loans/loans/{id}/accrual-entries` | Book an interest accrual entry for a logical date under the per-period accrual variant | Servicer |
+| GET | `/private-student-loans/loans/{id}/accrual-entries` | List a loan's interest accrual ledger | Borrower, Servicer, Underwriter |
+| POST | `/private-student-loans/loans/{id}/repayment-plans` | Submit a repayment plan; the principal and rate snapshots are version-pinned at submission | Borrower, Servicer |
+| GET | `/private-student-loans/loans/{id}/repayment-plans` | List a loan's repayment plans | Borrower, Servicer, Underwriter |
+| POST | `/private-student-loans/repayment-plans/{id}/approve` | Activate a pending repayment plan, superseding any plan already ACTIVE | Servicer |
+| POST | `/private-student-loans/repayment-plans/{id}/decline` | Decline a pending repayment plan | Servicer |
+| POST | `/private-student-loans/loans/{id}/payment-schedule` | Generate the SCHEDULED payment rows for the loan's active plan term | Servicer |
+| POST | `/private-student-loans/loans/{id}/payments` | Record a payment against a due period; PAID_ON_TIME or PAID_LATE is derived from the payment date versus the period's due date plus the product notice threshold | Borrower, Servicer |
+| GET | `/private-student-loans/loans/{id}/payments` | List a loan's payments | Borrower, Cosigner, Servicer |
+| GET | `/private-student-loans/payments/{id}` | Read a payment | Borrower, Servicer |
+| POST | `/private-student-loans/payments/{id}/reverse` | Reverse a settled payment as a compensating action | Servicer |
+| POST | `/private-student-loans/loans/{id}/disbursements` | Schedule a disbursement for an academic period | Servicer |
+| GET | `/private-student-loans/loans/{id}/disbursements` | List a loan's disbursements | Borrower, School, Servicer, Underwriter |
+| GET | `/private-student-loans/disbursements/{id}` | Read a disbursement | Borrower, School, Servicer |
+| POST | `/private-student-loans/disbursements/{id}/release` | Release scheduled funds to the school; the first release moves the loan APPROVED -> IN_SCHOOL | Servicer |
+| DELETE | `/private-student-loans/disbursements/{id}` | Cancel a scheduled disbursement | Servicer |
+| POST | `/private-student-loans/disbursements/{id}/reschedule` | Re-schedule a failed disbursement for a fresh date | Servicer |
+| POST | `/private-student-loans/disbursements/{id}/school-refund` | Record the school's return of an over-disbursement, crediting the remainder back against the loan | School |
+| POST | `/private-student-loans/loans/{id}/forbearances` | Request and grant private-loan deferment or forbearance relief | Servicer, Borrower |
+| GET | `/private-student-loans/loans/{id}/forbearances` | List a loan's relief records | Borrower, Servicer |
+| GET | `/private-student-loans/forbearances/{id}` | Read a relief record | Borrower, Servicer |
+| POST | `/private-student-loans/loans/{id}/forbearances/{fid}/cancel` | Cancel a granted relief that has not yet started, restoring the prior loan status | Servicer |
+| POST | `/private-student-loans/loans/{id}/cure` | Cure a delinquent loan back to repayment once every missed period has been superseded | Servicer |
+| POST | `/private-student-loans/loans/{id}/declare-default` | Declare the loan in default once arrears reach the product threshold; notifies the cosigner | Servicer |
+| POST | `/private-student-loans/loans/{id}/rehabilitate` | Rehabilitate a defaulted loan back into repayment | Servicer |
+| GET | `/private-student-loans/loans/{id}/summary` | Computed read: balance, accrual, delinquency and release-eligibility roll-up | Borrower, Cosigner, Servicer, Underwriter |
+| POST | `/private-student-loans/loans/{id}/cosigner-release-applications` | File a cosigner release application, freezing the borrower's on-time payment run as of submission | Borrower, Cosigner |
+| GET | `/private-student-loans/loans/{id}/cosigner-release-applications` | List a loan's cosigner release applications | Borrower, Cosigner, Underwriter, Servicer |
+| GET | `/private-student-loans/cosigner-release-applications/{id}` | Read a cosigner release application | Borrower, Cosigner, Underwriter, Servicer |
+| POST | `/private-student-loans/cosigner-release-applications/{id}/decision` | Decide the independent re-underwriting for a cosigner release | Underwriter |
+| POST | `/private-student-loans/cosigner-release-applications/{id}/reapply` | Re-present a declined cosigner release application after the payment run rebuilds | Borrower |
+| POST | `/private-student-loans/cosigner-release-applications/{id}/withdraw` | Withdraw a cosigner release application before decision | Borrower |
+| POST | `/private-student-loans/_clock/set_current_utc` | Set the logical clock. Before any call the clock reads the fixed server default 2026-09-01T00:00:00Z and never falls back to wall-clock time, so every deadline, grace window and aging rule is deterministic. | PlatformAdmin, Servicer |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_FORBIDDEN` | 403 Forbidden |
+| `ERR_BORROWER_NOT_FOUND` | 404 Not Found |
+| `ERR_COSIGNER_NOT_FOUND` | 404 Not Found |
+| `ERR_SCHOOL_NOT_FOUND` | 404 Not Found |
+| `ERR_POLICY_NOT_FOUND` | 404 Not Found |
+| `ERR_APPLICATION_NOT_FOUND` | 404 Not Found |
+| `ERR_LOAN_NOT_FOUND` | 404 Not Found |
+| `ERR_CERTIFICATION_NOT_FOUND` | 404 Not Found |
+| `ERR_LOAN_CHILD_NOT_FOUND` | 404 Not Found |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_INVALID_CLOCK` | 400 Bad Request |
+| `ERR_INVALID_STATE` | 409 Conflict |
+| `ERR_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_SCHOOL_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_CERTIFICATION_PERIOD_CONFLICT` | 409 Conflict |
+| `ERR_DISBURSEMENT_BLOCKED` | 409 Conflict |
+| `ERR_DISBURSEMENT_WINDOW_OVERLAP` | 409 Conflict |
+| `ERR_FORBEARANCE_OVERLAP` | 409 Conflict |
+| `ERR_PLAN_REQUIRED` | 409 Conflict |
+| `ERR_COSIGNER_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_CREDIT_DECLINED` | 422 Unprocessable Entity |
+| `ERR_AMOUNT_OUT_OF_RANGE` | 422 Unprocessable Entity |
+| `ERR_CERTIFICATION_LIMIT_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_DISBURSEMENT_OVER_CERTIFIED` | 422 Unprocessable Entity |
+| `ERR_DEFERMENT_CAP_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_PRODUCT_RULE_UNSUPPORTED` | 422 Unprocessable Entity |
+| `ERR_RELEASE_RUN_INSUFFICIENT` | 422 Unprocessable Entity |
+| `ERR_RELEASE_UNDERWRITING_FAILED` | 422 Unprocessable Entity |
+| `ERR_COSIGNER_NOT_ELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_NOTICE_OBLIGATION_PENDING` | 409 Conflict |
+| `ERR_LOAN_DELINQUENT` | 422 Unprocessable Entity |
+| `ERR_DEFAULT_THRESHOLD_NOT_MET` | 422 Unprocessable Entity |

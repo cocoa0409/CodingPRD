@@ -1,0 +1,113 @@
+"""Error catalog for the Community Center Membership API.
+
+Every error identifier the PRD declares, together with the HTTP status each one
+must be returned with. Registering the mapping with the shared validators lets
+``validate_error`` cross-check the status automatically, so a test only has to
+name the identifier it expects.
+"""
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    """Declared error identifiers, grouped by the validation tier that emits them."""
+
+    # Tier 1-2: credentials and role authorization.
+    UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    UNAUTHORIZED = "ERR_UNAUTHORIZED"
+
+    # Tier 3: path-identifier existence.
+    NOT_FOUND = "ERR_NOT_FOUND"
+
+    # Tier 4: body foreign-key resolution.
+    BRANCH_NOT_FOUND = "ERR_BRANCH_NOT_FOUND"
+    MEMBER_NOT_FOUND = "ERR_MEMBER_NOT_FOUND"
+    CATEGORY_NOT_FOUND = "ERR_CATEGORY_NOT_FOUND"
+    SPACE_NOT_FOUND = "ERR_SPACE_NOT_FOUND"
+    SESSION_NOT_FOUND = "ERR_SESSION_NOT_FOUND"
+    APPLICATION_NOT_FOUND = "ERR_APPLICATION_NOT_FOUND"
+
+    # Tier 5: state legality.
+    INVALID_STATE = "ERR_INVALID_STATE"
+    CAMPAIGN_NOT_ACTIVE = "ERR_CAMPAIGN_NOT_ACTIVE"
+    ALREADY_TERMINAL = "ERR_ALREADY_TERMINAL"
+
+    # Tier 6: request schema and composition.
+    INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    DOCUMENTATION_MISSING = "ERR_DOCUMENTATION_MISSING"
+    HOUSEHOLD_CAP_EXCEEDED = "ERR_HOUSEHOLD_CAP_EXCEEDED"
+    TIME_RANGE_INVALID = "ERR_TIME_RANGE_INVALID"
+
+    # Tier 7: childcare licensing-ratio safety.
+    RATIO_CAPACITY_EXCEEDED = "ERR_RATIO_CAPACITY_EXCEEDED"
+
+    # Tier 8: temporal-window rules.
+    REGISTRATION_WINDOW_CLOSED = "ERR_REGISTRATION_WINDOW_CLOSED"
+    MEMBER_PRIORITY_ONLY = "ERR_MEMBER_PRIORITY_ONLY"
+    HOLD_WINDOW_INVALID = "ERR_HOLD_WINDOW_INVALID"
+    PARTICIPANT_AGE_INVALID = "ERR_PARTICIPANT_AGE_INVALID"
+    MEMBER_ONLY_PROGRAM = "ERR_MEMBER_ONLY_PROGRAM"
+
+    # Tier 9: capacity and uniqueness.
+    SESSION_FULL = "ERR_SESSION_FULL"
+    SPACE_CONFLICT = "ERR_SPACE_CONFLICT"
+    DUPLICATE_ACTIVE_AWARD = "ERR_DUPLICATE_ACTIVE_AWARD"
+    CAMPAIGN_ALREADY_ACTIVE = "ERR_CAMPAIGN_ALREADY_ACTIVE"
+    DUPLICATE_DRAFT = "ERR_DUPLICATE_DRAFT"
+    DUPLICATE_EMAIL = "ERR_DUPLICATE_EMAIL"
+    DUPLICATE_BRANCH_CODE = "ERR_DUPLICATE_BRANCH_CODE"
+
+    # Tier 10: fiscal limits.
+    POOL_EXHAUSTED = "ERR_POOL_EXHAUSTED"
+    POOL_WOULD_GO_NEGATIVE = "ERR_POOL_WOULD_GO_NEGATIVE"
+    AWARD_INELIGIBLE = "ERR_AWARD_INELIGIBLE"
+    HOLD_ALLOWANCE_EXCEEDED = "ERR_HOLD_ALLOWANCE_EXCEEDED"
+    REINSTATE_WINDOW_PASSED = "ERR_REINSTATE_WINDOW_PASSED"
+
+    # Tier 11: optimistic concurrency.
+    STALE_VERSION = "ERR_STALE_VERSION"
+
+
+# error_id -> HTTP status, exactly as the PRD's error catalogue declares it.
+HTTP_STATUS_CODES: dict[str, int] = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_NOT_FOUND": 404,
+    "ERR_BRANCH_NOT_FOUND": 404,
+    "ERR_MEMBER_NOT_FOUND": 404,
+    "ERR_CATEGORY_NOT_FOUND": 404,
+    "ERR_SPACE_NOT_FOUND": 404,
+    "ERR_SESSION_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_DUPLICATE_EMAIL": 409,
+    "ERR_DUPLICATE_BRANCH_CODE": 409,
+    "ERR_DUPLICATE_DRAFT": 409,
+    "ERR_DUPLICATE_ACTIVE_AWARD": 409,
+    "ERR_CAMPAIGN_ALREADY_ACTIVE": 409,
+    "ERR_CAMPAIGN_NOT_ACTIVE": 409,
+    "ERR_HOUSEHOLD_CAP_EXCEEDED": 409,
+    "ERR_DOCUMENTATION_MISSING": 400,
+    "ERR_AWARD_INELIGIBLE": 409,
+    "ERR_POOL_EXHAUSTED": 409,
+    "ERR_POOL_WOULD_GO_NEGATIVE": 409,
+    "ERR_HOLD_WINDOW_INVALID": 409,
+    "ERR_HOLD_ALLOWANCE_EXCEEDED": 409,
+    "ERR_REINSTATE_WINDOW_PASSED": 409,
+    "ERR_REGISTRATION_WINDOW_CLOSED": 409,
+    "ERR_MEMBER_PRIORITY_ONLY": 409,
+    "ERR_MEMBER_ONLY_PROGRAM": 409,
+    "ERR_SESSION_FULL": 409,
+    "ERR_RATIO_CAPACITY_EXCEEDED": 409,
+    "ERR_TIME_RANGE_INVALID": 400,
+    "ERR_SPACE_CONFLICT": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_PARTICIPANT_AGE_INVALID": 409,
+}
+
+# Hand the mapping to the shared validators once, at import time.
+set_error_http_status_map(HTTP_STATUS_CODES)

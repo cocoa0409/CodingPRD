@@ -1,0 +1,172 @@
+"""Shared error type and constants.
+
+Nothing here holds entity data; the store lives in ``store.py`` and starts empty.
+"""
+
+
+class ApiError(Exception):
+    """An API failure carrying the PRD's error identifier and HTTP status."""
+
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+# --- §2.2 response envelope -------------------------------------------------
+RESPONSE_META = "meta"
+RESPONSE_TYPE = "response_type"
+RESPONSE_DATA = "data"
+META_REQUEST_ID = "api_request_id"
+META_REQUEST_TIMESTAMP = "api_request_timestamp"
+
+# --- §2.3 pagination --------------------------------------------------------
+PAGINATION_FIELDS = ("limit", "offset", "total_count", "has_more")
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+PAGINATION_DEFAULT_OFFSET = 0
+
+# --- §2.1 auth --------------------------------------------------------------
+HEADER_USER_ID = "X-User-ID"
+HEADER_USER_ROLE = "X-User-Role"
+
+ROLE_CUSTOMER = "Customer"
+ROLE_SUPPLIER = "Supplier"
+ROLE_FULFILLMENT_OPERATOR = "FulfillmentOperator"
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+ROLE_ANONYMOUS = "Anonymous"
+
+RECOGNIZED_ROLES = (
+    ROLE_CUSTOMER,
+    ROLE_SUPPLIER,
+    ROLE_FULFILLMENT_OPERATOR,
+    ROLE_PLATFORM_ADMIN,
+    ROLE_ANONYMOUS,
+)
+
+# --- §2.4 logical clock -----------------------------------------------------
+DEFAULT_LOGICAL_CLOCK = "2026-09-01T00:00:00.000Z"
+
+# --- enums (§1.1) -----------------------------------------------------------
+REGIONS = ("NE", "MW", "SO", "WE")
+CATEGORIES = ("FRUIT", "VEGETABLE", "DAIRY", "BAKERY", "PANTRY", "BEVERAGE")
+PROCUREMENT_GRADES = ("OFF_SPEC", "SURPLUS", "SHORT_DATED", "COSMETIC")
+INSULATION_PROFILES = ("LIGHT", "MEDIUM", "HEAVY")
+FORWARD_POSTURES = ("OPEN", "CONSTRAINED", "DEGRADED")
+LOT_STATUSES = ("QUOTED", "AWARDED", "READY", "COMMITTED", "DEPLETED", "EXPIRED")
+LOT_QUALITY_STATUSES = ("PENDING_INSPECTION", "PASS", "INVESTIGATION", "REJECTED")
+BID_STATUSES = ("PENDING", "SHORTLISTED", "SELECTED", "NOT_SELECTED", "WITHDRAWN")
+SUBSTANTIATION_STATUSES = ("UNSUBSTANTIATED", "SUBSTANTIATED")
+BOX_STATUSES = (
+    "DRAFT",
+    "AWAITING_WINDOW",
+    "READY_TO_BUILD",
+    "BUILDING",
+    "REROUTED",
+    "CRASHED",
+    "PACKED",
+    "SHIPPED",
+)
+PRICING_STATUSES = ("UNPRICED", "PRICED", "REVISED")
+CUISINE_PREFERENCES = (
+    "STANDARD",
+    "FRUIT_FORWARD",
+    "VEGGIE_FORWARD",
+    "BAKERY_FORWARD",
+    "PANTRY_FORWARD",
+)
+BUILD_ITEM_TYPES = ("PREFERENCE", "FILLER", "RETAINED")
+BUILD_ITEM_STATUSES = ("INCLUDED", "REMOVED")
+CLAIM_REASON_CODES = ("SPOILED", "DAMAGED", "MISSING_ITEM", "TEMPERATURE_ABUSE")
+CLAIM_STATUSES = ("IN_REVIEW", "UNDER_REVIEW", "CLOSED", "UPHELD", "REJECTED")
+CLAIM_OUTCOMES = ("UPHELD", "REJECTED")
+SELECTION_STATUSES = ("SELECTED", "NOT_REQUIRED")
+CADENCES = ("WEEKLY", "BIWEEKLY", "MONTHLY")
+SUBSCRIPTION_STATUSES = ("ACTIVE", "SKIPPED", "AUTO_SKIPPED", "PAUSED", "CANCELLED")
+CANCELLATION_REASONS = ("CUSTOMER_REQUEST", "NONPAYMENT")
+SUPPLIER_STATUSES = ("ACTIVE", "SUSPENDED")
+RELATIONSHIP_STATUSES = ("PREFERRED", "STANDARD", "ON_WATCH", "SUSPENDED")
+
+PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+
+# --- constants pinned by §1.3 ----------------------------------------------
+GRADE_RETAIL_MULTIPLIER = {
+    "OFF_SPEC": "1.50",
+    "SURPLUS": "1.60",
+    "SHORT_DATED": "1.75",
+    "COSMETIC": "1.80",
+    "CONVENTIONAL": "1.40",
+}
+FLOOR_MULTIPLIER = {
+    "FRUIT": "1.25",
+    "VEGETABLE": "1.25",
+    "DAIRY": "1.20",
+    "BAKERY": "1.35",
+    "PANTRY": "1.30",
+    "BEVERAGE": "1.30",
+}
+MIN_BILLING_WEIGHT_GRAMS = {
+    "FRUIT": 120,
+    "VEGETABLE": 120,
+    "DAIRY": 150,
+    "BAKERY": 200,
+    "PANTRY": 100,
+    "BEVERAGE": 300,
+}
+COLD_CHAIN_CATEGORIES = ("FRUIT", "VEGETABLE", "DAIRY")
+COLD_PACKAGING_ALLOWANCE_GRAMS = 250
+LANE_TRANSIT_DAYS = {"NE": 2, "MW": 3, "SO": 3, "WE": 4}
+COLD_WEIGHT_REQUIRED_GRAMS = 1200
+INSULATED_TRANSIT_MIN_DAYS = 3
+COOLANT_UNIT_DIVISOR = 1500
+WARM_LANE_REGIONS = ("WE", "SO")
+
+CUTOFF_LEAD_HOURS = {"NE": 36, "MW": 48, "SO": 48, "WE": 60}
+BUILD_WINDOW_HOURS = 72
+HOURS_PER_CYCLE = {"WEEKLY": 168, "BIWEEKLY": 336, "MONTHLY": 720}
+
+MIN_UNITS_PER_LINE = 2
+MAX_LINES_PER_BOX = 6
+BOX_UNIT_TARGET = 10
+PREFERENCE_RATIO = "0.60"
+FILLER_RATIO = "0.20"
+SERVICE_FEE_CENTS = 599
+TAX_RATE = "0.05"
+ORDER_DISCOUNT_GATE_CENTS = 5000
+ORDER_DISCOUNT_RATE = "0.10"
+
+PLACEHOLDER_BASE_NEED_GRAMS = {
+    "FRUIT": 1200,
+    "VEGETABLE": 1200,
+    "DAIRY": 900,
+    "BAKERY": 800,
+    "PANTRY": 600,
+    "BEVERAGE": 2400,
+}
+SHORTFALL_RATE = "0.10"
+
+FLAT_UNIT_CREDIT_CENTS = {
+    "SPOILED": 300,
+    "DAMAGED": 350,
+    "MISSING_ITEM": 300,
+    "TEMPERATURE_ABUSE": 400,
+}
+GRADE_MULTIPLIER = {
+    "OFF_SPEC": "1.00",
+    "SURPLUS": "1.00",
+    "SHORT_DATED": "1.10",
+    "COSMETIC": "1.15",
+}
+PER_CLAIM_GRACE_CENTS = 200
+CLAIM_WINDOW_DAYS = 7
+CLAIM_WINDOW_DAYS_ESCALATION = 7
+
+GRADE_SCORE_WEIGHTS = ("0.40", "0.40", "0.20")
+PREFERRED_FLOOR_BP = 9000
+STANDARD_FLOOR_BP = 7500
+ON_WATCH_FLOOR_BP = 6000
+
+SUBSTANTIATION_MAX_SOURCES = 3
+MAX_PAUSE_HOPS = 4

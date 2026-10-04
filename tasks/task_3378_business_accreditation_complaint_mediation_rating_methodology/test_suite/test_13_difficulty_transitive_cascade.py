@@ -1,0 +1,192 @@
+"""Difficulty queue — transitive cascades: the daily-close complaint expiry
+cascading through counters, provisional rating and the suspension scan
+(PRD §2.4, §3.4, §3.7), and the advertising-referral cascade rewriting the
+business's compliance status and provisional rating (PRD §3.8, §3.6)."""
+
+from test_helpers import (
+    ApiErrorId,
+    CLOCK_START_ISO,
+    TEST_USERS,
+    business_respond,
+    conclude_review_deceptive_payload,
+    consumer_reject,
+    create_advertising_review_payload,
+    create_bureau,
+    create_business,
+    create_consumer,
+    create_rating_snapshot_payload,
+    file_and_forward_complaint,
+    get_business,
+    get_complaint,
+    open_advertising_review,
+    run_daily_close,
+    set_clock,
+    setup_accredited_business,
+    setup_world,
+    validate_paginated,
+    validate_success,
+)
+
+ADMIN = TEST_USERS["bureau_admin_headers"]
+REVIEWER = TEST_USERS["standards_reviewer_headers"]
+
+
+def _setup_accredited_medium_with_history(api):
+    """ACCREDITED MEDIUM business; c1/c2 UNRESOLVED, c3 UNANSWERED via the
+    2026-09-16 sweep; a PUBLISHED 72 already on record; c4 FORWARDED with a
+    2026-09-30 deadline and the clock advanced to 2026-10-01."""
+    world = setup_world(business_overrides={
+        "legal_name": "MidSize Manufacturing LLC", "employee_count": 50,
+        "founded_on": "2020-01-01T00:00:00Z"})
+    bureau, consumer = world["bureau"], world["consumer"]
+    business = setup_accredited_business(world=world)["business"]
+    c1 = file_and_forward_complaint(consumer, business, category="SERVICE",
+                                    description="c1 reject-bound")
+    c1 = business_respond(c1, business, body="answer 1")
+    consumer_reject(c1, consumer, body="no")
+    c2 = file_and_forward_complaint(consumer, business, category="SERVICE",
+                                    description="c2 reject-bound")
+    c2 = business_respond(c2, business, body="answer 2")
+    consumer_reject(c2, consumer, body="no")
+    c3 = file_and_forward_complaint(consumer, business, category="DELIVERY",
+                                    description="c3 expires")
+    set_clock("2026-09-16T00:00:00Z")
+    run_daily_close(bureau["id"])
+    resp = api.create_rating_snapshot(
+        business["id"], create_rating_snapshot_payload("PUBLISHED"), ADMIN)
+    published_72 = validate_success(resp, 201)
+    c4 = file_and_forward_complaint(consumer, business, category="DELIVERY",
+                                    description="c4 expires")
+    set_clock("2026-10-01T00:00:00Z")
+    return bureau, consumer, business, c3, c4, published_72
+
+
+class TestSweepTimeoutCascade:
+    def test_expiry_cascades_complaint_to_counters(self, api):
+        """PRD §3.4: "When the daily close finds a `FORWARDED` complaint whose
+        deadline has passed, it closes the complaint as `UNANSWERED`:
+        `resolution_outcome` becomes `AUTO_UNANSWERED`, `closed_at` is
+        stamped, `complaints_unanswered_36m` rises by 1,
+        `complaints_open_count` drops by 1, `complaints_closed_count` rises by
+        1, the trailing counters recompute, and the provisional rating
+        regenerates."
+
+        Design: Difficulty/transitive_cascade/sweep_timeout_cascade_complaint_to_counters_to_snapshot_to_suspension
+        """
+        bureau, _consumer, business, _c3, c4, _pub = \
+            _setup_accredited_medium_with_history(api)
+        run_daily_close(bureau["id"])
+        c4_after = get_complaint(c4["id"])
+        assert c4_after["status"] == "UNANSWERED"
+        assert c4_after["resolution_outcome"] == "AUTO_UNANSWERED"
+        mirror = get_business(business["id"])
+        # c3 and c4 UNANSWERED; c1/c2 UNRESOLVED (open states).
+        assert mirror["complaints_unanswered_36m"] == 2
+        assert mirror["complaints_received_36m"] == 4
+        assert mirror["complaints_open_count"] == 2
+        assert mirror["complaints_closed_count"] == 2
+
+    def test_cascade_regenerates_provisional_and_suspends(self, api):
+        """PRD §3.6: "the system regenerates a `PROVISIONAL` snapshot
+        automatically whenever any of the business's complaint counters, its
+        `advertising_compliance_status`, or its `published_scam_count_12m`
+        changes"
+        PRD §3.7: "An `ACCREDITED` business whose latest published score is
+        below 75 is suspended: `accreditation_status` becomes `SUSPENDED`,
+        `suspension_count_24m` increments by 1, `last_suspension_at` is
+        stamped, and the business's `version` increments by 1."
+
+        Design: Difficulty/transitive_cascade/sweep_timeout_cascade_complaint_to_counters_to_snapshot_to_suspension
+        """
+        bureau, _consumer, business, _c3, _c4, published_72 = \
+            _setup_accredited_medium_with_history(api)
+        assert published_72["score"] == 72  # 12 unanswered + 16 unresolved
+        run_daily_close(bureau["id"])
+        mirror = get_business(business["id"])
+        # Provisional regenerated by the sweep: 24 unanswered + 16 unresolved.
+        assert mirror["current_provisional_score"] == 60
+        assert mirror["current_provisional_grade"] == "C_MINUS"
+        # The scan reads the previously published 72 (< 75): first suspension.
+        assert mirror["accreditation_status"] == "SUSPENDED"
+        assert mirror["suspension_count_24m"] == 1
+        assert mirror["current_published_score"] == 72, \
+            "the cascade must not rewrite the already-published record"
+
+
+def _setup_unanswered_small_business():
+    """SMALL business with a single complaint expired to UNANSWERED at the
+    2026-09-16 sweep (provisional 88)."""
+    set_clock(CLOCK_START_ISO)
+    bureau = create_bureau(name="Heartland Bureau",
+                           territory_state_codes=["IA", "NE"],
+                           local_dues_fee_cents=0)
+    consumer = create_consumer(full_name="Pat Consumer",
+                               email="pat@example.com", home_state_code="IA")
+    business = create_business(legal_name="Small Fry Marketing Co",
+                               home_state_code="IA", employee_count=10,
+                               founded_on="2020-01-01T00:00:00Z")
+    file_and_forward_complaint(consumer, business, category="SERVICE",
+                               description="never answered")
+    set_clock("2026-09-16T00:00:00Z")
+    run_daily_close(bureau["id"])
+    return bureau, consumer, business
+
+
+class TestAdReferralCascade:
+    def test_deceptive_conclusion_rewrites_review_and_business(self, api):
+        """PRD §3.8: "An `outcome` of `SUBSTANTIATED_DECEPTIVE` requires a
+        `regulator_name` in the payload, and omitting it is rejected with
+        `ERR_INVALID_REQUEST`: the review closes as `REFERRED_TO_REGULATOR`
+        with both `concluded_at` and `referred_at` stamped at the conclusion
+        instant, the `regulator_name` persisted, and the business's
+        `advertising_compliance_status` set to `REFERRED_TO_REGULATOR`."
+
+        Design: Difficulty/transitive_cascade/ad_referral_cascade_rewrites_business_status_and_provisional_rating
+        """
+        _bureau, _consumer, business = _setup_unanswered_small_business()
+        review = open_advertising_review(
+            business, claim_description="guaranteed weight loss claim")
+        resp = api.conclude_advertising_review(
+            review["id"],
+            conclude_review_deceptive_payload(regulator_name="FTC"),
+            REVIEWER)
+        concluded = validate_success(resp, 200)
+        assert concluded["status"] == "REFERRED_TO_REGULATOR"
+        assert concluded["regulator_name"] == "FTC"
+        assert concluded["referred_at"] == concluded["concluded_at"]
+        mirror = get_business(business["id"])
+        assert mirror["advertising_compliance_status"] == \
+            "REFERRED_TO_REGULATOR"
+
+    def test_referral_regenerates_provisional_rating(self, api):
+        """PRD §3.6: "`advertising_deduction` is 15 points while the
+        business's `advertising_compliance_status` is `REFERRED_TO_REGULATOR`,
+        5 points while it is `UNDER_AD_REVIEW`, and 0 points while it is
+        `CLEAR`."
+        PRD §3.6: "the system regenerates a `PROVISIONAL` snapshot
+        automatically whenever any of the business's complaint counters, its
+        `advertising_compliance_status`, or its `published_scam_count_12m`
+        changes"
+
+        Design: Difficulty/transitive_cascade/ad_referral_cascade_rewrites_business_status_and_provisional_rating
+        """
+        _bureau, _consumer, business = _setup_unanswered_small_business()
+        before = get_business(business["id"])
+        assert before["current_provisional_score"] == 88, \
+            "one UNANSWERED complaint: 100 - 12"
+        review = open_advertising_review(
+            business, claim_description="guaranteed weight loss claim")
+        validate_success(api.conclude_advertising_review(
+            review["id"],
+            conclude_review_deceptive_payload(regulator_name="FTC"),
+            REVIEWER), 200)
+        after = get_business(business["id"])
+        # unanswered 12 + advertising 15 = 27 deductions.
+        assert after["current_provisional_score"] == 73
+        assert after["current_provisional_grade"] == "C_PLUS"
+        rows, _meta = validate_paginated(api.list_rating_snapshots(
+            business["id"], ADMIN, params={"variant": "PROVISIONAL"}))
+        assert any(s["advertising_deduction"] == 15
+                   and s["unanswered_deduction"] == 12
+                   and s["score"] == 73 for s in rows), \
+            "a PROVISIONAL snapshot with the referral deductions must exist"

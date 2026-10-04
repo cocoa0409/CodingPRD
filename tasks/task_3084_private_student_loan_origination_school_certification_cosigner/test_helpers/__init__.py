@@ -1,0 +1,92 @@
+"""Barrel export: framework generics + PRD-specific infrastructure."""
+# Framework generics (re-exported for convenience)
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+# PRD-specific
+from .api_client import ApiClient, api_client
+from .api_errors import (
+    ERR_AMOUNT_OUT_OF_RANGE,
+    ERR_APPLICATION_NOT_FOUND,
+    ERR_BORROWER_NOT_FOUND,
+    ERR_CERTIFICATION_LIMIT_EXCEEDED,
+    ERR_CERTIFICATION_NOT_FOUND,
+    ERR_CERTIFICATION_PERIOD_CONFLICT,
+    ERR_COSIGNER_NOT_ELIGIBLE,
+    ERR_COSIGNER_NOT_FOUND,
+    ERR_COSIGNER_REQUIRED,
+    ERR_CREDIT_DECLINED,
+    ERR_DEFAULT_THRESHOLD_NOT_MET,
+    ERR_DEFERMENT_CAP_EXCEEDED,
+    ERR_DISBURSEMENT_BLOCKED,
+    ERR_DISBURSEMENT_OVER_CERTIFIED,
+    ERR_DISBURSEMENT_WINDOW_OVERLAP,
+    ERR_FORBEARANCE_OVERLAP,
+    ERR_FORBIDDEN,
+    ERR_INVALID_CLOCK,
+    ERR_INVALID_REQUEST,
+    ERR_INVALID_STATE,
+    ERR_LOAN_CHILD_NOT_FOUND,
+    ERR_LOAN_DELINQUENT,
+    ERR_LOAN_NOT_FOUND,
+    ERR_NOTICE_OBLIGATION_PENDING,
+    ERR_PLAN_REQUIRED,
+    ERR_POLICY_NOT_FOUND,
+    ERR_PRODUCT_RULE_UNSUPPORTED,
+    ERR_RELEASE_RUN_INSUFFICIENT,
+    ERR_RELEASE_UNDERWRITING_FAILED,
+    ERR_SCHOOL_CAPACITY_EXCEEDED,
+    ERR_SCHOOL_NOT_FOUND,
+    ERR_STALE_VERSION,
+    ERR_UNAUTHENTICATED,
+    HTTP_STATUS_CODES,
+    ApiErrorId,
+)
+from .assertions import (
+    assert_accrual_entry,
+    assert_application,
+    assert_borrower,
+    assert_capitalized_within_cap,
+    assert_certification,
+    assert_cosigner,
+    assert_disbursement,
+    assert_forbearance,
+    assert_headroom_non_negative,
+    assert_loan,
+    assert_loan_invariants,
+    assert_payment,
+    assert_policy,
+    assert_rate_is_margin_or_reduced,
+    assert_release_application,
+    assert_repayment_plan,
+    assert_school,
+)
+from .constants import *  # noqa: F401,F403
+from .factories import *  # noqa: F401,F403
+from .fixtures import *  # noqa: F401,F403
+from .test_users import (
+    TEST_USERS,
+    make_admin_headers,
+    make_borrower_headers,
+    make_cosigner_headers,
+    make_school_headers,
+    make_servicer_headers,
+    make_underwriter_headers,
+)
+from .types import *  # noqa: F401,F403

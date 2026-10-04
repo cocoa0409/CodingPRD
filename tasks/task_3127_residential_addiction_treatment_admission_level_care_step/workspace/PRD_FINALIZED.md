@@ -1,0 +1,501 @@
+# Residential Addiction Treatment Stepdown API — Product Requirements Document
+
+## 1. Introduction
+
+Residential addiction treatment is one of the last clinical settings where a facility, a payer, a state licensure body and a patient's own physiology all hold a veto over the same decision. A patient cannot be admitted because a bed is not clean, or because a tuberculosis screen lapsed on the minute, or because the payer authorized ten days at a level the facility's licence does not cover, or because the medical director who wants to sign the plan is the same person who already worked the utilization file. This document specifies the API surface that a treatment network uses to hold those constraints together — one network, many facilities, each facility carrying its own beds, its own accreditations, its own credentialed clinicians, and its own recovery-housing stock.
+
+The system is organized around the **treatment episode**: a single patient's journey from intake, through standardized clinical assessment, payer authorization, medical clearance, admission, active treatment, one or more level-of-care changes, completion, discharge and post-discharge alumni follow-up. Every step of that journey is gated by an explicit, checkable condition, and the network exposes the whole thing as a REST surface mounted under `/treatment-network`.
+
+Two properties make this domain harder than a typical clinical workflow. First, level of care is not a label but a *funding construct*: payers grant a number of days at a level, watch those days burn down, demand concurrent reviews and start pushing the patient toward cheaper levels the moment the pressure crosses a threshold. Second, facilities are themselves *regulated objects*. Accreditation rows expire, get suspended, get revoked; when they do, the facility's maximum deliverable level, its licensing flag, its admission posture and the funding of every authorization it holds all shift at once. The API must make both of those dynamics first-class, observable and reproducible.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the network must carry two headers: `X-User-ID`, which identifies the acting user, and `X-User-Role`, which names the capacity in which that user is acting. A request missing either header, or carrying an `X-User-Role` that does not name one of the roles declared below, is rejected with `ERR_MISSING_USER_CONTEXT_HEADER`. A request whose role is not permitted on the targeted operation, or whose `X-User-ID` fails to resolve where the role demands a persisted identity, is rejected with `ERR_INSUFFICIENT_PERMISSIONS`.
+
+The network declares seven roles: `PlatformAdmin`, `ClinicalDirector`, `UtilizationReviewer`, `AdmissionsIntakeNurse`, `Clinician`, `AlumniCoordinator` and `Any`.
+
+Most roles act as opaque operators. When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it where a workflow writes an operator reference but does not compare it to any entity's `id`. The same is true for `ClinicalDirector`, for `UtilizationReviewer`, for `AdmissionsIntakeNurse` and for `AlumniCoordinator`, and also for the read-only role `Any`. The single exception is `Clinician`. When `X-User-Role` is `Clinician`, `X-User-ID` is the `id` of the acting `Clinician`; ownership checks on any resource that references a `Clinician` — an assessment's assessor, a plan's author, a session's running clinician, a credential's holder — compare that resource's foreign-key field to `X-User-ID`.
+
+`PlatformAdmin` is the network operator: it creates facilities, clinicians, payers, beds, service offerings, recovery housing and accreditations, and it drives both the logical clock and the facility-ops epoch. `AdmissionsIntakeNurse` opens episodes, starts assessments, orders clearances and performs the admission itself. `Clinician` (entity-backed, as above) authors the withdrawal-management record, completes and cancels assessments, drafts treatment plans and schedules sessions. `UtilizationReviewer` is the payer-facing role: it requests authorizations and approves, denies or re-reviews them. `ClinicalDirector` owns the senior clinical decisions — co-signing plans, appointing and completing level-of-care changes, completing treatment, discharging, and managing accreditation status. `AlumniCoordinator` files post-discharge outcome contacts. `Any` covers the read surface only and is granted no write operation at all.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept a `limit` query parameter that caps the number of rows returned, and an `offset` query parameter that skips a number of leading rows. `limit` defaults to 10, may not be lower than 1, and may not exceed 100. `offset` defaults to 0. Unless an endpoint states otherwise, list results are ordered by creation timestamp ascending. Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope.
+
+### 2.4. Common Resource Properties and the Optimistic Concurrency Gate
+
+Every resource in this network is addressable. All fourteen persisted entity types — `Facility`, `Bed`, `Clinician`, `ClinicianFacilityCredential`, `ServiceOffering`, `Payer`, `TreatmentEpisode`, `ClinicalAssessment`, `LevelOfCareAuthorization`, `MedicalClearance`, `WithdrawalManagementPlan`, `TreatmentPlan`, `SessionAttendance`, `LevelOfCareChange`, `ContinuingCarePlan`, `RecoveryHousing`, `AlumniContact` and `Accreditation` — carry the common fields described here; none of them opts out.
+
+- `id` is a unique, server-minted identifier formatted as a UUID string with no type prefix and no embedded meaning.
+- `created_at` is a server-stamped instant in ISO 8601 UTC with three fractional digits, recording when the row was first written.
+- `updated_at` is a server-stamped instant in the same format, refreshed on every mutation of the row.
+- `version` is a system-managed integer, starting from an initial value and incremented by one on each mutation. It exists to support the concurrency gate below.
+
+`TreatmentPlan` declares an explicit `version` field in addition to the common one; the semantics are identical.
+
+Four write operations are guarded by an optimistic-concurrency check. Each such request must carry the client's last observed version of a named parent entity, as a non-optional body field, and the value must equal that parent's current `version` at the moment the request is processed. A mismatch is rejected with `ERR_STALE_VERSION` and HTTP 412.
+
+- Drafting a new treatment plan for an episode requires `expected_treatment_episode_version`, carrying the client's last observed `version` of the target `TreatmentEpisode`. A create against a stale view of the episode is refused, because a new plan legitimately supersedes the prior `ACTIVE` plan and an unguarded create would otherwise succeed against a view the client has not observed.
+- Appointing a level-of-care change for an episode requires `expected_treatment_episode_version`, again carrying the episode's observed `version`. Appointment advances the episode's `step_down_count`, so the same serialization argument applies.
+- Drafting a new continuing-care plan for an episode requires `expected_treatment_episode_version`, carrying the observed episode `version`. A new plan supersedes the prior `ACTIVE` plan at discharge-planning time, so the guard applies here for the same reason.
+- Editing an existing treatment plan requires `expected_treatment_plan_version`, carrying the client's last observed `version` of the target `TreatmentPlan` itself. A co-sign acceptance legitimately bumps the plan's version, and an unguarded edit would otherwise succeed against a view the client has not observed.
+
+No other endpoint accepts a version field. If a request supplies an `expected_*_version` on an operation outside this set, it is not part of the contract for that operation.
+
+Every child row in the hierarchy carries the `episode_id` of the episode it belongs to, and the facility-rooted children carry the corresponding facility reference; nested retrieval uses those references to place a row under exactly one parent.
+
+### 2.5. Facility Licensure, Accreditation Standing and the Clinical Credential Ladder
+
+A `Facility` is created with a display `name` and a two-letter uppercase `state_code`; the state code is what selects the licensure rule that governs the site. A facility holds a set of `Accreditation` rows. Each row has an `accreditation_class` drawn from `ACCREDITATION_BODY`, `STATE_LICENSE` and `RECOVERY_HOUSE`, a `granting_body`, an `effective_at` instant that opens its validity, an `expires_at` instant that closes it (exclusive), and a `status` from `GRANTED`, `SUSPENDED`, `REVOKED` and `EXPIRED`. A `STATE_LICENSE` row additionally carries `license_level_max`, the highest ASAM level that licence permits, and `credential_tier_min`, the lowest clinician credential tier it permits; both are null for the other two classes. A facility may hold several accreditations of the same class from distinct granting bodies. `Accreditation` rows are immutable in the sense that `effective_at` and `expires_at` move only through the renew, suspend, reinstate and revoke operations, never through a general-purpose edit.
+
+Two derived facility flags hang off that set. `licensed` is true once a `STATE_LICENSE` accreditation for the facility's own `state_code` has been `GRANTED` and has not reached `EXPIRED`. `as_level_max` records the highest ASAM level the facility is licensed to deliver and takes one of `ASAM_1_0`, `ASAM_2_1`, `ASAM_3_1`, `ASAM_3_5` or `ASAM_3_7`; it starts at `ASAM_1_0` on facility creation and is recomputed whenever a `STATE_LICENSE` row's status changes. A newly created `Facility` therefore begins with `licensed` false and `as_level_max` at `ASAM_1_0` until a state licence is recorded.
+
+Clinical authoring authority is a tiered ladder. A `Clinician` carries a display `full_name`, a `credential_tier` from `TIER_1_SUPPORT`, `TIER_2_COUNSELOR`, `TIER_3_LICENSED` and `TIER_4_INDEPENDENT`, in ascending order of authority, and an `is_medical_provider` flag that is true only for physicians and advanced practice providers permitted to author medical clearance and withdrawal-management orders. A `Clinician` acts at a facility only while holding a `ClinicianFacilityCredential` for that facility: a row with `clinician_id`, `facility_id`, an `effective_at` that opens a validity window and an `expires_at` that closes it exclusively. The credential's `status` moves between `ACTIVE` and `REVOKED`, and its derived `is_usable` flag is true only when the status is `ACTIVE` and the logical now is at or after `effective_at` and strictly before `expires_at`. A `ServiceOffering` at a facility names the `service_code` it delivers, the `level_of_care` it belongs to, the `required_min_credential_tier` a clinician must hold to run it, and a `requires_medical_provider` flag that demands a clinician whose `is_medical_provider` is true.
+
+Each facility also carries a `state_min_credential_tier`, the lowest tier the state's licensure rule permits to author clinical documents at that facility; it starts at `TIER_1_SUPPORT`. An assessor or plan author whose `credential_tier` sits below `state_min_credential_tier`, or who holds no usable facility credential at the facility, is refused with `ERR_ASSESSOR_CREDENTIAL_INSUFFICIENT`. Payers may set a stricter bar per level, but the relationship between the two bars is one-directional: a payer whose `credential_min_tier_by_loc` floor sits above the facility's own `state_min_credential_tier` renders that level unfundable at that facility, reported as `ERR_PAYER_CREDENTIAL_TIER_UNMET`.
+
+### 2.6. The Compliance Risk Ledger and Facility Posture Bands
+
+A facility tracks an integer `compliance_risk_points` total, starting at 0, that measures how far its accreditation portfolio has drifted from a clean state. The score is recomputed from scratch on every facility-ops run and on every accreditation status change, so it is a pure function of the current accreditation set and the logical clock rather than an accumulating counter.
+
+Three raw inputs feed the score. The first is the count of `Accreditation` rows at the facility whose `status` is `GRANTED` and whose `expires_at` is at or before the logical now — that is, rows that have silently lapsed but have not yet been flipped to `EXPIRED`. The second is the count of accreditation classes, drawn from `ACCREDITATION_BODY`, `STATE_LICENSE` and `RECOVERY_HOUSE`, for which the facility holds no `GRANTED` row at all. The third is an aged component: the longest elapsed span since lapse is taken across the lapsed rows, expressed in whole days by rounding the day count down toward zero, floored at 0 and defaulting to 0 when no row has lapsed; that day count is divided by 30 and rounded down, and the resulting unit count is capped at 6; each surviving unit contributes 2 points. In business terms, a facility with no lapsed rows scores nothing on the aged component, and the aged component saturates six months of drift at 12 points.
+
+The raw score is 12 points per lapsed-but-still-`GRANTED` row, plus 5 points for each accreditation class the facility is entirely missing, plus the aged component. A tier is then selected from that raw score using strictly-greater-than boundaries: the `PREMIUM` tier applies strictly above 60 raw points; the `HI` tier applies strictly above 30 and at most 60; the `MODERATE` tier applies strictly above 10 and at most 30; and the `BASE` tier applies at 10 raw points or fewer. The tier selects a single multiplier applied once to the whole raw score — 1.5 for `PREMIUM`, 1.25 for `HI`, and 1.0 for both `MODERATE` and `BASE` — never term by term. The stored `compliance_risk_points` is that product rounded half up to a whole number. A raw score of exactly 30 therefore lands `MODERATE`, exactly 60 lands `HI`, and exactly 10 lands `BASE`; the multiplier is applied to the raw score as a whole, so a facility cannot reach `PREMIUM` by accumulating many small terms.
+
+`facility_posture` is a three-way band selection over the same finalized integer, with no multiplier involved. `FROZEN` applies at 45 or more compliance risk points; `RESTRICTED` applies at 45 or more and below 60 — which is to say, at 59 or fewer; and `OPEN` applies below 45. The boundary is inclusive at 45, so a facility at exactly 45 points reads `RESTRICTED` and a facility at 44 reads `OPEN`; the boundary at 60 is likewise inclusive, so 60 reads `FROZEN` and 59 reads `RESTRICTED`. `is_accepting_admissions` is false whenever `facility_posture` is `FROZEN`, false whenever `licensed` is false, and true otherwise. A `FROZEN` facility refuses admission, discharge, level-of-care changes and session scheduling with `ERR_FACILITY_POSTURE_FROZEN`.
+
+### 2.7. Nested Resource Resolution
+
+Almost every path in this API nests an episode, a clearance, a plan or a change beneath a facility. Resolution is strict, left-to-right and short-circuiting: the server validates the facility identifier first, then the episode identifier, then any terminal child identifier, and rejects at the first identifier that does not resolve. A missing facility yields `ERR_FACILITY_NOT_FOUND`. A missing episode beneath a facility that does resolve yields `ERR_EPISODE_NOT_FOUND`. A missing terminal child yields the class-specific code: `ERR_ASSESSMENT_NOT_FOUND` for an assessment, `ERR_BED_NOT_FOUND` for a bed, `ERR_AUTHORIZATION_NOT_FOUND` for an authorization, `ERR_PLAN_NOT_FOUND` for a treatment plan, `ERR_CHANGE_NOT_FOUND` for a level-of-care change, `ERR_HOUSING_NOT_FOUND` for a recovery-housing row, `ERR_ACCREDITATION_NOT_FOUND` for an accreditation, `ERR_CONTACT_NOT_FOUND` for an alumni contact, and `ERR_SESSION_NOT_FOUND` for a session attendance. All of these are HTTP 404.
+
+Rooms, clinicians and payers named inside a request body resolve separately from the path. A body field that names a `ServiceOffering`, a `Clinician` or a `Payer` that does not exist is reported as `ERR_SERVICE_NOT_FOUND`, `ERR_CLINICIAN_NOT_FOUND` or `ERR_PAYER_NOT_FOUND` respectively; any other unresolvable id-valued body field is reported as `ERR_INVALID_REFERENCE`. That includes a reference that exists but belongs to a different facility from the one in the path. All of these are HTTP 404, and all of them are checked on create operations before any business rule runs.
+
+Request shape is validated at the same layer. A request that omits a required field, carries a field the operation does not declare, or supplies a value of the wrong type is refused with `ERR_INVALID_REQUEST`. An enum-typed field carrying a value outside its declared member set is refused with `ERR_INVALID_ENUM_VALUE`. Both codes are HTTP 400.
+
+One class of undeclared field is tolerated. A body may carry a field the server itself owns — the common `id`, `created_at`, `updated_at` and `version`, and the state, derived and stamped fields the server writes on the resource, such as a row's own `status`, a session's `attended` and `billing_amount_cents`, an episode's `clinical_status`, `care_level_status`, `step_down_count`, `therapy_revenue_cents`, `admitted_at` and `discharged_at`, a facility's derived `licensed`, `as_level_max`, `state_min_credential_tier`, `facility_posture`, `is_accepting_admissions`, `compliance_risk_points`, `ops_epoch` and `last_ops_run_at`, and an assessment's or clearance's stamps. A supplied value for any of these is never an undeclared-input refusal: the server ignores the body value and answers with the value it holds, whether or not the operation happens to list the field among the ones it acknowledges.
+
+### 2.7a. Validation Precedence
+
+When several rules could fire on one request, they are evaluated in a fixed order and the first failure is the one reported. Identity comes first: header presence and role membership are settled before anything else, and a request that fails there is never evaluated further. Segregation of duties follows immediately — a gated `ClinicalDirector` step is refused before the server even confirms that the resources named in the path exist. The concurrency checks come next, so a stale expected-version value or a colliding `Idempotency-Key` is reported ahead of any look-up. Existence checks then run in the path order described above, followed by the body-reference checks. Only after all of that do the state and posture rules run — whether the episode sits in the state the operation requires, and whether the relevant child row sits in the status the operation requires. Facility safety rules follow: licensure, accreditation standing, frozen posture and the two credential floors. The business constraints close out the sequence — bed and housing window disjointness, the step-down and change-per-payer ceilings, the level-route and coverage-map rules, the alumni-interval and housing-window shape rules, and finally the fiscal rules. A request that would violate several rules is therefore reported against the earliest one in this sequence.
+
+### 2.8. The Authorization Day Bank and Concurrent-Review Cadence
+
+A `LevelOfCareAuthorization` records two numbers that move in opposite directions: `authorized_days`, the total days granted for the current authorization period, and `days_used`, the whole days of residential (`ASAM_3_x`) care consumed inside that period. `days_remaining` is `authorized_days` minus `days_used` and never goes negative. `concurrent_review_count` counts completed reviews for the authorization and starts at 0.
+
+The bank is burned by the facility-ops cycle, not by wall time. On each ops run, for every authorization whose `posture` is one of `APPROVED`, `CONCURRENT_REVIEW_DUE`, `EXTENDED` or `STEP_DOWN_REQUIRED`, the burn interval is the half-open span running from the later of the facility's *previous* ops-run instant and the episode's `admitted_at`, up to the logical now. The previous ops-run instant is the value `last_ops_run_at` held before this run restamped it, so a run always burns forward from the instant the previous run closed rather than reading the stamp it has just written. On a facility's first run there is no previous instant and the span therefore begins at the episode's admission instant; when neither instant exists the span is empty. Days are counted only when a whole day falls inside that span *and* inside the episode's `IN_TREATMENT` period; the opening instant is inclusive and the closing instant is exclusive. The consumed count for the interval is added to `days_used`, and the sum is capped at `authorized_days`. The order matters: the clock advances first, then `days_used` and `days_remaining` are recomputed from the advanced clock.
+
+The posture is then re-derived from the new `days_remaining`, in a fixed order. A `days_remaining` of exactly 0 makes the posture `EXHAUSTED`, and this case wins outright — an authorization at exactly zero remaining days is never reported as due for review, even when the payer's review interval is 0. Otherwise, a `days_remaining` at or below the payer's `concurrent_review_interval_days` makes the posture `CONCURRENT_REVIEW_DUE`; a `days_remaining` of one more day than that interval does not. An authorization that satisfies neither condition keeps its posture unchanged.
+
+`review_due_at` is the scheduled instant of the next concurrent review and is set at grant time to the logical now plus the difference between `authorized_days` and the payer's `concurrent_review_interval_days`, expressed in days. Filing a concurrent review extends `authorized_days` by the payer's `concurrent_review_interval_days`, recomputes `review_due_at` from the new total and increments `concurrent_review_count` by one. An authorization already at `EXHAUSTED` cannot be extended at all; the review attempt is refused with `ERR_AUTHORIZATION_DAYS_EXHAUSTED` (HTTP 402), the same code returned when admission is attempted against an authorization whose `days_remaining` is exactly 0.
+
+### 2.9. The Bed Occupancy Ledger and Capacity Ceilings
+
+Beds are the physical substrate of level-of-care changes. A `Bed` belongs to a facility, carries a `unit_name` and a `bed_label` unique within that facility, names the `level_of_care` it is staffed for, and records a `cleaning_turnaround_hours` requirement. Its `status` moves among `AVAILABLE`, `OCCUPIED` and `CLEANING`, starting at `AVAILABLE`. `next_available_at` is the instant at which a bed in `CLEANING` becomes `AVAILABLE` again and is null while the bed is `AVAILABLE` or `OCCUPIED`.
+
+The ledger keeps one named conserved quantity: the facility's committed bed nights, defined as the count of `Bed` rows whose `status` is `OCCUPIED`. Completion through the branch that reaches `COMPLETED` directly — the bed-allocating branch described below — releases the source bed from `OCCUPIED` into `CLEANING` and takes the target bed into `OCCUPIED` where it is not already held; a completion that lands on the deferred `PENDING_DISCHARGE_ORDER` branch allocates no target bed and releases nothing, so the committed count is unmoved by it. Cancelling a change that completed in the current ops epoch reverses the moves that branch made: the target bed returns from `OCCUPIED` to `AVAILABLE` and the source bed from `CLEANING` back to `OCCUPIED`, so the compensating cancel leaves the committed count exactly where the completion left it. The invariant the network asserts is that a forward action immediately followed by its compensating action leaves the committed count undisturbed, and a cancel attempted after a facility-ops run has intervened is refused with `ERR_EPOCH_STALE`, so the invariant is scoped to a same-epoch cancel.
+
+Windows, not just counts, are enforced. The occupancy window a change claims on its target bed runs from the change's `effective_at` for the number of `days_remaining` on the referencing authorization. That window may not overlap the occupancy window of any level-of-care change already recorded against the same bed, regardless of that other change's current status; adjacency — one window ending at exactly the instant the next begins — is permitted. A violation is `ERR_BED_OCCUPANCY_OVERLAP`.
+
+Recovery housing carries a parallel ceiling. `RecoveryHousing` rows are children of a facility, each with a `house_name`, a `proximity_rank` where 1 is the closest to the patient's home ZIP, a `day_rate_cents` daily bed rate, a `capacity_beds` resident capacity, and a `grab_barrier_hours` turnaround requirement between two resident placements — 0 meaning no barrier and open-ended occupancy windows. `status` is `OPEN` or `SUSPENDED`, starting `OPEN`, and `licensed` is derived from a `RECOVERY_HOUSE` accreditation that is `GRANTED` and unexpired for the facility's `state_code`. The summed `capacity_beds` of a facility's `OPEN` recovery-housing rows must be at least the count of `ACTIVE` continuing-care plans placed there; the check is an inclusive ceiling, so a count exactly equal to the summed capacity passes and one more fails with `ERR_CONTINUING_CARE_HOUSING_FULL`. A requested housing window may not overlap another `ACTIVE` plan's window on the same housing row, with alignment permitted, and a violation is `ERR_HOUSING_WINDOW_OVERLAP`. The zero-barrier case is read literally at draft time: when the housing row named in the request carries a `grab_barrier_hours` of 0, an existing `ACTIVE` plan's window on that row is treated as open-ended rather than as the finite window it was drafted with, so a second window placed on that row is an overlap no matter how far in the future it starts.
+
+### 2.10. The Attendance Ledger and Professional Revenue
+
+Sessions are never deleted. The episode's attendance ledger counts every `SessionAttendance` row ever created for it, and that count must always equal the sum of the rows in `SCHEDULED`, `ATTENDED`, `NO_SHOW` and `CANCELLED` status. A plan invalidation rewrites row statuses; it removes nothing.
+
+A `SessionAttendance` is scheduled against a `ServiceOffering`, naming the `service_id` attended, the `clinician_id` who ran it, a `scheduled_at` start instant and a `duration_minutes` length. It starts at `SCHEDULED` with `attended` false and `billing_amount_cents` 0. Recording attendance moves the row to `ATTENDED` or `NO_SHOW`, and cancelling a scheduled row moves it to `CANCELLED`.
+
+Billed revenue is derived, not supplied. The per-row `billing_amount_cents` is the base fee for the service's `level_of_care` multiplied by the session's billed hour units, where the hour units are the session's `duration_minutes` divided by 60 with the remainder discarded, floored at a minimum of 1, and the product is capped at 900 cents for the row. The base fees are 210 cents at `ASAM_3_7`, 180 at `ASAM_3_5`, 150 at `ASAM_3_1`, 110 at `ASAM_2_1` and 80 at `ASAM_1_0`. A row bills 0 whenever its status is not `ATTENDED` — a cancelled or no-show row contributes nothing. The episode's `therapy_revenue_cents` is the sum of `billing_amount_cents` over the rows whose status is `ATTENDED`.
+
+Compensation is exact. When a plan is forced back to `PENDING_COSIGN` by an accreditation revocation during a facility-ops run, every `SCHEDULED` session row is rewritten to `CANCELLED` and a replacement row is scheduled for each, carrying the new plan's version. Re-attending those replacements must leave `therapy_revenue_cents` at exactly its pre-invalidation value.
+
+### 2.11. The Logical Clock, Precision and Rounding
+
+The network runs on a single logical clock. It reads a fixed server startup default of `2026-09-01T00:00:00Z` and never falls back to real wall-clock time; the default sits before every fixture date so that an unset clock is a well-defined earliest instant. A `PlatformAdmin` may set the clock to any instant by supplying `current_utc`, and from that point the logical now governs every deadline, expiry, window, bucket, credential window and contact-schedule calculation in the network. Test-driving clock operations return the resulting clock value alongside the network's facility count.
+
+Timestamps are ISO 8601 UTC with three fractional digits throughout. Money is denominated in integer cents and counts are integer. Rounding is always half up. The rules that round to a fractional precision are called out where they occur: the step-down pressure score rounds to one decimal place, and the compliance multiplier and the housing-savings arithmetic round to whole numbers. Sub-terms are never pre-rounded — each rule rounds its own final figure once.
+
+### 2.12. Segregation of Clinical and Utilization Duties
+
+The network enforces a segregation-of-duties rule between the payer-facing and clinical sides of the same episode. The same `X-User-ID` may not perform a `UtilizationReviewer` step on an episode and then attempt a gated `ClinicalDirector` step on that same episode. Three `UtilizationReviewer` steps are gated: assessment co-signature, authoring a payer concurrent review, and medical-provider co-signature. The `ClinicalDirector` steps guarded against them are admission, treatment completion, discharge and submitting a plan for co-signature. A violation is reported as `ERR_SEGREGATION_OF_DUTIES_VIOLATION`, and it is reported before the server performs any existence check on the request.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Intake, ASAM Assessment and Level Placement
+
+A treatment episode begins when an `AdmissionsIntakeNurse` or a `Clinician` opens one at a facility, supplying a `patient_ref` — the stable reference the intake desk already holds — and, optionally, an initial `assigned_level`. The new episode starts with `clinical_status` at `AWAITING_ASSESSMENT`, `care_level_status` at `NOT_STARTED`, `step_down_count` at 0 and `therapy_revenue_cents` at 0. Everything clinical that follows hangs off that episode.
+
+Assessment begins when an `AdmissionsIntakeNurse` or `Clinician` files an assessment against an episode that is still `AWAITING_ASSESSMENT`, supplying the `assessor_clinician_id` and a `dimension_scores` payload. The named assessor is fixed at filing time, so the credential precondition the completion action carries is applied here too: the assessor named by `assessor_clinician_id` must hold a `credential_tier` at or above the facility's `state_min_credential_tier` and a usable `ClinicianFacilityCredential` for that facility, or the request is refused with `ERR_ASSESSOR_CREDENTIAL_INSUFFICIENT`. On a successful filing the episode moves to `UNDER_ASSESSMENT` and the new `ClinicalAssessment` row starts at `IN_PROGRESS`. If the episode is not `AWAITING_ASSESSMENT` — or, for a replacement assessment, `UNDER_ASSESSMENT` — the request is refused with `ERR_EPISODE_NOT_AWAITING_ASSESSMENT`. Starting a second assessment while one is already in flight supersedes the earlier row: the pre-existing `IN_PROGRESS` assessment's status becomes `SUPERSEDED` and the episode's own dimension does not move.
+
+`dimension_scores` is a fixed six-member object. It carries `withdrawal_risk`, `biomedical_conditions`, `emotional_behavioral`, `readiness_to_change`, `relapse_potential` and `recovery_environment`, each an integer between 0 and 4 inclusive. Any payload that does not carry exactly those six members with in-range integer values is refused with `ERR_INVALID_DIMENSION_SCORES`.
+
+Placement happens on completion, and the network deliberately supports two readings of the same scores. The caller pins the reading it wants through the optional `placement_basis` field, which takes `DIMENSION_SUM` or `HIGHEST_DIMENSION_FLOOR`; when the field is absent it is treated as `DIMENSION_SUM`. Whichever reading applies is frozen onto the row as its `placement_basis`, so both readings of the same six scores remain comparable after the placement is written.
+
+The weighted total is shared by both readings and is computed from the six dimensions with fixed integer weights: `withdrawal_risk` carries a weight of 3, `biomedical_conditions` a weight of 2, `emotional_behavioral` a weight of 2, `readiness_to_change` a weight of 1, `relapse_potential` a weight of 3 and `recovery_environment` a weight of 1. `total_score` is that weighted sum, exact and unrounded, taking values from 0 to a declared maximum of 48. Every level comparison below uses a fixed rank order, lowest first: `ASAM_1_0` at rank 0, `ASAM_2_1` at rank 1, `ASAM_3_1` at rank 2, `ASAM_3_5` at rank 3 and `ASAM_3_7` at rank 4.
+
+Under the `DIMENSION_SUM` reading, the recommended level is read straight off `total_score` by descending bands. A total of 44 or more places the patient at `ASAM_3_7`. A total of 36 or more, below 44, places them at `ASAM_3_5`. A total of 28 or more, below 36, places them at `ASAM_3_1`. A total of 18 or more, below 28, places them at `ASAM_2_1`. Any total below 18 places them at `ASAM_1_0`. Under this reading a single saturated dimension cannot pull the placement above what the weighted total earns.
+
+Under the `HIGHEST_DIMENSION_FLOOR` reading, a floor is derived from the single worst dimension and the final placement is the higher-ranked of that floor and the level the weighted total would have earned. The floor is `ASAM_3_7` when `withdrawal_risk` equals 4. The floor is `ASAM_3_5` when `withdrawal_risk` equals 3, or when `relapse_potential` equals 4. The floor is `ASAM_3_1` when `relapse_potential` equals 3, or when `biomedical_conditions` equals 4. The floor is `ASAM_2_1` when `emotional_behavioral` equals 4. Otherwise the floor is `ASAM_1_0`. Identical scores can therefore land one or more levels higher under this reading than under the weighted-total reading — a patient scoring a 4 on `withdrawal_risk` but a small total will be placed at `ASAM_3_7` regardless of the total.
+
+The floor reading is reachable in normal operation. An assessment is created under the default reading, completed — which places the episode — and then cancelled, returning the episode to `AWAITING_ASSESSMENT` with the original `dimension_scores` intact; it is then re-created with the same scores and a `placement_basis` of `HIGHEST_DIMENSION_FLOOR`. Both assessment rows are then readable side by side, one recording each reading.
+
+Completion itself is a `Clinician` action and carries credential preconditions on two identities. The assessor named by `assessor_clinician_id` must hold a `credential_tier` at or above the facility's `state_min_credential_tier`, and must hold a `ClinicianFacilityCredential` for that facility whose `is_usable` flag is true; the completing `Clinician` themselves — entity-backed, so their `X-User-ID` names a persisted clinician — is bound by the same floor and the same usable-credential requirement. A failure of either is `ERR_ASSESSOR_CREDENTIAL_INSUFFICIENT`. On success, `total_score` and `recommended_level` are written, the assessment's status becomes `COMPLETED` and `assessed_at` is stamped, the episode's `assigned_level` takes the recommended level, and the episode moves from `UNDER_ASSESSMENT` to `AWAITING_AUTHORIZATION`. Any other assessment still `IN_PROGRESS` for the episode is superseded in the same operation. Assessment completion is refused with `ERR_EPISODE_NOT_UNDER_ASSESSMENT` when the episode is not under assessment, and with `ERR_ASSESSMENT_NOT_IN_PROGRESS` when the assessment itself is not in progress.
+
+Everything from the assessment onward sits behind a licensure gate. A facility must hold a `GRANTED`, unexpired `STATE_LICENSE` accreditation for its own `state_code` before any assessment, authorization request, admission or level-of-care change may proceed; without it the request fails with `ERR_FACILITY_NOT_LICENSED`.
+
+### 3.2. Payer Authorization, Concurrent Review and Step-Down Pressure
+
+A `UtilizationReviewer` requests funding by filing an authorization against an episode that is `AWAITING_AUTHORIZATION`, naming the `payer_id` and a `requested_level`, and optionally a `bed_id`. The new row starts at posture `PENDING`, with `days_used` at 0 and `concurrent_review_count` at 0. When the requested level is `ASAM_3_1` or higher — that is, at rank 2 and above — and a `bed_id` was supplied, that bed's status moves from `AVAILABLE` to `OCCUPIED` as a hold; requests at `ASAM_1_0` or `ASAM_2_1` hold nothing. The same request is also accepted against an episode already `IN_TREATMENT`, because a level-of-care change on an in-treatment episode is funded by an authorization that must be requested after treatment has begun. An episode in any other state is refused with `ERR_EPISODE_NOT_AWAITING_AUTHORIZATION`.
+
+The network will not stack authorizations. A second authorization for the same episode is refused with `ERR_AUTHORIZATION_NOT_REOPENABLE` unless every prior authorization for that episode is already `DENIED`, `EXPIRED` or `EXHAUSTED`, or the new `requested_level` differs from every prior authorization's `requested_level`. Creation carries an `Idempotency-Key` header: when the header is supplied on this create, the key must not already be bound to a different request body for the same operation, and a conflict is `ERR_IDEMPOTENCY_KEY_CONFLICT`. The same idempotency contract applies to session scheduling and to assessment filing.
+
+Approval is a `UtilizationReviewer` action on a `PENDING` authorization. Three things must hold. The requested level may not exceed the facility's `as_level_max`, or the request fails with `ERR_LEVEL_EXCEEDS_FACILITY_LICENSE`. The payer's `credential_min_tier_by_loc` for the requested level must be satisfied by the episode's treating plan author, or the request fails with `ERR_PAYER_CREDENTIAL_TIER_UNMET`. The authorization must itself still be `PENDING`, or the request fails with `ERR_AUTHORIZATION_NOT_PENDING`. On approval the authorization records a `granted_level` and a posture of `APPROVED`; `authored_days` is taken from the payer's `initial_authorized_days_by_loc` at the granted level; and `review_due_at` is computed from the logical now plus the difference between `authorized_days` and the payer's `concurrent_review_interval_days`, in days. The episode's advance from `AWAITING_AUTHORIZATION` to `AWAITING_ADMISSION` is gated on two conditions holding together: the episode's operative authorization is `APPROVED`, and the episode holds at least one clearance, every one of which still reads `CLEARED`. Because either condition can be the last to turn true, the promotion test is applied both when an authorization is approved and whenever a clearance is recorded as `CLEARED`, so a clearance filed after the approval advances the episode just as an approval filed after the clearances does.
+
+Denial works on two postures. A `PENDING` authorization becomes `DENIED` outright. An authorization already at `APPROVED` — or at `CONCURRENT_REVIEW_DUE` — with `days_used` strictly greater than 0 is instead demoted into step-down pressure: its posture becomes `STEP_DOWN_REQUIRED`, the payer's `step_down_coverage_map` is forced to promote the next lower covered level, and the episode's `care_level_status` moves from `ACTIVE` to `STEP_DOWN_PENDING`. A deny against an authorization whose `days_used` is exactly 0 is refused with `ERR_AUTHORIZATION_UNUSED` — no step-down pressure has accrued, so there is nothing to demote. Denying an authorization that is already `DENIED` is refused with `ERR_AUTHORIZATION_ALREADY_DENIED`. An authorization that is not `PENDING`, `APPROVED` or `CONCURRENT_REVIEW_DUE` in the first place is refused with `ERR_AUTHORIZATION_NOT_PENDING`.
+
+Step-down pressure is quantified by a score that compares consumption to a denominator. Two variants of the score exist and they read the same authorization but measure it against different denominators. The shared sub-terms are these: the granted level is converted to a rank — `ASAM_3_7` to 4, `ASAM_3_5` to 3, `ASAM_3_1` to 2, `ASAM_2_1` to 1 and `ASAM_1_0` to 0 — and a cost-pressure term is the difference between the granted level's rank and a fixed target rank of 1, multiplied by a cost unit of 8. A clinical-pressure term is added on top, driven by the episode's withdrawal-management status: 15 points when that status is `MEDICALLY_STABLE`, 5 points when it is `ACTIVE`, and a subtraction of 20 points when it is `COMPLICATED`. A floor of 0 applies to the final sum and never to an individual term.
+
+The first variant, which is the one persisted as `urgency_score` on the authorization, sets the time-pressure term by dividing `days_used` by the days granted at approval and multiplying by a time weight of 60; the term is 0 when that granted-day figure is 0. The persisted score is the sum of the three terms, floored at 0, rounded half up to one decimal place. Because the denominator is the granted days alone, fixed at approval rather than widened by a concurrent review, every completed concurrent review raises this figure.
+
+The second variant, exposed only as `projected_step_down_urgency` on the episode's utilization summary and never persisted, widens the denominator instead. It computes an extended day count as the days granted at approval plus `concurrent_review_count` multiplied by the payer's `concurrent_review_interval_days`, then divides `days_used` by that extended count and multiplies by the same time weight of 60, again yielding 0 when the extended count is 0. The projected figure is the same sum, floored at 0 and rounded half up to one decimal place.
+
+The two variants agree exactly when `concurrent_review_count` is 0 and diverge strictly as a function of completed reviews. Take an authorization granted at `ASAM_3_5` with 7 days used, 14 authorized days, one concurrent review completed, a payer review interval of 7 days and a withdrawal-management status of `MEDICALLY_STABLE`. The cost-pressure term is the granted rank of 3 minus the target rank of 1, multiplied by 8, giving 16; the clinical-pressure term is 15. The persisted variant divides 7 by 14 and multiplies by 60 to get a time-pressure term of 30.0, and the score is 30.0 plus 16 plus 15, rounded half up to one decimal place, giving 61.0. The projected variant extends the denominator to 14 plus one review multiplied by 7 days, giving 21, divides 7 by 21 and multiplies by 60 for a time-pressure term of 20.0, and reports 20.0 plus 16 plus 15, rounded half up to one decimal place, giving 51.0. The projected figure is strictly lower than the persisted one as soon as any concurrent review has been filed.
+
+The score is recomputed on approval, on concurrent review, on every facility-ops run, and whenever the withdrawal-management status changes. The floor of 0 is a fixed declaration rather than an observable behaviour: because the cost-pressure term can never go negative for a live authorization — the target rank is fixed at 1 while a funded authorization never sits below `ASAM_2_1` — the floor is never the binding constraint. It is declared for completeness and has no observable effect.
+
+### 3.3. Medical Clearance, Withdrawal Management and Admission
+
+A clearance is ordered by an `AdmissionsIntakeNurse` or a `Clinician` against an episode, with a `clearance_type` of `MEDICAL`, `PSYCHIATRIC` or `TB_SCREEN`. The row starts at `PENDING` with `ordered_at` stamped. A `Clinician` or `ClinicalDirector` may then record it as `CLEARED`, stamping `cleared_at` and setting `expires_at` to the cleared instant plus 7 days, or record it as `FAILED`. The expiry instant is exclusive.
+
+Clearance validity is expressed through two derived fields, and the order in which they are computed is load-bearing. First, the exact number of hours between `expires_at` and the logical now is taken as a decimal and may be negative; that figure is floored at 0 and then rounded half up to a whole number of hours. That whole-hour figure is `window_hours_remaining`. Only then is `window_days_remaining` derived, by dividing the *already-rounded* hour figure by 24 and rounding half up to a whole number. The alternative order — dividing the raw hour delta by 24 first and rounding afterwards — is explicitly not what this rule means. The two orders disagree: an exact delta of 35.7 hours rounds to 36 whole hours, and 36 divided by 24 is 1.5, which rounds half up to 2 days; dividing 35.7 by 24 first gives 1.4875, which rounds to 1 day. `window_days_remaining` must therefore never be computed from the raw hour delta.
+
+A clearance's `effective_status` is derived from the same hour figure. A clearance whose raw status is `CLEARED` reads as `CLEARED` while `window_hours_remaining` is strictly greater than 0, and reads as `EXPIRED` when `window_hours_remaining` is exactly 0. Because the expiry instant is exclusive and the hour figure is floored at 0, a clearance whose `expires_at` coincides exactly with the logical now reads `EXPIRED` rather than `CLEARED`.
+
+Withdrawal management is authored by a `Clinician` against an episode, supplying a `protocol` of `NONE`, `ALCOHOL_TAPER`, `OPIOID_AGONIST` or `BENZO_TAPER`, a `ciwa_score`, and a `dose_records` series. The record is authored while the episode sits at `AWAITING_ADMISSION` or `IN_TREATMENT`, since the withdrawal-management record is itself an admission precondition that must read `ACTIVE` at the admission gate; an episode in any other state is refused with `ERR_EPISODE_NOT_IN_TREATMENT`. The row starts at `ACTIVE`, and `ciwa_recorded_at` is stamped. `ciwa_score` is an integer between 0 and 30. Each element of `dose_records` is a medication reconciliation event carrying a `medication_code`, a `dose_mg`, a `given_at` instant and a `given_by_clinician_id`. The record's `status` moves among `ACTIVE`, `MEDICALLY_STABLE` and `COMPLICATED`; a `Clinician` may later update the record with a fresh `ciwa_score`, additional `dose_records`, or a status change. A change to `ciwa_score` re-runs the step-down pressure score for the episode's live authorizations, and a move to `COMPLICATED` makes the episode a step-up candidate.
+
+Admission is the narrowest gate in the system and belongs to `AdmissionsIntakeNurse` alone. The episode must be `AWAITING_ADMISSION` or the request fails with `ERR_EPISODE_NOT_AWAITING_ADMISSION`. Beyond that, seven clinical and administrative conditions must hold simultaneously, each with its own code. The episode must hold at least one `MEDICAL` clearance reading `CLEARED` and at least one `TB_SCREEN` clearance whose `effective_status` is `CLEARED`; a clearance that is not cleared is reported as `ERR_MEDICAL_CLEARANCE_NOT_CLEARED`. The `TB_SCREEN` clearance's `expires_at` must be strictly after the logical now, and a lapse is reported as `ERR_MEDICAL_CLEARANCE_EXPIRED` with HTTP 410. The withdrawal-management record must be `ACTIVE`, reported as `ERR_WITHDRAWAL_MANAGEMENT_NOT_ACTIVE`. The treatment plan must be `ACTIVE`, reported as `ERR_TREATMENT_PLAN_NOT_ACTIVE`. The facility must be `licensed` and hold a `GRANTED` accreditation of class `ACCREDITATION_BODY`, reported as `ERR_FACILITY_ACCREDITATION_INVALID`. The authorization's `days_remaining` must be strictly greater than 0, reported as `ERR_AUTHORIZATION_DAYS_EXHAUSTED` (HTTP 402). And the authorization's bed hold must still be `OCCUPIED` by this episode — an intervening ops run that released it is reported as `ERR_BED_NOT_HELD`.
+
+Two further checks apply to the same operation. A facility whose `facility_posture` is `FROZEN` refuses admission with `ERR_FACILITY_POSTURE_FROZEN`, and a `ClinicalDirector` who has already performed a gated utilization step on the episode is refused with `ERR_SEGREGATION_OF_DUTIES_VIOLATION`. The frozen-posture refusal is settled ahead of the clearance conditions — consistent with §2.7a's rule that facility safety rules precede the business constraints — so a request that would fail both the frozen test and a clearance test is reported against the frozen code. The lapse/not-cleared distinction among the clearance conditions is itself ordered: a `TB_SCREEN` row whose raw status is still `CLEARED` but whose window has closed is reported as the `ERR_MEDICAL_CLEARANCE_EXPIRED` lapse rather than as the `ERR_MEDICAL_CLEARANCE_NOT_CLEARED` code. On success the episode's `admitted_at` is stamped, `clinical_status` becomes `IN_TREATMENT`, `care_level_status` moves from `NOT_STARTED` to `ACTIVE`, and the episode's version advances. Alumni contact rows are explicitly not created at admission; they are materialized at discharge.
+
+### 3.4. Treatment Planning, Credentialing and the Weekly Curriculum
+
+A `Clinician` drafts a treatment plan against an episode that is `IN_TREATMENT`, supplying the `author_clinician_id`, a `cosign_rationale_code`, the required `expected_treatment_episode_version`, and optionally a `supersedes_plan_id`. The row starts at `DRAFT`, and its `required_sessions_per_week` is derived from the episode's `assigned_level`. Any prior `ACTIVE` plan for the episode becomes `SUPERSEDED` in the same operation. The endpoint accepts an `Idempotency-Key`, and a key already bound to a different body for the same operation is refused with `ERR_IDEMPOTENCY_KEY_CONFLICT`. Drafting is likewise accepted against an episode resting at `AWAITING_ADMISSION`, because the plan is itself an admission precondition and must be authored during that staging window; the admission gate's own check remains the authority on what may be admitted. Drafting a plan is refused with `ERR_EPISODE_NOT_IN_TREATMENT` when the episode is in any other state, with `ERR_ASSESSOR_CREDENTIAL_INSUFFICIENT` when the author lacks the facility's required credential standing, and with `ERR_FACILITY_ACCREDITATION_REVOKED` when the facility carries an `ACCREDITATION_BODY` accreditation in `REVOKED` status.
+
+The weekly requirement depends on the assigned level. A patient at `ASAM_1_0` or `ASAM_2_1` — the two lowest ranks — is expected to attend 5 sessions per week. A patient at `ASAM_3_1` is expected to attend 10. A patient at `ASAM_3_5` or `ASAM_3_7` is expected to attend 14. The treatment week is a half-open seven-day window anchored on the episode's `admitted_at`: the n-th week runs from the admission instant plus 7·n days up to, but not including, the admission instant plus 7·(n+1) days, and the current week is whichever of those windows contains the logical now. Within the current week, attended sessions are counted from the rows whose status is `ATTENDED` and whose `scheduled_at` falls inside the window. The curriculum is compliant when that attended count reaches the level's requirement exactly or exceeds it; one short is not compliant. A compliance percentage is derived by multiplying 100 by the attended count, dividing by the requirement, and discarding the remainder toward zero.
+
+A `Clinician` or `ClinicalDirector` may edit an existing plan, changing `author_clinician_id` or `cosign_rationale_code`, and that edit requires `expected_treatment_plan_version` under the optimistic-concurrency gate and advances the plan's version by one. Submitting a plan for co-signature is a `ClinicalDirector` action restricted to a plan in `DRAFT`; the plan moves through `PENDING_COSIGN` and reaches `ACTIVE` on acceptance within the same operation, bumping its version by one. A `ClinicalDirector` who has performed a gated `UtilizationReviewer` step on the same episode is refused with `ERR_SEGREGATION_OF_DUTIES_VIOLATION`.
+
+Sessions are scheduled by an `AdmissionsIntakeNurse` or a `Clinician` against an episode that is `IN_TREATMENT`, naming the `service_id`, the `clinician_id`, a `scheduled_at` instant and a `duration_minutes` length. A `duration_minutes` that is not a positive integer — zero or negative — is a request-shape failure refused with `ERR_INVALID_REQUEST`, and that shape failure is settled at the resolution layer ahead of the episode-state gate. The row starts at `SCHEDULED` with `attended` false and `billing_amount_cents` 0. The operation accepts an `Idempotency-Key` under the same conflict rule as plan creation. Scheduling is refused with `ERR_FACILITY_ACCREDITATION_REVOKED` when the facility's `ACCREDITATION_BODY` accreditation is revoked, and with `ERR_FACILITY_POSTURE_FROZEN` when the facility's posture is `FROZEN`. A `Clinician` records the outcome with an `attended` flag, which moves the row to `ATTENDED` or `NO_SHOW`, computes `billing_amount_cents` from the service level and duration, and recomputes the episode's `therapy_revenue_cents`. A `Clinician` may also cancel a scheduled session; the row is retained and becomes `CANCELLED` with a billed amount of 0, never deleted.
+
+### 3.5. The Facility Ops Cycle
+
+A single facility-ops run advances the facility's `ops_epoch` by exactly 1 at the very start, so that every downstream stage of the same run reads the same epoch value, and stamps `last_ops_run_at` with the logical now. That stamp is overwritten before any stage reads it, so every stage sees the same current epoch, but stage one's burn still opens from the instant the previous run stamped — the value the field held when the run began — rather than from the value just written. A `PlatformAdmin` or a `ClinicalDirector` may drive a run. Stage order is fixed and a later stage observes the mutations of every earlier stage.
+
+Stage one burns the clock bucket: `days_used`, `days_remaining` and the posture of every non-terminal authorization are re-derived, exactly as described for the day bank — advance first, then recompute, with a remaining count of exactly 0 winning over the review-due test and a remaining count at or below the payer's review interval producing `CONCURRENT_REVIEW_DUE`.
+
+Stage two recomputes the facility's compliance risk points and re-derives `facility_posture` from them.
+
+Stage three expires accreditations and releases cleaned beds: any accreditation past its expiry instant lapses, and any bed in `CLEANING` whose `next_available_at` has arrived becomes `AVAILABLE`.
+
+Stage four is the FROZEN-response stage. When `facility_posture` is `FROZEN`, every `IN_TREATMENT` episode's treatment plan is forced to `PENDING_COSIGN` and every `SCHEDULED` session row for those episodes is rewritten to `CANCELLED`, with a replacement row scheduled for each — the compensating leg of the attendance ledger, which must leave `therapy_revenue_cents` exactly where it stood before.
+
+Stage five promotes step-down pressure. An authorization sitting at `CONCURRENT_REVIEW_DUE` is promoted to `STEP_DOWN_REQUIRED` when its `days_remaining` is at or below the payer's `concurrent_review_interval_days`, the episode is `IN_TREATMENT`, and the episode's treatment plan status is `PENDING_COSIGN` — the reasoning being that a plan which has lost its signature cannot carry the current level of care, so the payer must be stepped down. This promotion also moves an `ACTIVE` episode's `care_level_status` to `STEP_DOWN_PENDING`. Then, for every episode whose `care_level_status` is `STEP_DOWN_PENDING` and whose current bed is `OCCUPIED`, that bed is released into `CLEANING`, which decrements the facility's committed bed nights. This second clause runs after the promotion clause within the same stage, so an episode promoted earlier in the same run has its bed released in that same run.
+
+Stage six times out alumni contacts: a contact still `PENDING` whose `scheduled_for` instant is at or before the logical now becomes `NO_CONTACT`.
+
+Stage seven processes `AWAITING_DISCHARGE` level-of-care changes in ascending order of `effective_at`, breaking ties by ascending creation instant and never by identifier. A change whose `retry_available_at` has arrived alternates its bed on each run: a bed still `CLEANING` returns to `AVAILABLE`, while a bed that is `OCCUPIED` or already `AVAILABLE` is taken into `CLEANING`. In both cases the change's `retry_available_at` advances by 24 hours and the row stays at `AWAITING_DISCHARGE`, so it keeps cycling without ever completing. A change whose `retry_available_at` has not yet arrived is skipped and left untouched.
+
+Every ordering inside the batch is pinned on entity fields — ascending `effective_at` then ascending creation instant, or ascending `attempt_number`. No identifier, UUID or random value participates in any ordering decision anywhere in the cycle.
+
+### 3.6. Level-of-Care Changes: Stepping Down and Stepping Up
+
+A `ClinicalDirector` or `UtilizationReviewer` appoints a level-of-care change against an episode that is `IN_TREATMENT`, supplying the `authorization_id` funding the target level, the `to_level`, the `effective_at` instant, the required `expected_treatment_episode_version`, and optionally a `bed_id`. The new `LevelOfCareChange` starts at `PLANNED` with a `change_type` of `STEP_DOWN` or `STEP_UP` decided by comparing ranks, and its `from_level` records the level being left. The episode's `care_level_status` moves from `ACTIVE` to `STEP_DOWN_PENDING` for a step-down, and the episode's version advances by one.
+
+Five checks guard appointment. The episode's `step_down_count` must be strictly less than 2, or the request fails with `ERR_MAX_STEP_DOWNS_REACHED`. The total level-of-care changes the episode has recorded under one `payer_id` may not exceed 5, or the request fails with `ERR_MAX_CHANGE_PER_PAYER`. The changed-to level may not exceed the facility's `as_level_max`, or the request fails with `ERR_LEVEL_EXCEEDS_FACILITY_LICENSE`. A step-down may not be appointed against an authorization whose `days_used` is exactly 0, or the request fails with `ERR_AUTHORIZATION_UNUSED`. And the route from the current level to the target must lie in the payer's standardized continuum: `ASAM_3_7` to `ASAM_3_5`, `ASAM_3_7` to `ASAM_3_1`, `ASAM_3_5` to `ASAM_3_1`, `ASAM_3_5` to `ASAM_2_1`, `ASAM_3_1` to `ASAM_2_1`, `ASAM_3_1` to `ASAM_1_0` and `ASAM_2_1` to `ASAM_1_0`, together with their exact reverses as step-ups, are the only permitted routes; anything else fails with `ERR_LEVEL_ROUTE_NOT_ALLOWED`. When the target is a residential level — `ASAM_3_1`, `ASAM_3_5` or `ASAM_3_7` — the target bed is held for the change. Where the change claims an occupancy window on a target bed, that window may not overlap any window already recorded against that bed, per the occupancy ledger, and an overlap is `ERR_BED_OCCUPANCY_OVERLAP`.
+
+Completion turns on which branch the change is eligible for, and the branches are not interchangeable. A change whose `effective_at` is after the logical now cannot complete at all and is refused with `ERR_CHANGE_NOT_DUE`. A change that is not in `PLANNED` status is refused with `ERR_CHANGE_NOT_PLANNED`. The set of conditions the change does not satisfy is reported as `ERR_CHANGE_BRANCH_NOT_APPLICABLE`.
+
+The first completion branch applies when the change is not a step-down onto a bed — either its `to_level` is `ASAM_1_0` or `ASAM_2_1`, or no `bed_id` was supplied, or its `to_level` rank is not strictly below its `from_level` rank. Such a change moves from `PLANNED` to `PENDING_DISCHARGE_ORDER` when its target authorization's posture is `APPROVED`, and is otherwise refused with `ERR_AUTHORIZATION_NOT_APPROVED`. `PENDING_DISCHARGE_ORDER` is a resting status that allocates no target bed and touches no source bed. No further completion operation advances such a row: a completion attempt against a row that is no longer `PLANNED` is refused with `ERR_CHANGE_NOT_PLANNED`, and the row is left where it stands. A cancel from this status returns it to `CANCELLED` and the episode to `ACTIVE`.
+
+The second completion branch applies when the change is a genuine step-down onto a bed: a `bed_id` was supplied, its `to_level` is a residential level, and its `to_level` rank is strictly below its `from_level` rank. Such a change moves directly from `PLANNED` to `COMPLETED`, but only when its target authorization's posture is `APPROVED`, or it is refused with `ERR_AUTHORIZATION_NOT_APPROVED`. On completion the source bed moves from `OCCUPIED` to `CLEANING` and the target bed from `AVAILABLE` to `OCCUPIED`; the episode's `care_level_status` becomes `STEPPED_DOWN`; `step_down_count` increments by one; and `revcap_pre_step_down_cents` and `revcap_post_step_down_cents` are frozen as the pre- and post-transition revenue-cap snapshots. Resolution of the target level itself can fail here: the payer's `step_down_coverage_map` must still name a level listed below the current `granted_level` that has not yet been funded, and a map with no such remaining entry is reported as `ERR_STEP_DOWN_MAP_EXHAUSTED` at completion time.
+
+A completed change can be compensated. A `ClinicalDirector` may cancel it inside the same ops epoch in which it completed — a cancel after a facility-ops run has intervened is refused with `ERR_EPOCH_STALE`. Compensation reverses the moves the completion branch made: it decrements `step_down_count` by one, returns the target bed from `OCCUPIED` to `AVAILABLE` and the source bed from `CLEANING` back to `OCCUPIED`. A change still in `PLANNED`, or resting at `PENDING_DISCHARGE_ORDER`, may also be cancelled outright, becoming `CANCELLED` and returning the episode to `ACTIVE`; a change sitting at `STEP_DOWN_PENDING` is reverted to `ACTIVE` by the same cancel path.
+
+The episode also carries a state of its own for this. Once stepped down, the episode sits at `STEPPED_DOWN`. A payer step-down demand — an authorization demoted to `STEP_DOWN_REQUIRED`, or an `APPROVED` authorization whose `days_remaining` has reached exactly 0 while the episode is `IN_TREATMENT` and whose payer's coverage map still names an unfunded lower level below the current granted level — moves the episode's `care_level_status` back to `STEP_DOWN_PENDING` while it was `ACTIVE`. On the exhaustion path the level the payer's coverage map is forced to promote is recorded onto the authorization; the demotion path records no such level. In neither path does the demand itself create a level-of-care change row; the change that acts on the demand is appointed through the ordinary appointment operation.
+
+Stepping up is a distinct action and a `ClinicalDirector` one. It applies to a completed change and requires two conditions: the episode's withdrawal-management status must be `COMPLICATED`, or the request fails with `ERR_WITHDRAWAL_MANAGEMENT_NOT_COMPLICATED`, and a bed at the higher level must be `AVAILABLE` within the requested window, or the request fails with `ERR_BED_NOT_AVAILABLE`. The action records a companion change of type `STEP_UP` and completes it; the episode's `assigned_level` rises to the higher level, `step_down_count` decrements by one with a floor of 0, the higher-level bed becomes `OCCUPIED` and the lower-level bed becomes `CLEANING`. The target bed identifier is supplied as `bed_id`.
+
+Authorizations expire into step-down pressure in their own right. An `APPROVED` authorization whose `days_remaining` has reached exactly 0 while the episode is `IN_TREATMENT` becomes `EXHAUSTED`, the payer's coverage map is forced to promote the next covered lower level, the episode's `care_level_status` becomes `STEP_DOWN_PENDING`, and the episode's treatment plan is superseded in the same moment.
+
+### 3.7. Completing Treatment and the Discharge Gate
+
+A `ClinicalDirector` completes treatment for an episode that is `IN_TREATMENT`. Three conditions stand in the way. The withdrawal-management status must be `MEDICALLY_STABLE`, or the request fails with `ERR_WITHDRAWAL_MANAGEMENT_NOT_STABLE`. The treatment plan must be `ACTIVE` and carry a recorded co-sign approval, or the request fails with `ERR_TREATMENT_PLAN_NOT_ACTIVE`. And the episode must have attended at least the level's `required_sessions_per_week` sessions in the current treatment week, or the request fails with `ERR_CURRICULUM_NOT_COMPLETE`. On success `clinical_status` becomes `COMPLETED`, `therapy_revenue_cents` is recomputed from all `ATTENDED` session rows, and the episode's version advances by one. An episode already `DISCHARGED` is refused here with `ERR_ALREADY_DISCHARGED`, and a `ClinicalDirector` who has performed a gated utilization step on the episode is refused with `ERR_SEGREGATION_OF_DUTIES_VIOLATION`.
+
+Discharge follows, and it carries an interesting asymmetry. A `ClinicalDirector` discharges an episode whose `clinical_status` is `IN_TREATMENT` or `COMPLETED`; an episode in any other state is refused with `ERR_EPISODE_NOT_COMPLETED`, and one already `DISCHARGED` is refused with `ERR_ALREADY_DISCHARGED`.
+
+When a `COMPLETED` episode is discharged and a continuing-care plan with status `ACTIVE` exists, several things happen at once. The episode moves to `DISCHARGED`, which is terminal; `discharged_at` is stamped; the episode's bed moves from `OCCUPIED` to `CLEANING` for the bed's `cleaning_turnaround_hours`, with `next_available_at` set accordingly; the payer's step-down coverage map is resolved so the covering levels become eligible for a further step-down; and alumni contact rows are materialized on the plan's cadence.
+
+That bed release has a deliberately delayed reopen. The occupancy does not become available in one hop: the bed moves to `CLEANING` first, then the bed's next available instant is set to the logical now plus the bed's `cleaning_turnaround_hours`, and only a subsequent facility-ops clock burn re-evaluates that instant and returns the bed to `AVAILABLE`. Three hops, and the middle one is a fixed instant rather than an immediate transition.
+
+When a `COMPLETED` episode is discharged with no `ACTIVE` continuing-care plan, the call is refused with `ERR_CONTINUING_CARE_PLAN_REQUIRED` and the episode performs no mutation at all. Instead, the release is deferred: a level-of-care change row is recorded at status `AWAITING_DISCHARGE`, with its `bed_id` set to the episode's current bed, its `from_level` set to the episode's `assigned_level` and its `to_level` set to the first entry of the payer's step-down coverage map below that level, and its `retry_available_at` set to the logical now plus 24 hours. The episode itself does not move; the release lives on the change row. That row then cycles through the ops run: at the run where its `retry_available_at` has arrived it holds its bed in `CLEANING` for the run instant, and on the following run the bed returns to `AVAILABLE` and `retry_available_at` advances by a further 24 hours, so the row keeps cycling without ever completing while the continuing-care gap persists.
+
+Discharge carries its own readiness gate, over and above the state conditions. Four things must hold. The facility's `facility_posture` must not be `FROZEN`. The facility's committed bed nights, measured after releasing this episode's bed, must be at most the summed `capacity_beds` of the facility's `OPEN` recovery-housing rows — an inclusive ceiling, so a count exactly equal to the summed capacity passes and one more fails with `ERR_CONTINUING_CARE_HOUSING_FULL`. A continuing-care plan with status `ACTIVE` must exist for the episode, and its `authorizing_clinician_id` must name a clinician whose credential tier is at or above the facility's `state_min_credential_tier` — the gate's declared credential floor is `TIER_3_LICENSED`. And the episode's withdrawal-management status must be `MEDICALLY_STABLE`. Discharge also requires a `GRANTED`, unexpired `ACCREDITATION_BODY` accreditation at the facility, or the request fails with `ERR_FACILITY_ACCREDITATION_INVALID`, and it refuses a `FROZEN` facility with `ERR_FACILITY_POSTURE_FROZEN`.
+
+### 3.8. Continuing Care, Recovery Housing and Alumni Contacts
+
+A `ClinicalDirector` or a `Clinician` drafts the continuing-care plan, supplying a `housing_selection_basis`, a `housing_window_start` that opens the requested window inclusively, a `housing_window_end` that closes it exclusively, the `alumni_contact_interval_days`, the `alumni_contacts_required`, the `authorizing_clinician_id`, the `shelter_class`, a `wants_recovery_only_house` flag that defaults to true, the required `expected_treatment_episode_version`, and optionally a `housing_id`. The plan starts at `DRAFT`, any prior `ACTIVE` plan for the episode becomes `SUPERSEDED`, and the episode's version advances by one.
+
+The window must be well-formed: `housing_window_end` must be strictly after `housing_window_start`, or the request fails with `ERR_HOUSING_WINDOW_INVALID`. The alumni cadence is bounded on both sides: `alumni_contact_interval_days` must be at least 1 and at most 90, and `alumni_contacts_required` must be at least 1 and at most 24; a value outside either range fails with `ERR_ALUMNI_INTERVAL_INVALID`. A requested window that overlaps another `ACTIVE` plan's window on the same housing row fails with `ERR_HOUSING_WINDOW_OVERLAP`.
+
+Housing placement resolves at activation, and `housing_selection_basis` decides how. An `EXPLICIT` plan requires a `housing_id` in the request. A `RANKED_AUTO` plan resolves its placement at activation from a ranked pool of affordable houses and ignores any `housing_id` supplied at draft time — the `housing_id` on the row is the resolved placement.
+
+Activation is a `ClinicalDirector` or `Clinician` action that moves a `DRAFT` plan to `ACTIVE` and supersedes every other `ACTIVE` plan for the episode. Activation is gated on recovery-housing capacity, per the ceiling described under the occupancy ledger: the count of `ACTIVE` continuing-care plans must not exceed the summed `capacity_beds` of the facility's `OPEN` rows, and an overfill is `ERR_CONTINUING_CARE_HOUSING_FULL`.
+
+For a `RANKED_AUTO` activation, the pool is built first. A recovery-housing row is a candidate only when all of the following hold: its `status` is `OPEN`; its `capacity_beds` minus the number of `ACTIVE` continuing-care plans already placed in it whose `housing_window` overlaps the requested window is greater than 0; its `day_rate_cents` is at most an affordability ceiling of 2000 cents; if `wants_recovery_only_house` is true then its `licensed` flag must be true; and if the requested `shelter_class` is `RESIDENTIAL` then its `licensed` flag must be true regardless of that flag. A `RESIDENTIAL` plan therefore cannot be satisfied by an unlicensed house. `shelter_class` itself takes one of `RESIDENTIAL`, `TRANSITIONAL`, `SOBER_DORM` or `MATRIX`, and it is meaningful only for a `RANKED_AUTO` plan.
+
+Candidates are then ranked by an ascending composite key whose first element is the absolute difference between the row's `day_rate_cents` and an affordability target of 1000 cents, and whose second element is the row's `proximity_rank` — cheapest-closest first, with proximity breaking price ties. Rows whose composite keys tie exactly are ordered by ascending `house_name`, compared byte-wise and case-sensitive; creation order and identifier are never consulted. To see how this resolves, consider a pool of three houses: one at 1200 cents with proximity rank 3, one at 900 cents with proximity rank 4, and one at 1200 cents with proximity rank 1. The first keys to a price delta of 200 and proximity 3, the second to 100 and 4, and the third to 200 and 1. Ascending order is the 900-cent house first, then the 1200-cent house at proximity 1, then the 1200-cent house at proximity 3 — so the nearer 1200-cent house loses to the cheaper one despite being closer, and it beats the farther 1200-cent house only on proximity. When the pool is empty — no `OPEN`, licensed where required, affordable, capacity-available house qualifies — the activation is refused with `ERR_HOUSING_POOL_EXHAUSTED`, and there is no fallback row and no partial placement. The pool is recomputed on every activation rather than cached, so re-running activation on the same plan after the winning house has filled resolves to the next house in order rather than repeating the earlier answer.
+
+Alumni contacts are created at discharge, not at admission. Exactly `alumni_contacts_required` rows are created for the episode, numbered from 1 upward in `attempt_number`, with each row's `scheduled_for` set to the discharge instant plus that attempt number multiplied by `alumni_contact_interval_days` — whole days added to the logical now at discharge. Only rows whose `scheduled_for` is strictly after the discharge instant are created, which is why an interval of 0 days is refused at plan creation rather than silently collapsing every contact onto the discharge instant; the minimum permitted interval is 1 day. Contacts are created and later timed out in ascending `attempt_number`, and ties in `scheduled_for` cannot arise because the interval is at least one day.
+
+A contact starts at `PENDING`. An `AlumniCoordinator` may file an ad-hoc contact outside the generated schedule by supplying a `scheduled_for` and an `attempt_number`, and the row starts `PENDING`. An `AlumniCoordinator` then records an outcome, supplying an `outcome` — `REACHED`, `UNREACHABLE` or `DECLINED` — and, for a successful contact, an `abstinent_at_contact` flag carrying the patient's self-reported abstinence, which is meaningful only when the outcome is `REACHED`. Recording stamps `record_filed_at` and captures `recorded_by_user_id` from `X-User-ID`. Recording against a contact that is not `PENDING` is refused with `ERR_CONTACT_NOT_PENDING`. The terminal outcomes are `REACHED`, `UNREACHABLE` and `DECLINED`; contacts that were never answered are moved to `NO_CONTACT` by the ops cycle when their `scheduled_for` instant passes.
+
+The utilization summary is the network's single computed read. For an episode it reports the authorization's `urgency_score`, the `projected_step_down_urgency` from the extended-window variant, the authorization's `days_used` and `days_remaining`, the `curriculum_compliance_percent`, the facility's `committed_bed_nights`, an `outstanding_formula` string, a `formula_version` integer and the episode's `discharged_at`; an `authorization_id` may be supplied to select which authorization is summarized.
+
+### 3.9. Accreditation Lifecycle and Facility Posture
+
+Accreditations are recorded by a `PlatformAdmin` with an `accreditation_class`, a `granting_body`, an `effective_at` and an `expires_at`, plus `license_level_max` and `credential_tier_min` where the class is `STATE_LICENSE`. They start at `GRANTED`, and the facility's `licensed` and `as_level_max` are recomputed when the class is `STATE_LICENSE`.
+
+A `ClinicalDirector` manages the rest of the lifecycle. Renewing an accreditation pushes its `expires_at` forward by 365 days, whether the row is currently `GRANTED` or has already lapsed to `EXPIRED`; a renewal from `EXPIRED` also recomputes the facility's `licensed` flag and lets it accept admissions again. Suspending a `GRANTED` accreditation moves it to `SUSPENDED` and forces any dependent authorization whose `granted_level` exceeds the facility's remaining licence into `STEP_DOWN_REQUIRED`. Reinstating a `SUSPENDED` accreditation returns it to `GRANTED`, recomputes `licensed`, and returns any episode held at `CARE_HOLD` to its carry-over status. Revoking a `SUSPENDED` accreditation moves it to `REVOKED`, permanently; the facility stops accepting admissions, and `licensed` becomes false when the revoked row was the only `GRANTED` state licence for that `state_code`. Every one of these transitions recomputes `facility_posture`.
+
+Expiry is automatic. During a facility-ops run a `GRANTED` accreditation whose expiry has passed becomes `EXPIRED`, and the facility's `as_level_max` is recomputed; when a `STATE_LICENSE` expires the facility drops to `ASAM_1_0` and stops accepting admissions.
+
+The consequences ripple through live treatment. An episode already `IN_TREATMENT` at a facility that loses its `ACCREDITATION_BODY` standing — a revocation or an expiry — has its treatment plan forced to `PENDING_COSIGN` and every `SCHEDULED` session row rewritten to `CANCELLED` with a replacement scheduled, which is precisely the situation stage four of the ops cycle handles when the facility's posture lands at `FROZEN`. A clinician attempting to author a clinical document or schedule a session at a facility carrying a revoked `ACCREDITATION_BODY` accreditation is refused outright with `ERR_FACILITY_ACCREDITATION_REVOKED`.
+
+## 4. Endpoint Definitions
+
+Operations that create new, stand-alone resources — a facility, a clinician, a payer, a bed, a service offering, a recovery-housing row, an accreditation, a treatment episode — return a `201 Created` status code. Operations that add a row to an existing parent collection without creating a new addressable concept, or that modify an existing resource, transition a state, or record an outcome against something already present, return a `200 OK` status code. This includes authorizations, assessments, clearances, withdrawal-management records, treatment plans, sessions, level-of-care changes, continuing-care plans and alumni contacts, and every accreditation lifecycle action.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/treatment-network/facilities` | Create a facility | PlatformAdmin |
+| GET | `/treatment-network/facilities` | List facilities | Any |
+| GET | `/treatment-network/facilities/{id}` | Get one facility | Any |
+| POST | `/treatment-network/facilities/{id}/facility-ops/run` | Run one facility-ops epoch | PlatformAdmin, ClinicalDirector |
+| POST | `/treatment-network/_clock/set_current_utc` | Set the logical clock | PlatformAdmin |
+| POST | `/treatment-network/clinicians` | Create a clinician | PlatformAdmin |
+| GET | `/treatment-network/clinicians/{id}` | Get one clinician | Any |
+| POST | `/treatment-network/clinicians/{clinicianId}/facility-credentials` | Grant a clinician a facility credential | PlatformAdmin |
+| GET | `/treatment-network/clinicians/{id}/facility-credentials` | List a clinician's facility credentials | Any |
+| GET | `/treatment-network/clinicians/{id}/assessments` | List assessments authored by a clinician | Any |
+| GET | `/treatment-network/clinicians/{id}/treatment-plans` | List treatment plans authored by a clinician | Any |
+| GET | `/treatment-network/clinicians/{id}/sessions` | List sessions run by a clinician | Any |
+| GET | `/treatment-network/clinicians/{id}/continuing-care-plans` | List continuing-care plans signed by a clinician | Any |
+| POST | `/treatment-network/payers` | Create a payer | PlatformAdmin |
+| GET | `/treatment-network/payers/{id}` | Get one payer | Any |
+| GET | `/treatment-network/payers/{id}/authorizations` | List authorizations funded by a payer | Any |
+| POST | `/treatment-network/facilities/{id}/beds` | Create a bed staffed for one ASAM level | PlatformAdmin |
+| GET | `/treatment-network/facilities/{id}/beds` | List a facility's beds | Any |
+| POST | `/treatment-network/facilities/{id}/service-offerings` | Create a programming service offering | PlatformAdmin |
+| GET | `/treatment-network/facilities/{id}/service-offerings` | List a facility's service offerings | Any |
+| GET | `/treatment-network/service-offerings/{id}` | Get one service offering | Any |
+| GET | `/treatment-network/service-offerings/{id}/sessions` | List sessions delivered for one service offering | Any |
+| GET | `/treatment-network/level-of-care-changes/{id}` | Get one level-of-care change | Any |
+| GET | `/treatment-network/beds/{id}/level-of-care-changes` | List the level-of-care changes targeting one bed | Any |
+| GET | `/treatment-network/level-of-care-changes` | List level-of-care changes across the network | Any |
+| POST | `/treatment-network/facilities/{id}/recovery-housing` | Create a recovery-housing row | PlatformAdmin |
+| GET | `/treatment-network/facilities/{id}/recovery-housing` | List a facility's recovery-housing rows | Any |
+| GET | `/treatment-network/recovery-housing/{id}` | Get one recovery-housing row | Any |
+| GET | `/treatment-network/recovery-housing/{id}/continuing-care-plans` | List continuing-care plans placed in one housing row | Any |
+| GET | `/treatment-network/facilities/{id}/clinician-credentials` | List clinician facility credentials issued at one facility | Any |
+| POST | `/treatment-network/facilities/{id}/accreditations` | Record an accreditation | PlatformAdmin |
+| GET | `/treatment-network/facilities/{id}/accreditations` | List a facility's accreditations | Any |
+| GET | `/treatment-network/accreditations/{id}` | Get one accreditation | Any |
+| POST | `/treatment-network/facilities/{id}/accreditations/{accreditationId}/renew` | Renew an accreditation | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/accreditations/{accreditationId}/suspend` | Suspend an accreditation | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/accreditations/{accreditationId}/revoke` | Revoke an accreditation permanently | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/accreditations/{accreditationId}/reinstate` | Reinstate a suspended accreditation | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes` | Open an admission episode | AdmissionsIntakeNurse, Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes` | List a facility's episodes | Any |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}` | Get one episode inside its facility | Any |
+| GET | `/treatment-network/treatment-episodes/{id}` | Get one episode across the network | Any |
+| GET | `/treatment-network/treatment-episodes/{episodeId}/utilization-summary` | Computed utilization read for one episode | Any |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/admit` | Admit the episode | AdmissionsIntakeNurse |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/complete-treatment` | Move the episode to COMPLETED | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/discharge` | Discharge the episode | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/assessments` | Begin a clinical assessment | AdmissionsIntakeNurse, Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/assessments` | List an episode's assessments | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/assessments` | List an episode's assessments across the network | Any |
+| POST | `/treatment-network/facilities/{id}/assessments/{assessmentId}/complete` | Complete an assessment and place the episode | Clinician |
+| POST | `/treatment-network/facilities/{id}/assessments/{assessmentId}/cancel` | Cancel an assessment | Clinician, ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/authorizations` | Request payer authorization for a level of care | UtilizationReviewer |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/authorizations` | List an episode's authorizations | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/authorizations` | List an episode's authorizations across the network | Any |
+| GET | `/treatment-network/authorizations/{id}` | Get one authorization | Any |
+| GET | `/treatment-network/authorizations/{id}/level-of-care-changes` | List the level-of-care changes funded by one authorization | Any |
+| POST | `/treatment-network/facilities/{id}/authorizations/{authorizationId}/approve` | Approve a pending authorization | UtilizationReviewer |
+| POST | `/treatment-network/facilities/{id}/authorizations/{authorizationId}/deny` | Deny a pending authorization or demote an approved one | UtilizationReviewer |
+| POST | `/treatment-network/facilities/{id}/authorizations/{authorizationId}/submit-concurrent-review` | File a concurrent review | UtilizationReviewer |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/medical-clearances` | Order a clearance | AdmissionsIntakeNurse, Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/medical-clearances` | List an episode's clearances | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/medical-clearances` | List an episode's clearances across the network | Any |
+| POST | `/treatment-network/facilities/{id}/medical-clearances/{clearanceId}/clear` | Record a clearance as CLEARED | Clinician, ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/medical-clearances/{clearanceId}/fail` | Record a clearance as FAILED | Clinician, ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/withdrawal-management` | Author the withdrawal-management record | Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/withdrawal-management` | List an episode's withdrawal-management records | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/withdrawal-management` | List an episode's withdrawal-management records across the network | Any |
+| GET | `/treatment-network/facilities/{id}/withdrawal-management` | List every withdrawal-management record at one facility | Any |
+| GET | `/treatment-network/withdrawal-management/{id}` | Get one withdrawal-management record | Any |
+| PUT | `/treatment-network/facilities/{id}/withdrawal-management/{planId}` | Update a withdrawal-management record | Clinician |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/treatment-plans` | Create a treatment plan | Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/treatment-plans` | List an episode's treatment plans | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/treatment-plans` | List an episode's treatment plans across the network | Any |
+| GET | `/treatment-network/facilities/{id}/treatment-plans` | List every treatment plan at one facility | Any |
+| GET | `/treatment-network/treatment-plans/{id}` | Get one treatment plan | Any |
+| PUT | `/treatment-network/treatment-plans/{id}` | Edit a treatment plan under optimistic concurrency | Clinician, ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-plans/{planId}/submit-for-cosign` | Submit a plan for clinical-director co-signature | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/sessions` | Schedule a session | AdmissionsIntakeNurse, Clinician |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/sessions` | List an episode's sessions | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/sessions` | List an episode's sessions across the network | Any |
+| GET | `/treatment-network/sessions/{id}` | Get one session attendance | Any |
+| POST | `/treatment-network/facilities/{id}/sessions/{sessionId}/record-attendance` | Record attendance or a no-show | Clinician |
+| POST | `/treatment-network/facilities/{id}/sessions/{sessionId}/cancel` | Cancel a scheduled session | Clinician |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/level-of-care-changes` | Appoint a level-of-care change | ClinicalDirector, UtilizationReviewer |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/level-of-care-changes` | List an episode's level-of-care changes | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/level-of-care-changes` | List an episode's level-of-care changes across the network | Any |
+| POST | `/treatment-network/facilities/{id}/level-of-care-changes/{changeId}/complete` | Complete a planned level-of-care change | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/level-of-care-changes/{changeId}/cancel` | Cancel a planned change or compensate a completed one | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/level-of-care-changes/{changeId}/step-up` | Raise the episode to a higher level of care | ClinicalDirector |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/continuing-care-plans` | Draft a continuing-care plan | ClinicalDirector, Clinician |
+| GET | `/treatment-network/facilities/{id}/continuing-care-plans` | List every continuing-care plan at one facility | Any |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/continuing-care-plans` | List an episode's continuing-care plans | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/continuing-care-plans` | List an episode's continuing-care plans across the network | Any |
+| POST | `/treatment-network/facilities/{id}/continuing-care-plans/{ccPlanId}/activate` | Activate a drafted continuing-care plan | ClinicalDirector, Clinician |
+| POST | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/alumni-contacts` | File an ad-hoc alumni contact | AlumniCoordinator |
+| GET | `/treatment-network/facilities/{id}/treatment-episodes/{episodeId}/alumni-contacts` | List an episode's alumni contacts | Any |
+| GET | `/treatment-network/treatment-episodes/{id}/alumni-contacts` | List an episode's alumni contacts across the network | Any |
+| POST | `/treatment-network/facilities/{id}/alumni-contacts/{contactId}/record` | Record the outcome of a due alumni contact | AlumniCoordinator |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_USER_CONTEXT_HEADER` | 400 |
+| `ERR_INSUFFICIENT_PERMISSIONS` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES_VIOLATION` | 403 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_IDEMPOTENCY_KEY_CONFLICT` | 409 |
+| `ERR_FACILITY_NOT_FOUND` | 404 |
+| `ERR_EPISODE_NOT_FOUND` | 404 |
+| `ERR_ASSESSMENT_NOT_FOUND` | 404 |
+| `ERR_BED_NOT_FOUND` | 404 |
+| `ERR_AUTHORIZATION_NOT_FOUND` | 404 |
+| `ERR_PLAN_NOT_FOUND` | 404 |
+| `ERR_CHANGE_NOT_FOUND` | 404 |
+| `ERR_HOUSING_NOT_FOUND` | 404 |
+| `ERR_ACCREDITATION_NOT_FOUND` | 404 |
+| `ERR_CONTACT_NOT_FOUND` | 404 |
+| `ERR_SERVICE_NOT_FOUND` | 404 |
+| `ERR_CLINICIAN_NOT_FOUND` | 404 |
+| `ERR_PAYER_NOT_FOUND` | 404 |
+| `ERR_SESSION_NOT_FOUND` | 404 |
+| `ERR_INVALID_REFERENCE` | 404 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_INVALID_ENUM_VALUE` | 400 |
+| `ERR_INVALID_DIMENSION_SCORES` | 400 |
+| `ERR_ALUMNI_INTERVAL_INVALID` | 400 |
+| `ERR_HOUSING_WINDOW_INVALID` | 400 |
+| `ERR_EPISODE_NOT_AWAITING_ASSESSMENT` | 409 |
+| `ERR_EPISODE_NOT_UNDER_ASSESSMENT` | 409 |
+| `ERR_EPISODE_NOT_AWAITING_AUTHORIZATION` | 409 |
+| `ERR_EPISODE_NOT_AWAITING_ADMISSION` | 409 |
+| `ERR_EPISODE_NOT_IN_TREATMENT` | 409 |
+| `ERR_EPISODE_NOT_COMPLETED` | 409 |
+| `ERR_CONTINUING_CARE_PLAN_REQUIRED` | 409 |
+| `ERR_ALREADY_DISCHARGED` | 409 |
+| `ERR_ASSESSMENT_NOT_IN_PROGRESS` | 409 |
+| `ERR_AUTHORIZATION_NOT_PENDING` | 409 |
+| `ERR_AUTHORIZATION_NOT_APPROVED` | 409 |
+| `ERR_AUTHORIZATION_ALREADY_DENIED` | 409 |
+| `ERR_AUTHORIZATION_NOT_REOPENABLE` | 409 |
+| `ERR_AUTHORIZATION_UNUSED` | 409 |
+| `ERR_TREATMENT_PLAN_NOT_ACTIVE` | 409 |
+| `ERR_CHANGE_NOT_PLANNED` | 409 |
+| `ERR_CHANGE_NOT_DUE` | 409 |
+| `ERR_CHANGE_BRANCH_NOT_APPLICABLE` | 409 |
+| `ERR_CONTACT_NOT_PENDING` | 409 |
+| `ERR_FACILITY_NOT_LICENSED` | 403 |
+| `ERR_FACILITY_ACCREDITATION_INVALID` | 409 |
+| `ERR_FACILITY_ACCREDITATION_REVOKED` | 409 |
+| `ERR_FACILITY_POSTURE_FROZEN` | 409 |
+| `ERR_LEVEL_EXCEEDS_FACILITY_LICENSE` | 409 |
+| `ERR_ASSESSOR_CREDENTIAL_INSUFFICIENT` | 403 |
+| `ERR_PAYER_CREDENTIAL_TIER_UNMET` | 403 |
+| `ERR_MEDICAL_CLEARANCE_NOT_CLEARED` | 409 |
+| `ERR_MEDICAL_CLEARANCE_EXPIRED` | 410 |
+| `ERR_WITHDRAWAL_MANAGEMENT_NOT_ACTIVE` | 409 |
+| `ERR_WITHDRAWAL_MANAGEMENT_NOT_COMPLICATED` | 409 |
+| `ERR_CURRICULUM_NOT_COMPLETE` | 409 |
+| `ERR_BED_OCCUPANCY_OVERLAP` | 409 |
+| `ERR_BED_NOT_HELD` | 409 |
+| `ERR_BED_NOT_AVAILABLE` | 409 |
+| `ERR_HOUSING_WINDOW_OVERLAP` | 409 |
+| `ERR_HOUSING_POOL_EXHAUSTED` | 409 |
+| `ERR_CONTINUING_CARE_HOUSING_FULL` | 409 |
+| `ERR_LEVEL_ROUTE_NOT_ALLOWED` | 409 |
+| `ERR_STEP_DOWN_MAP_EXHAUSTED` | 409 |
+| `ERR_MAX_STEP_DOWNS_REACHED` | 409 |
+| `ERR_MAX_CHANGE_PER_PAYER` | 409 |
+| `ERR_EPOCH_STALE` | 409 |
+| `ERR_AUTHORIZATION_DAYS_EXHAUSTED` | 402 |

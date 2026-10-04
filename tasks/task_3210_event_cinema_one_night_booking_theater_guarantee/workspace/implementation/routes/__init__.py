@@ -1,0 +1,1 @@
+"""Route blueprints for the Event Cinema Booking API."""

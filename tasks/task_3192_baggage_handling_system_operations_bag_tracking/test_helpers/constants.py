@@ -1,0 +1,80 @@
+"""Domain thresholds and reference values used by the fixtures and tests.
+
+Every figure below is a literal that the PRD states explicitly; tests cite the
+PRD sentence that carries it.  Generic NON_EXISTENT_UUID comes from the
+framework.
+"""
+
+# --- money / fee rules -----------------------------------------------------
+FEE_PER_5LB_GROUP_CENTS = 7500
+GROUP_SIZE_LB = 5
+HANDLING_BASE_CENTS = 700
+HANDLING_PER_LB_CENTS = 25
+HANDLING_PER_SPECIAL_ITEM_CENTS = 2600
+HANDLING_INTERNATIONAL_SURCHARGE_CENTS = 1800
+HANDLING_MANUAL_PARAMS_CENTS = 3700
+ITEM_BASE_FEE_CENTS = {
+    "OVERSIZE": 4500,
+    "FRAGILE": 6725,
+    "SPORTS_EQUIPMENT": 11250,
+    "MOBILITY_DEVICE": 0,
+}
+ITEM_LIABILITY_CAP_CENTS = {
+    "MOBILITY_DEVICE": 200000,
+    "FRAGILE": 50000,
+    "OVERSIZE": 100000,
+    "SPORTS_EQUIPMENT": 100000,
+}
+LONG_ITEM_SURCHARGE = 1.25
+LINEAR_THRESHOLD_IN = 115
+OVERSIZE_ENVELOPE_IN = 130
+OVERWEIGHT_MARGIN_LB = 20
+
+COMPENSATION_FRACTION = {
+    "DELAYED": 0.00,
+    "DAMAGED": 0.50,
+    "LOST": 0.75,
+    "PILFERED": 0.60,
+}
+FINAL_OFFER_MULTIPLIER = 1.25
+OPEN_STATUS_HAIRCUT = 0.75
+
+# --- counts / capacity -----------------------------------------------------
+MANUAL_CLASS_ALLOWANCE = 5
+CONGESTED_AT_FRACTION = 0.15
+DWELL_CAP_MINUTES = 45
+PER_MANUAL_SCAN_MINUTES = 15
+SCREENING_WINDOW_MINUTES = 20
+MAKEUP_INTERVAL_MINUTES = 120
+MAKEUP_BUFFER_MINUTES = 15
+TASK_DUE_MINUTES = 30
+STALE_OPS_RUNS = 2
+SORTATION_OPEN_MINUTES_BEFORE = 120
+SORTATION_CLOSE_MINUTES_BEFORE = 45
+BOARDING_MINUTES_BEFORE_CLOSE = 15
+RUSH_FLOOR_MINUTES = -15
+
+COUNTED_CUSTODY_STATES = [
+    "ACCEPTED", "SCREENING", "SORTED", "IN_MAKEUP", "LOADED", "HELD",
+]
+OPEN_LIABILITY_STATUSES = [
+    "REPORTED", "INVESTIGATING", "DELIVERY_ARRANGED", "REOPENED",
+]
+SETTLED_LIABILITY_STATUSES = ["DELIVERED", "COMPENSATED", "CLOSED"]
+COUNTER_URL_POINTS = ["INDUCTION", "SCREENING", "SORTATION", "MAKEUP", "LOAD", "DELIVERY"]
+
+# --- reference data chain used across fixtures -----------------------------
+CLOCK_START = "2026-09-01T07:00:00Z"
+FLIGHT_DL1423_DEP = "2026-09-01T15:00:00Z"
+FLIGHT_DL1788_DEP = "2026-09-01T17:30:00Z"
+STATION_SEA = {"code": "SEA", "name": "Seattle-Tacoma", "sorter_capacity_bags": 60}
+AIRLINE_DL = {
+    "code": "DL",
+    "name": "Delta Air Lines",
+    "interline_agreement_active": True,
+    "max_excess_weight_lb": 50,
+    "excess_weight_fee_cents": 7500,
+    "compensation_cap_cents": 300000,
+}
+FLIGHT_MAKEUP_OPEN_UTC = "2026-09-01T13:00:00Z"
+FLIGHT_MAKEUP_CLOSE_UTC = "2026-09-01T14:15:00Z"

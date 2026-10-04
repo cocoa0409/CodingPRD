@@ -1,0 +1,33 @@
+"""Domain thresholds — numeric constants from PRD §2.4, §3.4, §3.6, §3.8."""
+CLOCK_DEFAULT = "2026-09-01T00:00:00Z"
+
+THRESHOLDS = {
+    # PRD §2.4 counterparty eligibility thresholds
+    "MIN_NET_WORTH_CENTS": 2500000,
+    "MAX_QC_DEFECT_BPS": 150,
+    # PRD §3.4 eligibility gates
+    "MAX_LTV_BP": 9500,
+    "MIN_CREDIT_SCORE": 620,
+    "REFER_CREDIT_SCORE_LT": 680,
+    "REFER_LTV_BP_GT": 9000,
+    # PRD §3.6 relief milestone
+    "PAYMENT_HISTORY_MILESTONE": 36,
+    # PRD §3.9 appeal window
+    "APPEAL_WINDOW_DAYS": 30,
+    "MAX_APPEAL_ROUNDS": 2,
+    # PRD §3.8 oversight score
+    "MIN_OVERSIGHT_SCORE_FOR_TRANSFER": 60,
+    "PENDING_ISSUE_PENALTY": 5,
+    "FINDING_PENALTY": 2,
+}
+
+TEST_DEFAULTS = {
+    "SELLER_NET_WORTH_CENTS": 500000000,
+    "SERVICER_NET_WORTH_CENTS": 300000000,
+    "SELLER_QC_DEFECT_RATE_BPS": 100,
+    "LOAN_UPB_CENTS": 400000000,
+    "LOAN_APPRAISAL_CENTS": 500000000,
+    "LOAN_CREDIT_SCORE": 740,
+    "POOL_TARGET_CENTS": 500000000,
+    "PAYMENT_AMOUNT_CENTS": 200000,
+}

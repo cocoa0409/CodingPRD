@@ -1,0 +1,288 @@
+# Flat-Pack Warehouse Assembly API — Product Requirements Document
+
+## 1. Introduction
+
+Flat-pack furniture retail runs on an unusual bargain with the shopper: the store keeps prices low by making the customer do the last mile of the supply chain — finding the aisle and bin, wrestling cartons onto a trolley, and assembling the product at home. This document specifies the API behind that bargain for a U.S. flat-pack retailer: article-to-aisle/bin location, self-serve versus full-serve picking, live in-store stock signals, pickup-counter reservation of bulky goods, home delivery scheduled against vehicle capacity and building access, third-party assembly crews billed against labor standards, free spare-part replacement claims, family-membership pricing with points, and returns of goods in any state of assembly with condition grading and restocking.
+
+The hardest property of the domain is that a single product is not a single box. A wardrobe may ship as three cartons that must be picked together, stocked together, reserved together, and weighed together for delivery. Almost every rule below — availability, pricing, capacity, refunding — is therefore expressed per carton and aggregated, and the API exists to keep those aggregates consistent as shoppers, store staff, delivery coordinators, and assembly crews act on the same stock concurrently.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, identifying that user's role. A request missing either header, or carrying a role the server does not recognize, is rejected with `ERR_UNAUTHENTICATED`. A recognized role attempting an operation outside its grant, or a `Customer` acting on a resource owned by another customer, is rejected with `ERR_FORBIDDEN`. These two checks apply to every endpoint in the system.
+
+Six roles are recognized. **Anonymous** is the placeholder for an unauthenticated caller — blank or absent `X-User-Role` and `X-User-ID` — and every endpoint rejects it. When `X-User-Role` is `Anonymous`, `X-User-ID` is an opaque identifier tied to no persisted entity. **PlatformAdmin** is the platform operator: it manages stores, the article catalog, carton registration, assembly standards, customer registration, and the logical clock. When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not compared to any entity's `id`. **StoreOps** is in-store operations staff: it manages bin stock, fulfills and cancels reservations, completes pickup handover, enrolls members, grades and settles returns, and reviews spare-part claims. When `X-User-Role` is `StoreOps`, `X-User-ID` is an opaque operator identifier the server does not compare to any entity's `id`. **DeliveryCoordinator** operates the delivery network: it creates slots and drives bookings out the door. When `X-User-Role` is `DeliveryCoordinator`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. **AssemblyProvider** is a third-party assembly crew: it drives job dispatch, start, hold, resume, and completion. When `X-User-Role` is `AssemblyProvider`, `X-User-ID` is an opaque crew identifier — the server may record it, for example as `provider_id` on an assembly job, but does not compare it to any entity's `id`. **Customer** is the shopper, and it is the only entity-backed role: when `X-User-Role` is `Customer`, `X-User-ID` is the `id` of the acting customer record, and ownership checks on any resource that references a customer compare the resource's `customer_id` field to `X-User-ID`. A customer may read and mutate only its own orders, reservations, bookings, assembly requests, claims, and returns.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters: `limit`, the page size, defaulting to 10 with a minimum of 1 and a maximum of 100, and `offset`, the number of records to skip, defaulting to 0. Both are optional on every list endpoint. Every list response reports `limit`, `offset`, `total_count`, and `has_more` inside `meta`. Unless an endpoint states otherwise, list results are sorted by `created_at` in ascending order — oldest record first.
+
+### 2.4. Resource Identity and Common Fields
+
+Every resource in this system carries the same four system-managed properties. The `id` is a server-minted UUID with no type prefix — the identifier itself never encodes the entity kind. `created_at` and `updated_at` are ISO 8601 UTC timestamps rendered with three fractional digits; `created_at` is fixed at creation, while `updated_at` refreshes on every mutation of the resource. `version` is an integer that starts at 1 when the resource is created and increments by exactly 1 on every mutation, including mutations caused by cascades from other resources — so when a booking confirmation bumps a delivery slot's consumed capacity, the slot's `version` advances too, and the response reflects the new value immediately. All entities in this domain — stores, articles, cartons, bin-stock rows, customers, orders, order lines, reservations, delivery slots, delivery bookings, assembly standards, assembly jobs, spare-part claims, return requests, and return lines — carry the full set; there are no reduced-metadata entities.
+
+### 2.5. Money, Units, and Rounding Discipline
+
+All monetary values are integer cents. No endpoint accepts or returns fractional cents, and every derived amount is rounded half-up — a half cent rounds away from zero — at the step where the specification says the rounding occurs. Two rounding disciplines recur and must not be confused: per-line rounding, where each line's amount is rounded half-up before the rounded amounts are summed (order pricing and return refunds work this way), and terminal rounding, where a single rounding half-up happens once at the end of a calculation (the member delivery-fee discount and the no-receipt refund basis work this way). Physical quantities are decimal numbers: carton weight is expressed in kilograms and carton volume in cubic meters, both strictly greater than zero. Stock quantities, points, and minutes are integers.
+
+### 2.6. The Logical Clock and Time Comparisons
+
+The server maintains a logical clock rather than reading wall-clock time. Before any client call has been made, the clock reads exactly 2026-09-01T00:00:00Z, and it never falls back to wall-clock time thereafter. A platform-admin-only test-driving capability advances the clock to a supplied `to_iso8601` instant and responds with the resulting `current_utc`. Every temporal rule in this document — reservation expiry, delivery-slot past-date checks, assembly-window past checks, and rolling 365-day claim windows — is evaluated against this logical clock. A reservation created "now" expires exactly 24 hours later; a fulfillment attempted at the exact expiry instant is already too late, because the reservation is expired from its `expires_at` moment onward, inclusive.
+
+### 2.7. Optimistic Concurrency Control
+
+Two write operations are guarded by optimistic concurrency control, and only those two accept a version field in their request body. Creating a delivery booking for an order requires `expected_slot_version`, carrying the `version` of the target delivery slot the client last observed; if the slot's current `version` has advanced — because another booking has since consumed or released capacity — the request is rejected with `ERR_STALE_VERSION` (HTTP 412), forcing the client to re-read the slot before quoting fee and capacity again. Adjusting a bin-stock row requires `expected_stock_version`, carrying the `version` of the row the operator last observed; because adjustments are delta-based, a request written against a stale row — one since mutated by a checkout, a reservation, a fulfillment, a return restock, or a prior adjustment — is rejected with `ERR_STALE_VERSION` (HTTP 412) so the operator re-reads the row before re-applying the delta. Endpoints not named here take no version field at all.
+
+### 2.8. Nested Path Resolution
+
+URLs that name more than one resource are validated left to right: the server resolves the first path parameter, confirms the referenced resource exists, then resolves the next. When a path names a store and then an article, a missing store yields `ERR_STORE_NOT_FOUND` before the article is ever examined, and a missing article under an existing store yields `ERR_ARTICLE_NOT_FOUND`. The same discipline applies to grading a return line, where the return request's `id` resolves first and the line's `line_id` second, surfacing `ERR_RETURN_NOT_FOUND` or `ERR_RETURN_LINE_NOT_FOUND` respectively. Every resource class has its own not-found error — `ERR_CARTON_NOT_FOUND`, `ERR_BIN_STOCK_NOT_FOUND`, `ERR_CUSTOMER_NOT_FOUND`, `ERR_ORDER_NOT_FOUND`, `ERR_ORDER_LINE_NOT_FOUND`, `ERR_RESERVATION_NOT_FOUND`, `ERR_SLOT_NOT_FOUND`, `ERR_BOOKING_NOT_FOUND`, `ERR_JOB_NOT_FOUND`, `ERR_CLAIM_NOT_FOUND`, and `ERR_STANDARD_NOT_FOUND` alongside those above — and all of them carry HTTP 404.
+
+### 2.9. Validation Priority Order
+
+When a request violates several rules at once, the error the caller sees is determined by a fixed priority order, evaluated from first to last. Request-shape validation comes first — required fields present, enum values valid, types correct — and any failure there is `ERR_VALIDATION` (HTTP 400). Second, authentication: missing or unrecognized `X-User-Role` or `X-User-ID` headers yield `ERR_UNAUTHENTICATED` (HTTP 401). Third, authorization: a role not permitted for the endpoint, or a customer touching another customer's resource, yields `ERR_FORBIDDEN` (HTTP 403). Fourth, existence of every identifier referenced in the path or body, resolved left to right, yielding the appropriate not-found error (HTTP 404). Fifth, optimistic concurrency: a stale `expected_slot_version` or `expected_stock_version` yields `ERR_STALE_VERSION` (HTTP 412). Sixth, state-machine legality — wrong from-state, an unreturnable order, an expired reservation, a duplicate booking, or ungraded return lines — yielding `ERR_INVALID_STATE`, `ERR_ORDER_NOT_RETURNABLE`, `ERR_RESERVATION_EXPIRED`, `ERR_DUPLICATE_BOOKING`, or `ERR_UNGRADED_LINES` (HTTP 409). Seventh, temporal rules: an assembly window in the past or a delivery slot whose service date has passed, yielding `ERR_WINDOW_IN_PAST` or `ERR_SLOT_IN_PAST` (HTTP 422). Eighth, business constraints: stock sufficiency, multi-carton completeness, duplicate bin-stock rows, slot capacity, building-access feasibility, crew-window conflicts, missing assembly standards, receipt requirements, and return-quantity limits (HTTP 422). Ninth and last, fiscal limits: points balance and spare-part claim caps (HTTP 422). Because of this ordering, a request that is both malformed and unauthorized always reports `ERR_VALIDATION`, and a stock failure on a stale-versioned request always reports `ERR_STALE_VERSION` first.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Catalog Setup: Articles, Cartons, and Shelf Stock
+
+A `PlatformAdmin` opens a new store by supplying its display `name` and a `code` that must be unique across all stores, along with an optional `low_stock_threshold` — the number of units at or above which an article signals healthy stock — which defaults to 5 and must be at least 1. Articles are registered with a unique IKEA-style `article_number`, a product `name`, a `category` of `FURNITURE`, `FOOD`, or `ACCESSORY`, and a `pick_policy` of `SELF_SERVE` (the shopper picks from the aisle) or `FULL_SERVE` (bulky goods handed over at the pickup counter against a reservation). Pricing is set through `price_cents`, the non-negative regular unit price; `family_price_cents`, an optional member price that must be non-negative when set and where a null value means the article has no member price; and `lowest_price_365d_cents`, the lowest sale price in the trailing 365 days, used as the basis for no-receipt refunds, where a null value means the current regular price is used instead. A later catalog-price update may revise any of these three pricing fields without touching the rest of the article. The `requires_assembly` flag, defaulting to false, marks the article eligible for third-party assembly.
+
+Cartons are where the flat-pack reality enters the model. Each carton registered against an article carries a `carton_seq` — a 1-based sequence number unique within its article — plus its `aisle` and `bin` locators and its `weight_kg` and `volume_m3`. The article's `carton_count` is recomputed every time a carton is registered, and `is_multi_carton` is true exactly when that count is greater than 1; until any carton is registered the count is 0. Shelf stock lives one level down: a bin-stock row joins a `store_id` and a `carton_id`, exactly one row per store-and-carton pair — attempting to create a second row for an existing pair is rejected with `ERR_DUPLICATE_BIN_STOCK`. The row's `on_hand` is the physical unit count on the shelf, defaulting to 0 and never negative; `reserved` counts units promised to active reservations or confirmed delivery bookings and must stay between 0 and `on_hand` inclusive; `available` is simply what remains when the reserved units are subtracted from what is on hand. A `StoreOps` operator may correct `on_hand` with a manual delta adjustment carrying `delta_on_hand` — the adjustment is applied on top of the current count, the result must stay non-negative and at least as large as `reserved`, and the row's `version` increments by 1 — subject to the optimistic-concurrency rule of §2.7.
+
+Shoppers see stock through the in-store signal, recomputed after every mutation of a bin-stock row. For a given store and article, the server walks the article's cartons in ascending `carton_seq` order; if the article has no cartons, or any carton lacks a bin-stock row in that store, the signal reports `available_units` of 0. Otherwise `available_units` is the smallest per-carton `available` across all of the article's cartons — the number of complete multi-box sets the shelf can yield. The response reports the queried `article_id` and `store_id`, the computed `available_units`, the `threshold_used` (the store's `low_stock_threshold`), and the `signal` itself: `OUT_OF_STOCK` when no complete units are available, `LOW_STOCK` when some are available but fewer than the threshold, and `IN_STOCK` once availability reaches the threshold. The same store's full shelf can be browsed through the store's stock listing, and bin-stock rows can be listed globally with optional `store_id` and `carton_id` filters.
+
+### 3.2. Shoppers and the Family Membership
+
+Customer registration takes an `email`, unique across customers, and a `full_name`. New customers start with `member_status` of `NONE`, a null `member_since`, and a `points_balance` of 0. A `StoreOps` operator can enroll a customer in the family program, which flips `member_status` to `ACTIVE` and stamps `member_since` with the current logical time; enrollment is the only path into membership. Points are the program's currency at a fixed par of 1 point to 1 cent: they are earned when orders close, redeemed at checkout, and visible on the customer record alongside the orders and spare-part claims that belong to that customer. Membership gates three things elsewhere in the system — member pricing and the food offer at checkout, the delivery-fee discount, and the right to return goods without a receipt.
+
+### 3.3. Building and Paying an Order
+
+A customer begins by opening a draft order against a `store_id`; the order's `customer_id` is taken from the caller's `X-User-ID`, never from the request body, so one customer can never draft an order in another's name. The order is born with `status` of `DRAFT`, `delivery_status` of `NONE`, `assembly_status` of `NONE`, and a `fulfillment_channel` of `CARRYOUT`; the three status fields are parallel dimensions that evolve independently — an order can be `PAID` while `WAITLISTED` for delivery, or `FULFILLED` with assembly `IN_PROGRESS`. Lines are added to the draft one at a time with an `article_id` and a `qty` of at least 1. An order with no lines cannot be checked out at all.
+
+Checkout is the pivot of the whole workflow, and the caller may pass two optional inputs there: `fulfillment_channel`, pinning the order to `CARRYOUT` or `DELIVERY` from this point on, and `redeem_points`, asking to spend family points against the bill. The stock check runs per line against the order's store: for every line, the article's `available_units` — the smallest per-carton `available`, per the signal rule — must cover the requested `qty`, and every line's article must have at least one carton with a bin-stock row in that store. When every carton of an article falls short — or the article simply has no cartons or no stock rows — the checkout is rejected with `ERR_INSUFFICIENT_STOCK`; when some cartons could cover the quantity but at least one cannot, the rejection is `ERR_MULTI_CARTON_SHORTAGE`, because a multi-box product must be picked as a complete set. A `redeem_points` request exceeding the customer's `points_balance` is rejected with `ERR_INSUFFICIENT_POINTS`.
+
+Pricing then evaluates in a pinned order, per line and then across the order, with no circularity. First, each line's `unit_price_cents` is captured: the article's `family_price_cents` when the customer is an `ACTIVE` member and a member price is set, otherwise the regular `price_cents`. Second, `line_gross_cents` is the captured unit price multiplied by the quantity. Third, the food offer: when the customer is an `ACTIVE` member and the article's `category` is `FOOD`, the line earns a `line_discount_cents` of 10 percent of its gross, rounded half-up per line; every other line's discount is 0. Fourth, `line_total_cents` is the gross minus the discount, and fifth, `effective_unit_paid_cents` is the line total divided by the quantity, rounded half-up — this is the price actually paid per unit, it excludes any points redemption, and it becomes the refund basis for receipted returns. Sixth, the order's `subtotal_cents` is the sum of line grosses and `discount_cents` the sum of the per-line discounts — the rounded per-line discounts are summed, never recomputed from the summed grosses, so two `FOOD` lines grossing 115 cents each yield 12 plus 12, that is 24 cents of discount, not the 23 a sum-then-round would produce. Seventh, points redemption: the applied `points_discount_cents` is the smallest of the requested `redeem_points`, the customer's `points_balance`, and 20 percent of the post-discount merchandise value (the subtotal minus the discount), that last term rounded down to a whole cent. Eighth, `total_cents` is the subtotal minus the discount minus the applied points. The redeemed points are debited from the customer's `points_balance` as part of the same checkout.
+
+Stock movement at checkout depends on the pinned channel and each line's `fulfillment_mode` — `SELF_PICK` for `SELF_SERVE` articles, `PICKUP_COUNTER` for `FULL_SERVE` ones. On a `CARRYOUT` order, every `SELF_PICK` line decrements `on_hand` by the line quantity on every carton of its article, on the assumption the shopper is wheeling the boxes out now. Every `PICKUP_COUNTER` line instead auto-creates an `ACTIVE` pickup-counter reservation with its `order_line_id` set and an expiry exactly 24 hours out, and increments `reserved` by the quantity on every carton — the boxes stay on the shelf but are promised. On a `DELIVERY` order, checkout moves no stock at all; reservation happens later, when a delivery booking is confirmed. The order emerges from checkout in `PAID`.
+
+From `PAID`, a `CARRYOUT` order is handed over when a `StoreOps` operator marks pickup complete — allowed only once every `PICKUP_COUNTER` line's reservation has reached `FULFILLED` — moving the order to `FULFILLED`. An order on the delivery channel reaches `DELIVERED` by system action when its booking completes, provided its `delivery_status` is `OUT_FOR_DELIVERY`. Closing credits the family program: when an order moves from `FULFILLED` or `DELIVERED` to `CLOSED` — either by the customer's explicit close or automatically the moment its assembly finishes — the order's `assembly_status` must be `NONE` or `COMPLETED`, and if the customer is an `ACTIVE` member the server computes `points_earned` as the whole-dollar floor of `total_cents` divided by 100 and adds those points to the customer's `points_balance`; a non-member earns nothing. Cancellation is free while the order is a `DRAFT`. Cancelling a `PAID` order is allowed only when nothing downstream has started: `delivery_status` must be `NONE` (an active booking must be cancelled first), `assembly_status` must be `NONE`, and no `PICKUP_COUNTER` line's reservation may already be `FULFILLED`. The cancellation then compensates in full — every `SELF_PICK` line restocks by adding its quantity back to `on_hand` on each carton, every still-`ACTIVE` auto-created reservation flips to `CANCELLED` and releases its `reserved` units per carton, and the redeemed `points_discount_cents` are re-credited to the customer's balance.
+
+Orders can be listed with optional `customer_id`, `store_id`, and `status` filters, and order lines with optional `order_id` and `article_id` filters; a customer's own order history is also reachable under the customer resource.
+
+### 3.4. Pickup-Counter Reservations and the Daily Sweep
+
+Beyond the checkout auto-creation above, a customer can place a standalone pickup-counter reservation directly, naming a `store_id`, an `article_id`, and a `qty` of at least 1 — the article's `pick_policy` must be `FULL_SERVE`, since self-serve stock is simply walked out of the aisle. A standalone reservation has a null `order_line_id` (the checkout-created kind has it set), carries a `reserved_at` creation timestamp and an `expires_at` exactly 24 hours later, and immediately increments `reserved` by the quantity on every carton of the article in that store. Its lifecycle is short: `ACTIVE` at birth, then exactly one of three endings. A `StoreOps` fulfillment at the counter converts the promise into a sale — allowed only while the logical clock is still before `expires_at`; fulfilling at or after that instant instead flips the reservation to `EXPIRED` and rejects the request with `ERR_RESERVATION_EXPIRED`. A successful fulfillment decrements both `reserved` and `on_hand` by the quantity on every carton, moving the reservation to `FULFILLED`. A cancellation — by the customer, by `StoreOps`, or by the system cascade when the owning order is cancelled — releases the `reserved` units per carton and ends in `CANCELLED`. And time itself ends reservations: the ops-run sweep transitions every `ACTIVE` reservation whose `expires_at` has been reached to `EXPIRED`, releasing its `reserved` units per carton and recomputing the affected stock signals.
+
+The sweep is a `StoreOps`-only, per-store checkpoint with two phases. First it expires every due reservation in the store as just described; then it runs waitlist promotion (§3.5) across every delivery slot of the store. Its response names what it did through `expired_reservation_ids` and `promoted_booking_ids`. Reservations may also be browsed with optional `store_id`, `customer_id`, `article_id`, `order_line_id`, and `status` filters.
+
+### 3.5. Home Delivery: Slots, Quotes, and the Waitlist
+
+A `DeliveryCoordinator` opens a delivery slot for a store by naming a `service_date` (an ISO calendar date for the delivery day), a `vehicle_id`, a distance-band `zone` of `ZONE_A`, `ZONE_B`, or `ZONE_C`, and the vehicle's `capacity_weight_kg` and `capacity_volume_m3`, both strictly positive. The slot tracks its own loading: `used_weight_kg` and `used_volume_m3` are the sums over the slot's bookings that are `CONFIRMED` or `OUT_FOR_DELIVERY`, and the slot's `posture` reads `OPEN` while free capacity remains in both dimensions and `FULL` the moment free weight or free volume reaches zero. Slots can be listed with optional `store_id` and `service_date` filters, and a slot's bookings are listed under the slot itself.
+
+Booking home delivery is the customer's act on a `PAID` order whose channel was pinned to `DELIVERY` and whose `delivery_status` is still `NONE` — attempting a second booking while any non-terminal booking exists is rejected with `ERR_DUPLICATE_BOOKING`. The request names the `slot_id`, the building `access_type` — `ELEVATOR`, `WALKUP_LOW` for floors 1–2, or `WALKUP_HIGH` for floor 3 and above — the destination `floor` (zero or greater), and the OCC guard `expected_slot_version` from §2.7; a slot whose `service_date` is before the current logical date is rejected with `ERR_SLOT_IN_PAST`. The booking's physical size is derived, not declared: `total_weight_kg` is the sum over the order's lines of the line quantity times the summed `weight_kg` of that article's cartons, and `total_volume_m3` is computed the same way from carton volumes. A booking can be impossible before it is inconvenient: if its weight or volume alone would exceed the slot's capacity even on an empty slot, the request is rejected outright with `ERR_BOOKING_NEVER_FITS` rather than parked on a waitlist. Otherwise the fit test is inclusive — the booking fits when the slot's used weight plus the booking's weight stays at or under `capacity_weight_kg` and the same holds for volume, so a booking that exactly fills both dimensions still fits. A fitting booking is born `CONFIRMED`: it adds its totals to the slot's used figures, bumps the slot's `version` by 1, increments `reserved` by the line quantity on every carton of every line, and moves the order's `delivery_status` to `SCHEDULED`. A non-fitting booking is born `WAITLISTED` — no capacity, no stock, and the order's `delivery_status` reads `WAITLISTED`.
+
+The delivery fee is quoted at booking time into `fee_cents`. The gross fee starts from a zone base of 4900 cents for `ZONE_A`, 7900 cents for `ZONE_B`, or 12900 cents for `ZONE_C`. A weight surcharge follows: nothing while the booking weighs at most 50 kilograms; a flat 2500 cents once it exceeds 50 kilograms up to and including 150; and beyond 150 kilograms the flat 2500 plus 15 additional cents per kilogram of overage, with any fractional overage rounded up to a whole kilogram. Building access adds 1200 cents when the `access_type` is `WALKUP_HIGH` — and here the fee quote doubles as a feasibility gate, because a `WALKUP_HIGH` booking in which any carton of any line weighs more than 40 kilograms cannot be serviced at all and is rejected with `ERR_ACCESS_INFEASIBLE` before any fee is quoted. Finally, an `ACTIVE` family member pays 80 percent of the gross, the 20 percent discount applied with a single rounding half-up at the end; non-members pay the gross as computed.
+
+From `SCHEDULED`, a `DeliveryCoordinator` starts the run, moving the booking to `OUT_FOR_DELIVERY` and the order's `delivery_status` with it. Completion finishes the loop: the booking becomes `DELIVERED`, each line's quantity is finally deducted from `on_hand` on every carton while the matching `reserved` units are released, the order's `delivery_status` becomes `DELIVERED` and its `status` follows to `DELIVERED`, and the auto-close evaluation runs — if the order's assembly has already completed, the order closes on the spot with the usual points accrual. Cancellation by the customer or the coordinator unwinds by state: cancelling a `CONFIRMED` booking releases its capacity from the slot's used figures, bumps the slot's `version` by 1, releases the `reserved` stock per carton per line, returns the order's `delivery_status` to `NONE`, and triggers a waitlist-promotion scan of the slot; cancelling a `WAITLISTED` booking simply returns the order's `delivery_status` to `NONE`, since nothing was ever consumed.
+
+Waitlist promotion is the waterfall that refills freed capacity, triggered by a confirmed booking's cancellation and by the daily sweep. The slot's `WAITLISTED` bookings are ranked by `created_at` ascending, ties broken by lighter `total_weight_kg` first and then by smaller `total_volume_m3`. The scan walks that order greedily: a candidate that fits the remaining capacity is promoted to `CONFIRMED` — consuming slot capacity, bumping the slot's `version`, reserving its stock per carton per line, and moving its order's `delivery_status` to `SCHEDULED` — while a candidate that does not fit is skipped so smaller candidates behind it still get their chance. An empty waitlist is a quiet no-op, never an error.
+
+### 3.6. Third-Party Assembly: Standards, Dispatch, and Capped Billing
+
+Assembly pricing rests on labor standards registered per article: an `AssemblyStandard` names its `article_id` (at most one standard per article), a strictly positive `minutes_per_unit` of crew labor, and a `crew_size` defaulting to 1. Standards can be listed with an optional `article_id` filter. When a customer whose order has reached `FULFILLED` or `DELIVERED` — and whose `assembly_status` is still `NONE` — requests assembly, the request names the `provider_id` of the third-party crew and a service window from `window_start` to `window_end`, both inclusive. The window must lie in the future: a `window_start` before the current logical time, or a `window_end` that is not strictly after the start, is rejected with `ERR_WINDOW_IN_PAST`. The job's `estimated_minutes` is the sum, over every line whose article requires assembly, of the line quantity times that article's standard `minutes_per_unit`; if any such line has no registered standard, the request is rejected with `ERR_STANDARD_MISSING`.
+
+Crews cannot be in two places at once, so the request is also checked against every non-terminal job — `REQUESTED`, `DISPATCHED`, `IN_PROGRESS`, or `ON_HOLD` — already held by the same `provider_id`, with a 30-minute buffer applied on both sides of every existing window. A conflict exists when the new window's start falls before the end of an existing window plus its buffer while the start of that existing window minus its buffer falls before the new window's end; the comparison is strict on both sides, so a gap of exactly 30 minutes between windows is allowed, and anything tighter is rejected with `ERR_CREW_WINDOW_CONFLICT`. A clean request creates the job in `REQUESTED` and moves the order's `assembly_status` to `SCHEDULED`.
+
+The crew then drives the job. Accepting dispatch moves it to `DISPATCHED`; starting work moves it to `IN_PROGRESS` and the order's `assembly_status` follows. Work may pause: putting the job on hold — optionally recording a `hold_reason` — moves it to `ON_HOLD`, and resuming returns it to `IN_PROGRESS`, a loop that may repeat as often as the job demands. Completion is where money meets the estimate: the crew reports `actual_minutes`, and `billed_minutes` is set to the lesser of that report and the estimate scaled by one and a half, the scaled cap rounded up to a whole minute — identical inputs can bill less than the capped estimate, never more. Completion moves the order's `assembly_status` to `COMPLETED` and immediately triggers the auto-close evaluation: an order sitting in `FULFILLED` or `DELIVERED` closes on the spot, crediting `points_earned` to an `ACTIVE` member's balance as in §3.3. A customer may cancel a job while it is still `REQUESTED` or `DISPATCHED`; the job ends `CANCELLED` and the order's `assembly_status` falls back to `NONE`, leaving the order free to be closed or re-booked for assembly. Once work has started, cancellation is no longer offered. An order's assembly jobs are listed under the order, and individual jobs are readable by every authenticated role.
+
+### 3.7. Spare-Part Replacement Claims
+
+A missing cam screw should not require a receipt. A customer files a spare-part claim with the `article_id`, the `part_number` of the piece needed, a declared `part_value_cents` (zero or greater), and a free-text `reason`; the claim is born `SUBMITTED`, and no proof of purchase is asked for at filing. Review is a `StoreOps` decision expressed through a `decision` input — approve or deny — with an optional `review_note`. Denial simply moves the claim to `DENIED`. Approval is gated by a rolling eligibility check over the trailing 365 days, measured against the customer's prior claims that reached `APPROVED` or `SHIPPED`, and the two checks run in a pinned order. First the count: if the customer already has 3 such claims in the window, approval is rejected with `ERR_CLAIM_LIMIT_EXCEEDED`. Then the value: if the summed `part_value_cents` of those prior claims plus this claim's declared value would exceed 3000 cents, approval is rejected with `ERR_CLAIM_VALUE_EXCEEDED` — a cumulative value of exactly 3000 cents after this claim is still allowed. An approved claim moves to `APPROVED`, and a later ship action by `StoreOps` ends it at `SHIPPED`. Claims are listable globally with optional `customer_id`, `article_id`, and `status` filters, and per-customer under the customer resource.
+
+### 3.8. Returns: Grading, Settlement, and Disputes
+
+A return begins with the customer opening a return request, optionally naming an `order_id`. When an order is named the request is receipted — its `receipted` flag is true — and the referenced order must be in `FULFILLED`, `DELIVERED`, or `CLOSED`, otherwise the request is rejected with `ERR_ORDER_NOT_RETURNABLE`. A null `order_id` opens a no-receipt return, and the request is born `DRAFT` either way. Lines are added while the request is a draft: each names an `article_id`, a `qty` of at least 1, an `assembly_state` of `UNOPENED`, `PARTIALLY_ASSEMBLED`, or `ASSEMBLED`, and optionally an `order_line_id`. That last field is the hinge between the two return kinds: a receipted line must reference a line of the receipted order, and its `qty` may not exceed what that order line has left — the line's purchased `qty` minus its already-accepted `returned_qty` — with any excess rejected as `ERR_RETURN_QTY_EXCEEDED`; a no-receipt line leaves `order_line_id` null, and no-receipt returns are a member privilege, so a customer whose `member_status` is not `ACTIVE` is turned away with `ERR_RECEIPT_REQUIRED` at line creation. Returns are listable with optional `customer_id` and `status` filters, return lines with optional `return_id`, `article_id`, and `order_line_id` filters, and an order's returns are listed under the order.
+
+Submitting requires at least one line and moves the request to `SUBMITTED`. Grading is a per-line `StoreOps` judgment of `condition_grade` — `LIKE_NEW`, `OPEN_BOX`, `DAMAGED`, or `SCRAP` — and the very first graded line automatically moves the request from `SUBMITTED` to `GRADING`. Assembly work is held against the grade: when a line's `assembly_state` is `PARTIALLY_ASSEMBLED` or `ASSEMBLED`, its `effective_condition_grade` is the recorded grade capped at `OPEN_BOX` — a beautifully reassembled wardrobe is still an opened box — while an `UNOPENED` line keeps its grade untouched.
+
+Settlement is allowed only once every line has been graded; an attempt with any line still ungraded is rejected with `ERR_UNGRADED_LINES`. Each line's refund is computed and rounded half-up per line, then summed. The per-unit basis depends on the return kind: a receipted line's `unit_basis_cents` is the order line's `effective_unit_paid_cents` — the price actually paid; a no-receipt line's basis starts from the article's `lowest_price_365d_cents` when set, falling back to its current `price_cents`, and is then discounted by a 10 percent no-receipt penalty with a single rounding half-up, so the identical article and grade refunds less without a receipt. The condition factor applied to the basis is 100 percent for `LIKE_NEW`, 85 percent for `OPEN_BOX`, 50 percent for `DAMAGED`, and nothing for `SCRAP`, using the effective grade after the assembly cap; the line's `refund_cents` is the basis times the quantity times that factor, rounded half-up. A receipted line's `writeoff_cents` is whatever the refund did not return — basis times quantity minus the refund — while a no-receipt line writes off nothing. The request's `refund_total_cents` and `writeoff_total_cents` are the sums across lines, and the request lands in `SETTLED`. Restocking is selective: a receipted line graded `LIKE_NEW` goes back on the shelf — `on_hand` increases by the quantity on every carton of the article, the line's `restocked_units` records how many, and the order line's `returned_qty` grows by the quantity. A receipted line graded below `LIKE_NEW` still rolls `returned_qty` up but restocks nothing, and a no-receipt line neither restocks nor rolls any order line up.
+
+Settlement is not necessarily the end. A customer may dispute a settled return, which moves the request to `DISPUTED` and reverses the previous settlement in kind: any units restocked as `LIKE_NEW` come back off the shelf (`on_hand` drops by each line's `restocked_units`), and the `returned_qty` rollups on the referenced order lines are rolled back. A `StoreOps` operator may then reopen the disputed request to `GRADING`, where lines can be graded afresh and the next settle recomputes every refund and writeoff from scratch. The cycle — `SETTLED` to `DISPUTED` to `GRADING` and back to `SETTLED` — may repeat, and each settle is a full recompute rather than a delta on the last one.
+
+## 4. Endpoint Definitions
+
+All endpoints live under the `/api` mount. Creating a new resource answers 201 with the created resource in `data`; operations that modify an existing resource, trigger a transition, or run a read-only query answer 200 with the affected resource (or results) in `data`. Every response uses the envelope of §2.2, and every error uses the error envelope with the `error_id` values catalogued in §5.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | `/api/_clock/set_current_utc` | Advance the logical clock to a supplied instant | PlatformAdmin |
+| POST | `/api/stores` | Create a store | PlatformAdmin |
+| GET | `/api/stores/{id}` | Get a store | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/stores/{id}/stock` | List bin-stock rows of a store | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/stores/{id}/articles/{article_id}/signal` | In-store stock signal for an article (multi-carton aggregate) | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/stores/{id}/run_sweep` | Expire due reservations and run waitlist promotion across the store's slots | StoreOps |
+| POST | `/api/articles` | Create an article | PlatformAdmin |
+| GET | `/api/articles/{id}` | Get an article | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| PATCH | `/api/articles/{id}` | Update an article's pricing fields | PlatformAdmin |
+| POST | `/api/articles/{id}/cartons` | Register a carton (aisle/bin mapping) for an article | PlatformAdmin |
+| GET | `/api/articles/{id}/cartons` | List cartons of an article | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/bin-stock` | Create the bin-stock row for a store-and-carton pair | StoreOps |
+| GET | `/api/bin-stock/{id}` | Get a bin-stock row | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/bin-stock` | List bin-stock rows with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/bin-stock/{id}/adjust` | Manual delta adjustment of on-hand stock (OCC-guarded) | StoreOps |
+| POST | `/api/customers` | Register a customer | PlatformAdmin, StoreOps |
+| GET | `/api/customers/{id}` | Get a customer | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/customers/{id}/enroll` | Enroll a customer in the family membership | StoreOps |
+| GET | `/api/customers/{id}/orders` | List orders of a customer | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/customers/{id}/spare-part-claims` | List spare-part claims of a customer | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/orders` | Create a draft order for the acting customer | Customer |
+| GET | `/api/orders/{id}` | Get an order | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/orders` | List orders with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/orders/{id}/lines` | Add a line to a draft order | Customer |
+| GET | `/api/orders/{id}/lines` | List lines of an order | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/orders/{id}/delivery-bookings` | List delivery bookings of an order | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/orders/{id}/assembly-jobs` | List assembly jobs of an order | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/orders/{id}/returns` | List return requests of an order | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/order-lines/{id}` | Get an order line | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/order-lines` | List order lines with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/orders/{id}/checkout` | Pay the order: compute pricing, move stock, create pickup-counter reservations | Customer |
+| POST | `/api/orders/{id}/cancel` | Cancel a draft or paid order with full compensation | Customer |
+| POST | `/api/orders/{id}/pickup-complete` | Mark carryout handover complete | StoreOps |
+| POST | `/api/orders/{id}/close` | Close a fulfilled or delivered order (credits family points) | Customer |
+| POST | `/api/reservations` | Standalone pickup-counter reservation of a full-serve article | Customer |
+| GET | `/api/reservations/{id}` | Get a reservation | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/reservations` | List reservations with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/reservations/{id}/fulfill` | Fulfill a reservation at the pickup counter | StoreOps |
+| POST | `/api/reservations/{id}/cancel` | Cancel an active reservation | Customer, StoreOps |
+| POST | `/api/delivery-slots` | Create a delivery slot (vehicle-day with capacity and zone) | DeliveryCoordinator |
+| GET | `/api/delivery-slots/{id}` | Get a delivery slot | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/delivery-slots` | List delivery slots with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/delivery-slots/{id}/bookings` | List bookings of a slot | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/orders/{id}/delivery-bookings` | Book home delivery for a paid delivery-channel order (OCC on slot version) | Customer |
+| GET | `/api/delivery-bookings/{id}` | Get a delivery booking | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/delivery-bookings/{id}/cancel` | Cancel a confirmed or waitlisted booking; promotes waitlist on confirmed cancel | Customer, DeliveryCoordinator |
+| POST | `/api/delivery-bookings/{id}/start` | Mark a booking out for delivery | DeliveryCoordinator |
+| POST | `/api/delivery-bookings/{id}/complete` | Mark a booking delivered; decrements stock | DeliveryCoordinator |
+| POST | `/api/assembly-standards` | Register a per-article labor time standard | PlatformAdmin |
+| GET | `/api/assembly-standards/{id}` | Get an assembly standard | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/assembly-standards` | List assembly standards with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/orders/{id}/assembly-jobs` | Request third-party assembly for a fulfilled or delivered order | Customer |
+| GET | `/api/assembly-jobs/{id}` | Get an assembly job | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/assembly-jobs/{id}/dispatch` | Provider accepts dispatch | AssemblyProvider |
+| POST | `/api/assembly-jobs/{id}/start` | Provider starts work | AssemblyProvider |
+| POST | `/api/assembly-jobs/{id}/hold` | Provider puts the job on hold | AssemblyProvider |
+| POST | `/api/assembly-jobs/{id}/resume` | Provider resumes a held job | AssemblyProvider |
+| POST | `/api/assembly-jobs/{id}/complete` | Provider completes the job and reports actual minutes | AssemblyProvider |
+| POST | `/api/assembly-jobs/{id}/cancel` | Customer cancels a requested or dispatched job | Customer |
+| POST | `/api/spare-part-claims` | File a free spare-part replacement claim without receipt | Customer |
+| GET | `/api/spare-part-claims/{id}` | Get a spare-part claim | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/spare-part-claims` | List spare-part claims with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/spare-part-claims/{id}/review` | Approve or deny a claim (eligibility gates approval) | StoreOps |
+| POST | `/api/spare-part-claims/{id}/ship` | Ship an approved claim | StoreOps |
+| POST | `/api/returns` | Open a return request (null order reference means a no-receipt return) | Customer |
+| GET | `/api/returns/{id}` | Get a return request | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/returns` | List return requests with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/returns/{id}/lines` | Add a line to a draft return | Customer |
+| GET | `/api/returns/{id}/lines` | List lines of a return | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/return-lines/{id}` | Get a return line | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| GET | `/api/return-lines` | List return lines with filters | PlatformAdmin, StoreOps, DeliveryCoordinator, AssemblyProvider, Customer |
+| POST | `/api/returns/{id}/submit` | Submit a draft return for grading | Customer |
+| POST | `/api/returns/{id}/lines/{line_id}/grade` | Grade the damage of one return line | StoreOps |
+| POST | `/api/returns/{id}/settle` | Settle a fully graded return: refunds, restock, writeoff | StoreOps |
+| POST | `/api/returns/{id}/dispute` | Customer disputes a settled return (reverses settlement) | Customer |
+| POST | `/api/returns/{id}/reopen` | Reopen a disputed return for re-grading | StoreOps |
+
+## 5. Error Code Catalogue
+
+The catalogue below fixes each error's identifier and HTTP status. The conditions that trigger each error are specified in the narratives of §2 and §3, not repeated here.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| ERR_VALIDATION | 400 |
+| ERR_UNAUTHENTICATED | 401 |
+| ERR_FORBIDDEN | 403 |
+| ERR_STORE_NOT_FOUND | 404 |
+| ERR_ARTICLE_NOT_FOUND | 404 |
+| ERR_CARTON_NOT_FOUND | 404 |
+| ERR_BIN_STOCK_NOT_FOUND | 404 |
+| ERR_CUSTOMER_NOT_FOUND | 404 |
+| ERR_ORDER_NOT_FOUND | 404 |
+| ERR_ORDER_LINE_NOT_FOUND | 404 |
+| ERR_RESERVATION_NOT_FOUND | 404 |
+| ERR_SLOT_NOT_FOUND | 404 |
+| ERR_BOOKING_NOT_FOUND | 404 |
+| ERR_JOB_NOT_FOUND | 404 |
+| ERR_CLAIM_NOT_FOUND | 404 |
+| ERR_RETURN_NOT_FOUND | 404 |
+| ERR_RETURN_LINE_NOT_FOUND | 404 |
+| ERR_STANDARD_NOT_FOUND | 404 |
+| ERR_INVALID_STATE | 409 |
+| ERR_DUPLICATE_BIN_STOCK | 409 |
+| ERR_DUPLICATE_BOOKING | 409 |
+| ERR_UNGRADED_LINES | 409 |
+| ERR_RESERVATION_EXPIRED | 409 |
+| ERR_ORDER_NOT_RETURNABLE | 409 |
+| ERR_STALE_VERSION | 412 |
+| ERR_INSUFFICIENT_STOCK | 422 |
+| ERR_MULTI_CARTON_SHORTAGE | 422 |
+| ERR_BOOKING_NEVER_FITS | 422 |
+| ERR_ACCESS_INFEASIBLE | 422 |
+| ERR_CREW_WINDOW_CONFLICT | 422 |
+| ERR_WINDOW_IN_PAST | 422 |
+| ERR_SLOT_IN_PAST | 422 |
+| ERR_STANDARD_MISSING | 422 |
+| ERR_RECEIPT_REQUIRED | 422 |
+| ERR_RETURN_QTY_EXCEEDED | 422 |
+| ERR_INSUFFICIENT_POINTS | 422 |
+| ERR_CLAIM_LIMIT_EXCEEDED | 422 |
+| ERR_CLAIM_VALUE_EXCEEDED | 422 |

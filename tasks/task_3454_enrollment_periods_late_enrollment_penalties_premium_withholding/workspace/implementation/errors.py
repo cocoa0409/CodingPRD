@@ -1,0 +1,54 @@
+"""Error catalog: every error_id with its pinned HTTP status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SOD_SAME_ACTOR": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_BENEFICIARY_NOT_FOUND": 404,
+    "ERR_ENROLLMENT_NOT_FOUND": 404,
+    "ERR_COVERAGE_RECORD_NOT_FOUND": 404,
+    "ERR_DETERMINATION_NOT_FOUND": 404,
+    "ERR_APPEAL_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_ARRANGEMENT_NOT_FOUND": 404,
+    "ERR_RELIEF_CASE_NOT_FOUND": 404,
+    "ERR_STALE_BENEFICIARY_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_APPEAL_NOT_REVIEWABLE": 409,
+    "ERR_INVOICE_NOT_PAYABLE": 409,
+    "ERR_NO_OPEN_ENROLLMENT_WINDOW": 422,
+    "ERR_ELECTION_WINDOW_CLOSED": 422,
+    "ERR_EFFECTIVE_DATE_INVALID": 422,
+    "ERR_DUPLICATE_ENROLLMENT": 422,
+    "ERR_UNSUPPORTED_PART": 422,
+    "ERR_COVERAGE_PERIOD_OVERLAP": 409,
+    "ERR_COVERAGE_NOT_VERIFIED": 422,
+    "ERR_DUPLICATE_TAX_YEAR": 409,
+    "ERR_RATE_SCHEDULE_MISSING": 422,
+    "ERR_TAX_DATA_MISSING": 422,
+    "ERR_NO_ENROLLMENT_FOR_PART": 422,
+    "ERR_DUPLICATE_DETERMINATION": 409,
+    "ERR_DUPLICATE_RATE_SCHEDULE": 409,
+    "ERR_DUPLICATE_WITHHOLDING": 409,
+    "ERR_NO_ACTIVE_WITHHOLDING": 422,
+    "ERR_OEP_REQUIRES_MA": 422,
+    "ERR_OEP_ELECTION_ALREADY_USED": 422,
+    "ERR_ELECTION_TARGET_UNCHANGED": 422,
+    "ERR_RELIEF_PERIOD_OVERLAP": 409,
+    "ERR_PAYMENT_AMOUNT_MISMATCH": 422,
+}
+
+
+def fail(error_id: str, message: str):
+    raise ApiError(error_id, ERR[error_id], message)

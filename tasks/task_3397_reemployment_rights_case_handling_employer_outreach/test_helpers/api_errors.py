@@ -1,0 +1,106 @@
+"""Error catalog for the Reemployment Rights Mediation API.
+
+Every error identifier the PRD declares, together with the HTTP status each
+one must be returned with. Registering the mapping with the shared validators
+lets ``validate_error`` cross-check the status automatically, so a test only
+has to name the identifier it expects.
+"""
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    """Declared error identifiers, grouped by the validation tier that emits them."""
+
+    # Tier 1: credentials.
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+
+    # Tier 2: role authorization (endpoint list and transition-level actor rules).
+    ERR_UNAUTHORIZED_ROLE = "ERR_UNAUTHORIZED_ROLE"
+
+    # Tier 3: request shape.
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+    # Tier 4: existence, one identifier per resource family.
+    ERR_MEMBER_NOT_FOUND = "ERR_MEMBER_NOT_FOUND"
+    ERR_EMPLOYER_NOT_FOUND = "ERR_EMPLOYER_NOT_FOUND"
+    ERR_OMBUDSMAN_NOT_FOUND = "ERR_OMBUDSMAN_NOT_FOUND"
+    ERR_CASE_NOT_FOUND = "ERR_CASE_NOT_FOUND"
+    ERR_ROUND_NOT_FOUND = "ERR_ROUND_NOT_FOUND"
+    ERR_REFERRAL_NOT_FOUND = "ERR_REFERRAL_NOT_FOUND"
+    ERR_EVENT_NOT_FOUND = "ERR_EVENT_NOT_FOUND"
+    ERR_STATEMENT_NOT_FOUND = "ERR_STATEMENT_NOT_FOUND"
+    ERR_AWARD_NOT_FOUND = "ERR_AWARD_NOT_FOUND"
+
+    # Tier 5: ownership.
+    ERR_OWNERSHIP_VIOLATION = "ERR_OWNERSHIP_VIOLATION"
+
+    # Tier 6: state gates.
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ROUND_NOT_OPEN = "ERR_ROUND_NOT_OPEN"
+    ERR_OMBUDSMAN_NOT_CERTIFIED = "ERR_OMBUDSMAN_NOT_CERTIFIED"
+
+    # Tier 7: optimistic concurrency on the case version.
+    ERR_STALE_CASE_VERSION = "ERR_STALE_CASE_VERSION"
+
+    # Tier 8: integrity screens.
+    ERR_CONFLICT_OF_INTEREST = "ERR_CONFLICT_OF_INTEREST"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+
+    # Tier 9: temporal windows.
+    ERR_RESPONSE_DEADLINE_PASSED = "ERR_RESPONSE_DEADLINE_PASSED"
+    ERR_REFERRAL_WINDOW_PASSED = "ERR_REFERRAL_WINDOW_PASSED"
+    ERR_REOPEN_WINDOW_PASSED = "ERR_REOPEN_WINDOW_PASSED"
+
+    # Tier 10: business constraints.
+    ERR_CASELOAD_FULL = "ERR_CASELOAD_FULL"
+    ERR_ROUND_ALREADY_OPEN = "ERR_ROUND_ALREADY_OPEN"
+    ERR_DOCUMENTATION_INCOMPLETE = "ERR_DOCUMENTATION_INCOMPLETE"
+    ERR_CERTIFICATION_REQUIREMENTS_UNMET = "ERR_CERTIFICATION_REQUIREMENTS_UNMET"
+    ERR_AWARD_ELIGIBILITY_UNMET = "ERR_AWARD_ELIGIBILITY_UNMET"
+    ERR_NOMINATION_NOT_QUALIFIED = "ERR_NOMINATION_NOT_QUALIFIED"
+    ERR_NO_EXHAUSTED_ROUND = "ERR_NO_EXHAUSTED_ROUND"
+    ERR_NO_COMPLETED_SERVICE_PERIOD = "ERR_NO_COMPLETED_SERVICE_PERIOD"
+    ERR_SERVICE_PERIOD_OVERLAP = "ERR_SERVICE_PERIOD_OVERLAP"
+    ERR_VENUE_DOUBLE_BOOKED = "ERR_VENUE_DOUBLE_BOOKED"
+
+
+HTTP_STATUS_CODES = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED_ROLE: 403,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_MEMBER_NOT_FOUND: 404,
+    ApiErrorId.ERR_EMPLOYER_NOT_FOUND: 404,
+    ApiErrorId.ERR_OMBUDSMAN_NOT_FOUND: 404,
+    ApiErrorId.ERR_CASE_NOT_FOUND: 404,
+    ApiErrorId.ERR_ROUND_NOT_FOUND: 404,
+    ApiErrorId.ERR_REFERRAL_NOT_FOUND: 404,
+    ApiErrorId.ERR_EVENT_NOT_FOUND: 404,
+    ApiErrorId.ERR_STATEMENT_NOT_FOUND: 404,
+    ApiErrorId.ERR_AWARD_NOT_FOUND: 404,
+    ApiErrorId.ERR_OWNERSHIP_VIOLATION: 403,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ROUND_NOT_OPEN: 409,
+    ApiErrorId.ERR_OMBUDSMAN_NOT_CERTIFIED: 409,
+    ApiErrorId.ERR_STALE_CASE_VERSION: 412,
+    ApiErrorId.ERR_CONFLICT_OF_INTEREST: 409,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_RESPONSE_DEADLINE_PASSED: 422,
+    ApiErrorId.ERR_REFERRAL_WINDOW_PASSED: 422,
+    ApiErrorId.ERR_REOPEN_WINDOW_PASSED: 422,
+    ApiErrorId.ERR_CASELOAD_FULL: 409,
+    ApiErrorId.ERR_ROUND_ALREADY_OPEN: 409,
+    ApiErrorId.ERR_DOCUMENTATION_INCOMPLETE: 409,
+    ApiErrorId.ERR_CERTIFICATION_REQUIREMENTS_UNMET: 422,
+    ApiErrorId.ERR_AWARD_ELIGIBILITY_UNMET: 409,
+    ApiErrorId.ERR_NOMINATION_NOT_QUALIFIED: 409,
+    ApiErrorId.ERR_NO_EXHAUSTED_ROUND: 409,
+    ApiErrorId.ERR_NO_COMPLETED_SERVICE_PERIOD: 422,
+    ApiErrorId.ERR_SERVICE_PERIOD_OVERLAP: 422,
+    ApiErrorId.ERR_VENUE_DOUBLE_BOOKED: 422,
+}
+
+# Register with the framework so validate_error() auto-checks the HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

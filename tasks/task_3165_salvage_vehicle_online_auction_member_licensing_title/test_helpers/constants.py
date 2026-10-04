@@ -1,0 +1,40 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+THRESHOLDS = {
+    # Buyer premium tiers (PRD §3.6) — cents, inclusive lower bounds
+    "TIER1_CAP_CENTS": 500000,
+    "TIER2_CAP_CENTS": 2000000,
+    "TIER1_RATE": 0.12,
+    "TIER2_RATE": 0.09,
+    "TIER3_RATE": 0.06,
+    # Seller settlement (PRD §3.6)
+    "STANDARD_FEE_RATE": 0.10,
+    "STANDARD_FEE_FLOOR_CENTS": 2500,
+    "VOLUME_FEE_RATE": 0.075,
+    "VOLUME_FEE_FLOOR_CENTS": 1500,
+    "TITLE_FEE_CENTS": 5000,
+    "TITLE_SLA_DAYS": 30,
+    "TITLE_LATE_PENALTY_CENTS": 15000,
+    "SELLER_FREE_STORAGE_DAYS": 7,
+    # Bidding (PRD §3.4)
+    "MIN_INCREMENT_CENTS": 2500,
+    # Intake (PRD §3.1)
+    "MIN_IMAGES_FOR_READINESS": 5,
+    # Load-out (PRD §3.8)
+    "GATE_PASS_EXPIRY_HOURS": 72,
+    "MAX_SLOT_DURATION_HOURS": 8,
+    "YARD_SLOT_CAPACITY": 4,
+}
+
+TEST_DEFAULTS = {
+    "YARD_STATE": "CA",
+    "DAILY_STORAGE_RATE_CENTS": 1000,
+    "FREE_STORAGE_DAYS": 1,
+    "VIN_1": "1HGCM82633A004352",
+    "VIN_2": "5YJSA1E26HF1B0007",
+    "VIN_3": "1FTFW1ET5DFC10312",
+    "VIN_4": "2C4RC1BG7ER114788",
+    "VIN_5": "JN8AZ2NE6F9012345",
+    "HAMMER_CENTS": 1000000,
+    "CLOCK_DEFAULT": "2026-09-01T00:00:00Z",
+}

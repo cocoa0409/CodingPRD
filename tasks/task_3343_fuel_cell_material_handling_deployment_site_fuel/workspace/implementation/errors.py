@@ -1,0 +1,32 @@
+"""Error catalog: error ids and the ApiError exception (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.status = status
+        self.message = message
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                # 401
+ERR_FORBIDDEN = "ERR_FORBIDDEN"                            # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                            # 404
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                # 400
+ERR_INVALID_DATE_RANGE = "ERR_INVALID_DATE_RANGE"          # 422
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                    # 409
+ERR_SITE_CLOSED = "ERR_SITE_CLOSED"                        # 409
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                    # 412
+ERR_DUPLICATE_CODE = "ERR_DUPLICATE_CODE"                  # 409
+ERR_INDOOR_STORAGE_EXCEEDED = "ERR_INDOOR_STORAGE_EXCEEDED"          # 422
+ERR_STATION_NOT_COMMISSIONED = "ERR_STATION_NOT_COMMISSIONED"        # 422
+ERR_INDOOR_DISPENSING_NOT_APPROVED = "ERR_INDOOR_DISPENSING_NOT_APPROVED"  # 422
+ERR_TECHNICIAN_DOUBLE_BOOKED = "ERR_TECHNICIAN_DOUBLE_BOOKED"        # 409
+ERR_CONTRACT_PERIOD_OVERLAP = "ERR_CONTRACT_PERIOD_OVERLAP"          # 409
+ERR_CONTRACT_NOT_ACTIVE = "ERR_CONTRACT_NOT_ACTIVE"                  # 422
+ERR_OPEN_INVOICES_EXIST = "ERR_OPEN_INVOICES_EXIST"                  # 422
+ERR_PRODUCTIVITY_GATE_NOT_MET = "ERR_PRODUCTIVITY_GATE_NOT_MET"      # 422
+ERR_ASSESSMENT_NOT_APPROVED = "ERR_ASSESSMENT_NOT_APPROVED"          # 422
+ERR_NO_ACTIVE_CONTRACT = "ERR_NO_ACTIVE_CONTRACT"                    # 422
+ERR_EVENT_NOT_BILLABLE = "ERR_EVENT_NOT_BILLABLE"                    # 422
+ERR_TECHNICIAN_NOT_CERTIFIED = "ERR_TECHNICIAN_NOT_CERTIFIED"        # 422

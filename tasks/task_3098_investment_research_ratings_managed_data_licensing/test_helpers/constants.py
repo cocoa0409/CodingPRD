@@ -1,0 +1,43 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Quantitative star rating (PRD §3.5)
+THREE_YEAR_WEIGHT_BP = 6000
+FIVE_YEAR_WEIGHT_BP = 4000
+
+# License fee quote (PRD §3.8)
+SEAT_FEE_DISPLAY_CENTS = 120000
+SEAT_FEE_REDIS_CENTS = 250000
+SEAT_FEE_DERIVED_CENTS = 500000
+SURCHARGE_DERIVED_BP = 2500
+# volume discount bands by seat_limit
+VOLUME_DISCOUNT_BANDS = [
+    (10, 0),
+    (50, 1000),
+    (200, 2000),
+    (10**9, 3000),
+]
+
+# Audit penalty (PRD §3.9)
+AUDIT_RATE_DISPLAY_CENTS = 50000
+AUDIT_RATE_REDIS_CENTS = 150000
+AUDIT_RATE_DERIVED_CENTS = 400000
+REPEAT_OFFENDER_BP = 5000
+MIN_PENALTY_CENTS = 100000
+
+# Data quality score (PRD §3.7)
+QUALITY_BASE_BP = 10000
+ACCEPTED_DISPUTE_HIT_BP = 1500
+OPEN_DISPUTE_HIT_BP = 500
+
+# Category assignment score weights (PRD §3.2)
+CATEGORY_ASSET_WEIGHT_BP = 7000
+CATEGORY_SECTOR_WEIGHT_BP = 3000
+
+# Holdings snapshot integrity (PRD §3.2)
+SNAPSHOT_WEIGHT_TOTAL_BP = 10000
+
+# Committee quorum (PRD §3.6)
+QUORUM_VOTES = 3
+
+# Logical clock default (PRD §2.10)
+DEFAULT_CLOCK_ISO = "2026-09-01T00:00:00Z"

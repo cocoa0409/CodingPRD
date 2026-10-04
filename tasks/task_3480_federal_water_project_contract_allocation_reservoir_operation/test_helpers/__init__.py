@@ -1,0 +1,197 @@
+"""Test infrastructure for the Federal Water Allocation API.
+
+Re-exports the pieces test modules reach for most often: the shared framework
+validators and race utilities, the endpoint client and its singleton, the
+error catalog, the domain assertions, the payload factories, the constants,
+the caller identities and the composite fixtures.
+
+Note on the client: ``test_helpers.api_client`` names the singleton *instance*
+exported from the client module (the submodule attribute is shadowed by it on
+purpose). Tests should take the client from the ``api`` fixture or from
+``from test_helpers import api_client`` - both yield that instance - while the
+fixture layer always receives the client as an explicit parameter.
+"""
+
+# Framework generics (re-exported for convenience)
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+# PRD-specific: constants, types, client, errors, assertions, factories,
+# users, fixtures.
+from .constants import *  # noqa: F401,F403 - the constant names are the point
+from .types import (
+    AgreementStatus,
+    AllocationAnnouncement,
+    AllocationBasis,
+    AllocationLine,
+    AnnouncementStatus,
+    ComplianceIncident,
+    CompliancePosture,
+    ComplianceStatus,
+    ContractStatus,
+    DeliveryOrder,
+    District,
+    EnvironmentalConstraint,
+    FulfillmentStatus,
+    HydrologyObservation,
+    ImpactReview,
+    IncidentResolution,
+    IncidentStatus,
+    ObservationType,
+    PriorityClass,
+    ReleaseOrder,
+    ReleasePurpose,
+    ReleaseStatus,
+    RequirementType,
+    Reservoir,
+    RevenuePeriod,
+    RevenuePeriodStatus,
+    ReviewBasis,
+    ReviewOutcome,
+    ShortageAgreement,
+    ShortageTier,
+    Species,
+    TransferDecision,
+    TransferRequest,
+    TransferStatus,
+    UserRole,
+    WaterContract,
+    WaterYear,
+    WaterYearStatus,
+)
+from .api_client import ApiClient, api_client, canonical_instant
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES
+from .assertions import (
+    assert_acre_feet,
+    assert_allocation_announcement,
+    assert_allocation_line,
+    assert_append_only_common_fields,
+    assert_cents,
+    assert_compliance_incident,
+    assert_delivery_order,
+    assert_district,
+    assert_envelope_meta,
+    assert_environmental_constraint,
+    assert_identity_fields,
+    assert_ids_in_order,
+    assert_impact_review,
+    assert_instant,
+    assert_instant_format,
+    assert_line_remaining,
+    assert_list_page,
+    assert_mutable_common_fields,
+    assert_quantity,
+    assert_release_order,
+    assert_repayment_invariant,
+    assert_reservoir,
+    assert_revenue_period,
+    assert_shortage_agreement,
+    assert_transfer_request,
+    assert_two_dp,
+    assert_water_contract,
+    assert_water_year,
+)
+from . import factories
+from .test_users import (
+    ENVIRONMENTAL_OFFICER_HEADERS,
+    FINANCE_OFFICER_HEADERS,
+    HYDROLOGY_OFFICER_HEADERS,
+    RECLAMATION_OPERATOR_HEADERS,
+    REGIONAL_DIRECTOR_HEADERS,
+    SYSTEM_ADMIN_HEADERS,
+    TEST_USERS,
+    UNDECLARED_ROLE,
+    headers_with_undeclared_role,
+    headers_without_role,
+    headers_without_user_id,
+    make_district_manager_headers,
+)
+from . import fixtures
+
+__all__ = [
+    # framework generics
+    "NON_EXISTENT_UUID",
+    "assert_at_least_one_succeeds",
+    "assert_cost_precision",
+    "assert_exactly_one_succeeds",
+    "assert_race_outcome",
+    "assert_timestamp_format",
+    "assert_version_incremented",
+    "build_user_headers",
+    "get_success_data",
+    "is_iso8601_timestamp",
+    "is_valid_uuid",
+    "run_race",
+    "validate_error",
+    "validate_error_is_one_of",
+    "validate_paginated",
+    "validate_success",
+    # client
+    "ApiClient",
+    "api_client",
+    "canonical_instant",
+    # errors
+    "ApiErrorId",
+    "HTTP_STATUS_CODES",
+    # assertions
+    "assert_acre_feet",
+    "assert_allocation_announcement",
+    "assert_allocation_line",
+    "assert_append_only_common_fields",
+    "assert_cents",
+    "assert_compliance_incident",
+    "assert_delivery_order",
+    "assert_district",
+    "assert_envelope_meta",
+    "assert_environmental_constraint",
+    "assert_identity_fields",
+    "assert_ids_in_order",
+    "assert_impact_review",
+    "assert_instant",
+    "assert_instant_format",
+    "assert_line_remaining",
+    "assert_list_page",
+    "assert_mutable_common_fields",
+    "assert_quantity",
+    "assert_release_order",
+    "assert_repayment_invariant",
+    "assert_reservoir",
+    "assert_revenue_period",
+    "assert_shortage_agreement",
+    "assert_transfer_request",
+    "assert_two_dp",
+    "assert_water_contract",
+    "assert_water_year",
+    # factories / fixtures modules
+    "factories",
+    "fixtures",
+    # users
+    "ENVIRONMENTAL_OFFICER_HEADERS",
+    "FINANCE_OFFICER_HEADERS",
+    "HYDROLOGY_OFFICER_HEADERS",
+    "RECLAMATION_OPERATOR_HEADERS",
+    "REGIONAL_DIRECTOR_HEADERS",
+    "SYSTEM_ADMIN_HEADERS",
+    "TEST_USERS",
+    "UNDECLARED_ROLE",
+    "headers_with_undeclared_role",
+    "headers_without_role",
+    "headers_without_user_id",
+    "make_district_manager_headers",
+]

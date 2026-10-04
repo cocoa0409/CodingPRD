@@ -1,0 +1,105 @@
+"""All named constants from PRD.md / SCAFFOLD.yaml — defined exactly once."""
+from decimal import Decimal
+
+# --- Price ladder & order pricing (PRD §3.1, §3.5) ---
+PRICE_LADDER_CENTS = [39900, 59900, 89900, 129900, 189900]
+LICENSEE_DISCOUNT_RATE = Decimal("0.30")     # licensee pays base * (1 - 0.30)
+CLEARANCE_MARKDOWN_KEEP = Decimal("0.75")    # clearance keeps 75% of price point
+TIER1_QTY = 10
+TIER2_QTY = 25
+TIER3_QTY = 50
+TIER1_RATE = Decimal("0.05")
+TIER2_RATE = Decimal("0.09")
+TIER3_RATE = Decimal("0.14")
+LICENSEE_UNIT_FACTOR = Decimal("0.70")       # 1 - 0.30
+TIER1_FACTOR = Decimal("0.95")               # 1 - 0.05
+TIER2_FACTOR = Decimal("0.91")               # 1 - 0.09
+TIER3_FACTOR = Decimal("0.86")               # 1 - 0.14
+
+# --- Capacity waterfall (PRD §3.4) ---
+WHOLESALE_FLOOR_PCT = Decimal("0.25")
+LICENSEE_GUARANTEE_PCT = Decimal("0.60")     # nominal target; runtime split derives from floor
+CONSTRAINED_CAPACITY_DIV = 2                 # floor(weekly_capacity_units / 2)
+
+# --- Royalty ledger (PRD §3.7) ---
+CHARGEBACK_RATE = Decimal("0.15")
+
+# --- Territories (PRD §3.2) ---
+MAX_TERRITORIES_PER_LICENSEE = 3
+
+# --- Warranty info budget (PRD §3.7) ---
+INFO_REQUEST_MAX = 2
+
+# --- Delivery fees (PRD §3.6) ---
+CALL_OUT_CENTS = 14900
+ZONE_CENTS = {"LOCAL": 0, "REGIONAL": 5000, "EXTENDED": 12000}
+CREW_CENTS = 2500
+OVERAGE_BLOCK_MINUTES = 30
+OVERAGE_CENTS = 4000
+STAIRS_FREE_FLIGHTS = 1
+STAIRS_CENTS = 1500
+
+# --- Delivery temporal guards (PRD §3.6) ---
+MISSED_GRACE_MINUTES = 120
+DELIVERY_MIN_LEAD_HOURS = 48
+WINDOW_MIN_MINUTES = 120
+WINDOW_MAX_MINUTES = 360
+
+# --- Warranty filing windows (PRD §3.7) ---
+WARRANTY_WINDOW_DAYS = {
+    "DEFECT": 365,
+    "MISSING_PARTS": 365,
+    "DAMAGE_IN_TRANSIT": 30,
+}
+
+# --- Performance standards (PRD §3.8) ---
+PERF_PROBATION_THRESHOLD = Decimal("60.00")
+PERF_SUSPENSION_THRESHOLD = Decimal("40.00")
+PERF_RECOVERY_THRESHOLD = Decimal("75.00")
+PREFERRED_STANDING_SCORE = Decimal("75.00")
+SEASONED_WEIGHTS = [Decimal("0.4"), Decimal("0.3"), Decimal("0.2"), Decimal("0.1")]
+
+# --- Licensee defaults (PRD §3.2) ---
+DEFAULT_ROYALTY_RATE = 0.04
+DEFAULT_MERCH_STANDARD = "MS-2026.1"
+DEFAULT_AUDIT_SCORE = 80
+
+# --- DC defaults (PRD §3.6) ---
+DEFAULT_DAILY_CREW_UNITS = 6
+MIN_DAILY_CREW_UNITS = 1
+MAX_DAILY_CREW_UNITS = 20
+
+# --- Logical clock (PRD §2.5) ---
+CLOCK_START = (2026, 9, 1, 0, 0, 0)          # 2026-09-01T00:00:00Z
+
+# --- RBAC (PRD §2.1) ---
+ROLES = [
+    "PlatformAdmin",
+    "ProductionPlanner",
+    "LogisticsCoordinator",
+    "LicenseeManager",
+    "WholesaleBuyer",
+    "WarrantyAdmin",
+]
+
+# --- Enums ---
+FACTORY_REGIONS = ["DOMESTIC", "OVERSEAS"]
+COMPONENT_LINES = ["FOAM", "FRAMES", "UPHOLSTERY"]
+FACTORY_STATES = ["ACTIVE", "CONSTRAINED", "OFFLINE"]
+PRODUCT_CATEGORIES = ["UPHOLSTERY", "CASEGOODS", "BEDDING"]
+PRODUCT_LIFECYCLES = ["CONCEPT", "ACTIVE", "CLEARANCE", "RETIRED"]
+LICENSEE_STATUSES = ["APPLICANT", "ACTIVE", "PROBATION", "SUSPENDED", "TERMINATED"]
+POPULATION_TIERS = ["METRO", "SUBURBAN", "RURAL"]
+TERRITORY_STATUSES = ["OPEN", "ASSIGNED"]
+ACCOUNT_STATUSES = ["ACTIVE", "HOLD", "CLOSED"]
+CYCLE_STATUSES = ["OPEN", "ALLOCATED", "CLOSED"]
+BUYER_TYPES = ["LICENSEE", "RETAIL_ACCOUNT"]
+DELIVERY_MODES = ["FREIGHT_TO_STORE", "HOME_DELIVERY"]
+ALLOCATION_STATES = ["UNALLOCATED", "RESERVED", "ALLOCATED", "WAITLISTED", "DROPPED"]
+FULFILLMENT_STATES = ["PENDING", "PICKED", "SHIPPED", "DELIVERED", "CANCELLED"]
+ZONES = ["LOCAL", "REGIONAL", "EXTENDED"]
+APPOINTMENT_STATUSES = ["REQUESTED", "CONFIRMED", "COMPLETED", "MISSED", "CANCELLED"]
+CLAIM_TYPES = ["DEFECT", "DAMAGE_IN_TRANSIT", "MISSING_PARTS"]
+CLAIM_STATUSES = ["UNDER_REVIEW", "INFO_REQUESTED", "PARTS_ORDERED", "RESOLVED", "DENIED"]
+PARTS_STATUSES = ["QUEUED", "SHIPPED", "DELIVERED"]
+ORDER_ACTIONS = ["SUBMIT", "CANCEL", "PICK", "SHIP", "DELIVER"]

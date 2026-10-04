@@ -1,0 +1,88 @@
+"""Domain thresholds — numeric constants the PRD pins for its calculations."""
+
+# ─── Capitation rule ──────────────────────────────────
+BASE_RATE_COMMERCIAL_HMO_CENTS = 42000
+BASE_RATE_MEDICARE_ADVANTAGE_CENTS = 95000
+BASE_RATE_MEDICAID_MANAGED_CENTS = 28000
+BASE_RATE_DUAL_ELIGIBLE_CENTS = 118000
+CAPITATION_FLOOR_MULTIPLIER = 0.5
+CAPITATION_CEIL_MULTIPLIER = 2.5
+
+BASE_RATE_CENTS = {
+    "COMMERCIAL_HMO": BASE_RATE_COMMERCIAL_HMO_CENTS,
+    "MEDICARE_ADVANTAGE": BASE_RATE_MEDICARE_ADVANTAGE_CENTS,
+    "MEDICAID_MANAGED": BASE_RATE_MEDICAID_MANAGED_CENTS,
+    "DUAL_ELIGIBLE": BASE_RATE_DUAL_ELIGIBLE_CENTS,
+}
+
+# ─── Provider compensation rule ───────────────────────
+PANEL_RATE_CENTS = {
+    "PRIMARY_CARE": 900,
+    "CARDIOLOGY": 1400,
+    "ORTHOPEDICS": 1500,
+    "ONCOLOGY": 1800,
+    "RADIOLOGY": 1100,
+    "BEHAVIORAL_HEALTH": 1000,
+}
+QUALITY_BONUS_THRESHOLD = 85
+QUALITY_BONUS_RATE = 0.10
+
+# ─── Region operating budget ──────────────────────────
+FTE_COST_CENTS = 1250000
+MARGIN_FREEZE_FLOOR_CENTS = 500000000
+
+# ─── Capacity supply balance ──────────────────────────
+PANEL_TARGET_MEMBERS_PER_SLOT = 1.5
+
+# ─── Internal referral / composite scoring ────────────
+WEIGHT_ACCESS = 0.40
+WEIGHT_QUALITY = 0.30
+WEIGHT_SATISFACTION = 0.20
+WEIGHT_PANEL = 0.10
+
+# ─── Access wait metric ───────────────────────────────
+ACCESS_PCT_PRECISION_DP = 2
+
+# ─── Outside services liability ───────────────────────
+ANNUAL_DEDUCTIBLE_CENTS = 150000
+COINSURANCE_RATE = 0.20
+OUT_OF_POCKET_CAP_CENTS = 600000
+EMERGENCY_PAY_RATE = 0.75
+VENDOR_ALLOWABLE_PCT = {
+    "KP Affiliate": 0.80,
+    "Default": 0.70,
+}
+
+# ─── Referential integration settlement ───────────────
+INTERIM_CLAIM_THRESHOLD = 40
+INTERIM_HIGH_MULTIPLIER = 1.5
+INTEGRATION_CREDIT_RATE = {
+    "CAPITATED": 0.12,
+    "SHARED_SAVINGS": 0.20,
+    "BUNDLED": 0.08,
+    "NOT_AT_RISK": 0.0,
+}
+
+# ─── Referral authorization ───────────────────────────
+REFERRAL_EXPIRY_DAYS = 90
+APPEAL_ROUNDS_MAX = 2
+
+# ─── Logical clock ────────────────────────────────────
+CLOCK_START_UTC = "2026-09-01T00:00:00Z"
+
+# ─── Test defaults ────────────────────────────────────
+TEST_DEFAULTS = {
+    "REGION_MARGIN_TARGET_PCT": 0.03,
+    "REGION_CAPITATION_INDEX": 1.0,
+    "SITE_STAFFING_FTE_BUDGET": 10.0,
+    "DEPARTMENT_SLOTS": 200,
+    "DEPARTMENT_WAIT_THRESHOLD_DAYS": 14,
+    "PROVIDER_BASE_COMPONENT_CENTS": 1250000,
+    "PROVIDER_PANEL_SIZE_TARGET": 1000,
+    "BUDGET_PERIOD": "2026-09",
+    "BUDGET_STAFFING_CENTS": 20000000,
+    "BUDGET_OUTSIDE_SERVICES_CENTS": 20000000,
+    "BUDGET_FACILITY_INVESTMENT_CENTS": 2000000,
+    "BUDGET_SYSTEM_DEDUCTIBLE_CENTS": 0,
+    "COVERAGE_EFFECTIVE_DATE": "2026-09-01T00:00:00Z",
+}

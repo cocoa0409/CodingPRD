@@ -1,0 +1,1359 @@
+# =============================================================================
+# SCAFFOLD — task_3013_instant_needs_micro_fulfillment_center_operations
+# §1.0–§1.7. Difficulty design (§1.8) and corner design (§1.9) live in the
+# sibling files SCAFFOLD_DIFFICULTY_DESIGN.yaml / SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  Instant-Needs Micro-Fulfillment Center Operations (Gopuff): micro-fulfillment
+  site assortment of a few thousand instant-need items selected by local demand,
+  owned inventory with buy-side vendor terms rather than a marketplace model,
+  order pick-pack targets measured in minutes with single-picker batch limits,
+  delivery driver dispatch from a fixed site with a small delivery radius and
+  fee schedule, age-restricted item handling with identification scanning at
+  handoff, site-level demand forecasting for late-night and weather-driven
+  spikes, subscription membership waiving delivery fees above a basket
+  threshold, inventory shrink and expiry control in a small footprint.
+
+domain_name: instant-needs-mfc
+api_prefix: /mfc
+
+complexity_profile:
+  primary_archetype: quota_allocation        # on-hand pool reserved/committed/released; finite capacity pools (batch slots, driver runs)
+  secondary_archetype: compliance_audit      # age-restricted handoff with ID scanning, refusals, segregation of duties
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Site.version (capacity profile update) and Customer.version (membership change)
+    - cascading_side_effects                 # replenish finalize -> inventory receipt -> site posture recompute -> capacity derivation
+    - dual_variant_calculation               # per-line vs pooled tax rounding; loyalty credit record vs absorb variants
+    - derived_field_reconciliation           # InventoryBalance.on_hand; Membership counters reconciled on billing close
+    - ops_run_checkpoint                     # billing-period close recomputes membership counters; forecast horizon shift
+    - selector_policy                        # driver assignment: eligibility + ranking + tie-break + fallback
+    - scheduled_deferred_actions             # logical clock drives expiry sweeps and horizon shifts
+    - bulk_operations                        # replenish order finalize posts many receipt lines atomically
+    - rate_threshold_triggers                # batch line cap, batch item cap, fee-waiver threshold, peak windows, expiry horizon
+  entity_topology: flat                      # peer entities joined by body/query FKs; no nesting in URL paths
+  state_machine_shape: branching             # plus cyclic return-to-stock and parallel DeliveryBag dimensions
+  relationship_patterns: [cross_aggregate]
+  role_model: segregation_of_duties          # Picker cannot seal batches they picked; Driver cannot self-verify handoffs; Customer cannot write fulfillment resources
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (12 entities)
+# =============================================================================
+entities:
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Human site code, unique across sites", constraints: "unique" }
+      - { name: name, type: string, source: input, description: "Display name of the micro-fulfillment site" }
+      - { name: delivery_radius_miles, type: number, source: input, description: "Maximum straight-line delivery distance in miles; orders beyond it are rejected", constraints: "> 0" }
+      - { name: fee_schedule, type: object, source: input, description: "Delivery fee schedule: { base_cents, per_mile_cents, included_miles, peak_surcharge_cents, min_fee_cents, max_fee_cents }; all monetary fields integer cents" }
+      - { name: fee_waiver_threshold_cents, type: integer, source: input, description: "Item-subtotal cents at or above which an ACTIVE membership waives the delivery fee", constraints: ">= 0" }
+      - { name: batch_max_lines, type: integer, source: input, description: "Capacity derived per open PickBatch: maximum distinct orders", constraints: ">= 1" }
+      - { name: batch_max_items, type: integer, source: input, description: "Capacity derived per open PickBatch: maximum summed line quantities", constraints: ">= 1" }
+      - { name: expiry_horizon_days, type: integer, source: input, description: "Perishable StockLots expiring within this many days of the logical clock are EXPIRING soon and blocked from picking", constraints: ">= 0" }
+      - { name: peak_windows, type: array, source: input, description: "List of { day_of_week: MON..SUN, start: 'HH:MM', end: 'HH:MM' } UTC windows; if a placement's hour-of-week falls inside any window the peak surcharge applies; empty list means never peak" }
+      - { name: status, type: enum, source: system, description: "OPERATING -> SUSPENDED -> OPERATING; OPENED_REPLENISH (transitional posture computed on read) when any ReplenishOrder sits in PLACED", constraints: "enum { OPERATING, SUSPENDED, OPENED_REPLENISH }" }
+      - { name: effective_status, type: enum, source: computed, description: "Posture on read: SUSPENDED if status == SUSPENDED; else OPENED_REPLENISH if any ReplenishOrder of this site is in PLACED; else OPERATING", constraints: "enum { OPERATING, SUSPENDED, OPENED_REPLENISH }" }
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: sku, type: string, source: input, description: "Merchant SKU, unique across the catalog", constraints: "unique" }
+      - { name: name, type: string, source: input, description: "Display name" }
+      - { name: price_cents, type: integer, source: input, description: "Unit sell price in integer cents", constraints: "> 0" }
+      - { name: product_class, type: enum, source: input, description: "STANDARD | AGE_RESTRICTED | PERISHABLE — drives age-verification, per-line tax, and expiry controls" }
+      - { name: restricted, type: boolean, source: computed, description: "Read-only mirror: true iff product_class == AGE_RESTRICTED" }
+      - { name: perishable, type: boolean, source: computed, description: "Read-only mirror: true iff product_class == PERISHABLE" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> RETIRED (one-way); RETIRED products are unpickable", default: "ACTIVE", constraints: "enum { ACTIVE, RETIRED }" }
+
+  - name: InventoryBalance
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id; one balance row per (site, product)" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id" }
+      - { name: on_hand, type: integer, source: computed, description: "Derived physical units: seeded by stock adjustment RECEIPT and advanced by posted StockLot receipts, committed picks, and RETURN_TO_STOCK lot receipts; never set by clients" }
+      - { name: reserved, type: integer, source: computed, description: "Units currently allocated to PLACED orders at this site" }
+      - { name: min_par_level, type: integer, source: input, default: 0, description: "Replenishment par level: stockout defined as on_hand + on_order < min_par_level", constraints: ">= 0" }
+      - { name: on_order, type: integer, source: computed, description: "Units on ReplenishOrders in PLACED status for this (site, product)" }
+
+  - name: StockLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; perishable products only" }
+      - { name: lot_code, type: string, source: input, description: "Vendor lot code; unique per (site_id, product_id)", constraints: "unique per (site, product)" }
+      - { name: received_qty, type: integer, source: input, description: "Units received into this lot", constraints: ">= 1" }
+      - { name: remaining_qty, type: integer, source: computed, description: "Units not yet consumed; decremented by lot-attributed picks and shrink disposals" }
+      - { name: expires_at, type: datetime, source: input, description: "Expiry instant (ISO 8601 UTC)" }
+      - { name: status, type: enum, source: computed, description: "Derived per read against logical clock: EXPIRED if expires_at <= now; EXPIRING if now < expires_at <= now + site.expiry_horizon_days; else FRESH", constraints: "enum { FRESH, EXPIRING, EXPIRED }" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Customer email, unique", constraints: "unique" }
+      - { name: full_name, type: string, source: input, description: "Legal name used for age-restricted handoff comparison" }
+      - { name: date_of_birth, type: datetime, source: input, description: "Date of birth (ISO 8601 date or datetime UTC); drives age verification against the logical clock" }
+      - { name: wallet_credit_cents, type: integer, source: computed, description: "Loyalty credit balance; accrued on delivery per loyalty_credit_accrual and consumed at placement before fee computation" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> SUSPENDED -> ACTIVE", constraints: "enum { ACTIVE, SUSPENDED }" }
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; at most one Membership per customer" }
+      - { name: tier, type: enum, source: input, description: "FAM — the instant-needs free-delivery membership tier", constraints: "enum { FAM }" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> LAPSED (on billing close when monthly fee unpaid) -> ACTIVE (on renewal); -> CANCELLED (one-way)", constraints: "enum { ACTIVE, LAPSED, CANCELLED }" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Monthly membership fee charged at billing close", constraints: ">= 0" }
+      - { name: current_period_start, type: datetime, source: computed, description: "Start instant (UTC) of the current 30-day billing period; set at enrollment, advanced 30 days per close" }
+      - { name: current_period_end, type: datetime, source: computed, description: "current_period_start + 30 days exactly; the billing close endpoint runs at or after this instant" }
+      - { name: periods_paid, type: integer, source: computed, description: "Count of billing periods closed with monthly_fee_paid == true in the trailing 12-period window; drives tenure discount" }
+      - { name: period_orders_count, type: integer, source: computed, description: "Orders DELIVERED in the current period; reset to 0 at close" }
+      - { name: period_credit_earned_cents, type: integer, source: computed, description: "Loyalty cents earned in the current period; folded into lifetime stats then reset to 0 at close" }
+      - { name: auto_renew, type: boolean, source: input, default: true, description: "Whether the membership renews at period end" }
+      - { name: tenure_discount_bps, type: integer, source: computed, description: "0 until periods_paid >= 12, then TENURE_DISCOUNT_BPS; recomputed at billing close before the next period's fee is set" }
+
+  - name: ReplenishOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id" }
+      - { name: reference, type: string, source: input, description: "Vendor-facing purchase reference; unique per site", constraints: "unique per site" }
+      - { name: lines, type: array, source: input, description: "List of { product_id, qty, unit_cost_cents }; qty >= 1, unit_cost_cents >= 0; at least one line", constraints: "len >= 1" }
+      - { name: expected_at, type: datetime, source: input, description: "Expected vendor delivery instant (UTC)" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> PLACED -> FINALIZED / CANCELLED", constraints: "enum { DRAFT, PLACED, FINALIZED, CANCELLED }" }
+      - { name: idempotency_key, type: string, source: input, description: "Client-supplied idempotency key; a replayed POST with the same key returns the original record", constraints: "unique per site" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; must equal the placing Customer's identity" }
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id; the fulfilling site" }
+      - { name: lines, type: array, source: input, description: "List of { product_id, qty }; qty >= 1; at least one line", constraints: "len >= 1" }
+      - { name: delivery_distance_miles, type: number, source: input, description: "Straight-line distance from site to drop-off; must be <= site.delivery_radius_miles", constraints: ">= 0" }
+      - { name: contains_age_restricted, type: boolean, source: computed, description: "True iff any line's product is AGE_RESTRICTED" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "Sum of line unit prices x quantities" }
+      - { name: tax_cents, type: integer, source: computed, description: "Per order_tax rules: AGE_RESTRICTED lines taxed at TOBACCO_TAX_RATE, all others untaxed; rounding order pinned per-line" }
+      - { name: delivery_fee_cents, type: integer, source: computed, description: "Per delivery_fee rules: fee schedule + peak surcharge, waived to 0 when membership waiver applies" }
+      - { name: loyalty_credit_applied_cents, type: integer, source: computed, description: "Wallet cents consumed at placement (absorb variant): min(wallet, subtotal - wallet floor)" }
+      - { name: total_cents, type: integer, source: computed, description: "subtotal_cents + tax_cents + delivery_fee_cents - loyalty_credit_applied_cents" }
+      - { name: pick_batch_id, type: string, source: system, description: "FK -> PickBatch.id; set when the order is appended to an OPEN batch; null before and after the batch seals" }
+      - { name: status, type: enum, source: system, description: "PLACED -> PICKING -> AWAITING_HANDOFF -> OUT_FOR_DELIVERY -> DELIVERED; alternately PLACED -> CANCELLED and AWAITING_HANDOFF -> HANDOFF_FAILED -> CANCELLED", constraints: "enum { PLACED, PICKING, AWAITING_HANDOFF, OUT_FOR_DELIVERY, DELIVERED, HANDOFF_FAILED, CANCELLED }" }
+
+  - name: PickBatch
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id" }
+      - { name: picker_id, type: string, source: input, description: "FK -> Picker.id; exactly one picker owns the batch (single-picker limit)" }
+      - { name: order_ids, type: array, source: computed, description: "Orders appended to this batch; capped at site.batch_max_lines with summed quantities capped at site.batch_max_items" }
+      - { name: total_items, type: integer, source: computed, description: "Sum of line quantities across appended orders" }
+      - { name: sealed_at, type: datetime, source: system, description: "Set at seal; a batch stays OPEN until this is written" }
+      - { name: sealed_by_id, type: string, source: system, description: "FK -> Picker.id of the sealer; MUST differ from picker_id (segregation of duties)" }
+      - { name: status, type: enum, source: system, description: "OPEN -> SEALED -> CLOSED", constraints: "enum { OPEN, SEALED, CLOSED }" }
+
+  - name: Picker
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id" }
+      - { name: name, type: string, source: input, description: "Display name" }
+      - { name: status, type: enum, source: input, default: "ACTIVE", description: "ACTIVE | INACTIVE — only ACTIVE pickers may own or seal batches", constraints: "enum { ACTIVE, INACTIVE }" }
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id; the fixed dispatch site" }
+      - { name: name, type: string, source: input, description: "Display name" }
+      - { name: max_run_orders, type: integer, source: input, description: "Maximum orders the driver may carry on one delivery run", constraints: ">= 1" }
+      - { name: status, type: enum, source: input, default: "AVAILABLE", description: "AVAILABLE | OFF_DUTY | SUSPENDED — eligibility input for the dispatch selector", constraints: "enum { AVAILABLE, OFF_DUTY, SUSPENDED }" }
+
+  - name: DeliveryBag
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; at most one DeliveryBag per order" }
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id; null while UNASSIGNED; set by the dispatch selector" }
+      - { name: assigned_at, type: datetime, source: system, description: "Set when the bag is assigned to a driver run" }
+      - { name: delivery_status, type: enum, source: system, description: "UNASSIGNED -> ASSIGNED -> OUT_FOR_DELIVERY -> DELIVERED / FAILED", constraints: "enum { UNASSIGNED, ASSIGNED, OUT_FOR_DELIVERY, DELIVERED, FAILED }" }
+      - { name: handoff_status, type: enum, source: system, description: "NONE -> ID_SCANNED -> AGE_VERIFIED; alternately ID_SCANNED -> REFUSED; terminal alongside delivery", constraints: "enum { NONE, ID_SCANNED, AGE_VERIFIED, REFUSED }" }
+      - { name: scanned_id_last4, type: string, source: system, description: "Last 4 characters of the scanned identification document; audit trail for age-restricted handoff" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Site
+    initial_state: OPERATING
+    terminal_states: []
+    transitions:
+      - from: OPERATING
+        to: SUSPENDED
+        trigger: "POST /sites/{siteId}/suspend"
+        actor: SiteOps
+        preconditions:
+          - "Site must be OPERATING (ERR_INVALID_STATE)"
+          - "No open or in-flight work: no PickBatch in OPEN or SEALED, no Order in PICKING or AWAITING_HANDOFF or OUT_FOR_DELIVERY at this site (ERR_SITE_BUSY)"
+        side_effects:
+          - "increments Site.version by 1"
+      - from: SUSPENDED
+        to: OPERATING
+        trigger: "POST /sites/{siteId}/resume"
+        actor: SiteOps
+        preconditions:
+          - "Site must be SUSPENDED (ERR_INVALID_STATE)"
+        side_effects:
+          - "increments Site.version by 1"
+    note: "Cyclic OPERATING <-> SUSPENDED. effective_status additionally surfaces the derived OPENED_REPLENISH posture while any ReplenishOrder is PLACED; OPENED_REPLENISH blocks new order placement but never picking, sealing, or dispatch."
+
+  - entity: Product
+    initial_state: ACTIVE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "POST /products/{productId}/retire"
+        actor: SiteOps
+        preconditions:
+          - "Product must be ACTIVE (ERR_INVALID_STATE)"
+          - "No order line references this product on an Order in PLACED, PICKING, AWAITING_HANDOFF, or OUT_FOR_DELIVERY (ERR_PRODUCT_IN_USE)"
+        side_effects:
+          - "increments Product.version by 1"
+
+  - entity: ReplenishOrder
+    initial_state: DRAFT
+    terminal_states: [FINALIZED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: PLACED
+        trigger: "POST /replenish-orders/{replenishOrderId}/place"
+        actor: SiteOps
+        preconditions:
+          - "ReplenishOrder must be DRAFT (ERR_INVALID_STATE)"
+          - "Site.effective_status must be OPERATING (ERR_SITE_NOT_OPERATING)"
+        side_effects:
+          - "For each line: InventoryBalance(site, product).on_order += line.qty (hop 1)"
+          - "Each on_order increase re-derives that balance's stockout posture: on_hand + on_order >= min_par_level clears the stockout flag used by the reorder report (hop 2)"
+          - "increments ReplenishOrder.version by 1"
+      - from: PLACED
+        to: FINALIZED
+        trigger: "POST /replenish-orders/{replenishOrderId}/finalize"
+        actor: SiteOps
+        preconditions:
+          - "ReplenishOrder must be PLACED (ERR_INVALID_STATE)"
+        side_effects:
+          - "For each line: InventoryBalance.on_order -= line.qty and on_hand += line.qty (hop 1)"
+          - "For each line whose product is PERISHABLE: create a StockLot { received_qty = line.qty, remaining_qty = line.qty, expires_at = payload lot expiry for that line } (hop 2)"
+          - "Site posture recompute: with no ReplenishOrder left in PLACED, Site.effective_status falls back to OPERATING (hop 3)"
+          - "increments ReplenishOrder.version by 1"
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /replenish-orders/{replenishOrderId}/cancel"
+        actor: SiteOps
+        preconditions:
+          - "ReplenishOrder must be PLACED (ERR_INVALID_STATE)"
+        side_effects:
+          - "For each line: InventoryBalance.on_order -= line.qty (compensation of the place side effect)"
+          - "increments ReplenishOrder.version by 1"
+    note: "Branching from PLACED: FINALIZED (goods arrived) or CANCELLED (vendor short)."
+
+  - entity: Order
+    initial_state: PLACED
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: PICKING
+        trigger: "system (automatic when the order is appended to an OPEN PickBatch via POST /pick-batches/{batchId}/orders)"
+        actor: system
+        preconditions:
+          - "Order must be PLACED (ERR_INVALID_STATE)"
+          - "Appending the order must respect site.batch_max_lines and site.batch_max_items (ERR_BATCH_FULL)"
+          - "For every line: InventoryBalance.on_hand - reserved >= line.qty (ERR_INSUFFICIENT_STOCK)"
+          - "If contains_age_restricted: customer age at the logical clock >= MIN_AGE_RESTRICTED (ERR_AGE_VERIFICATION_REQUIRED)"
+        side_effects:
+          - "For every line: InventoryBalance.reserved += line.qty (hop 1 of the pick cascade)"
+          - "Order.pick_batch_id set to the batch"
+          - "PickBatch.total_items recomputed; PickBatch.order_ids extended (hop 2)"
+          - "increments Order.version by 1"
+      - from: PICKING
+        to: AWAITING_HANDOFF
+        trigger: "system (automatic when the parent PickBatch is sealed via POST /pick-batches/{batchId}/seal)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "For every line: InventoryBalance.reserved -= line.qty and on_hand -= line.qty (hop 2 of the pick cascade; the reservation commits to a physical pick)"
+          - "For every line on a PERISHABLE product: deduct line.qty from StockLots of the same (site, product) with status FRESH, ordered by expires_at ASC then created_at ASC (earliest-expiry-first), creating pick attribution (hop 3)"
+          - "increments Order.version by 1"
+      - from: AWAITING_HANDOFF
+        to: OUT_FOR_DELIVERY
+        trigger: "POST /delivery-bags/{bagId}/depart"
+        actor: Driver
+        preconditions:
+          - "DeliveryBag.delivery_status must be ASSIGNED (ERR_BAG_NOT_ASSIGNED)"
+          - "Acting driver must equal DeliveryBag.driver_id (ERR_UNAUTHORIZED)"
+          - "If the order contains_age_restricted: handoff_status must be AGE_VERIFIED (ERR_HANDOFF_NOT_VERIFIED)"
+        side_effects:
+          - "Order.status -> OUT_FOR_DELIVERY (hop 1 of the dispatch cascade)"
+          - "DeliveryBag.delivery_status -> OUT_FOR_DELIVERY (hop 2)"
+          - "increments Order.version and DeliveryBag.version by 1"
+      - from: OUT_FOR_DELIVERY
+        to: DELIVERED
+        trigger: "POST /delivery-bags/{bagId}/complete"
+        actor: Driver
+        preconditions:
+          - "DeliveryBag.delivery_status must be OUT_FOR_DELIVERY (ERR_INVALID_STATE)"
+          - "Acting driver must equal DeliveryBag.driver_id (ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Order.status -> DELIVERED (hop 1)"
+          - "DeliveryBag.delivery_status -> DELIVERED (hop 2)"
+          - "Loyalty accrual per loyalty_credit_accrual: Customer.wallet_credit_cents += earned cents (record variant); Membership.period_orders_count += 1 and period_credit_earned_cents += earned cents (hop 3)"
+          - "increments Order.version, DeliveryBag.version, Customer.version by 1"
+      - from: AWAITING_HANDOFF
+        to: HANDOFF_FAILED
+        trigger: "POST /delivery-bags/{bagId}/fail-handoff"
+        actor: Driver
+        preconditions:
+          - "DeliveryBag.handoff_status must be REFUSED (ERR_REFUSAL_REQUIRED)"
+        side_effects:
+          - "Order.status -> HANDOFF_FAILED"
+          - "DeliveryBag.delivery_status -> FAILED (parallel dimension moves with the order)"
+      - from: HANDOFF_FAILED
+        to: CANCELLED
+        trigger: "POST /orders/{orderId}/cancel (reason RETURN_TO_STOCK)"
+        actor: SiteOps
+        preconditions:
+          - "Order must be HANDOFF_FAILED (ERR_INVALID_STATE)"
+          - "reason must be RETURN_TO_STOCK (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "For every line on a non-perishable product: create a StockLot { lot_code = 'RMA-<order id>-<product id>', received_qty = remaining_qty = line.qty, expires_at = 2099-12-31T00:00:00Z } and InventoryBalance.on_hand += line.qty (compensating return-to-stock receipt)"
+          - "Perishable lines are NOT restocked (food safety); they are written off"
+          - "For every line: loyalty reversal — Customer.wallet_credit_cents -= the cents this order earned at delivery time (none earned here since delivery never completed; the reversal targets loyalty_credit_applied_cents which is refunded to the wallet instead)"
+          - "Customer.wallet_credit_cents += loyalty_credit_applied_cents (refund of absorbed credit)"
+          - "increments Order.version and Customer.version by 1"
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /orders/{orderId}/cancel (reason CUSTOMER)"
+        actor: Customer
+        preconditions:
+          - "Order must be PLACED (ERR_INVALID_STATE)"
+          - "Acting customer must own the order (ERR_UNAUTHORIZED)"
+          - "reason must be CUSTOMER (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "Customer.wallet_credit_cents += loyalty_credit_applied_cents (refund of absorbed credit)"
+          - "increments Order.version and Customer.version by 1"
+    note: "Branching with a post-failure path: PLACED -> PICKING -> AWAITING_HANDOFF then either OUT_FOR_DELIVERY -> DELIVERED or HANDOFF_FAILED -> CANCELLED."
+
+  - entity: PickBatch
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: SEALED
+        trigger: "POST /pick-batches/{batchId}/seal"
+        actor: Picker
+        preconditions:
+          - "PickBatch must be OPEN (ERR_INVALID_STATE)"
+          - "order_ids must be non-empty (ERR_BATCH_EMPTY)"
+          - "sealer (acting Picker id) must differ from picker_id (ERR_SELF_SEAL_FORBIDDEN)"
+        side_effects:
+          - "sealed_at and sealed_by_id set"
+          - "Every appended Order: PICKING -> AWAITING_HANDOFF with its inventory commit cascade (see Order machine)"
+          - "increments PickBatch.version by 1"
+      - from: SEALED
+        to: CLOSED
+        trigger: "system (automatic when the last appended Order reaches a terminal state DELIVERED or CANCELLED)"
+        actor: system
+        preconditions:
+          - "All appended orders are terminal"
+        side_effects: []
+    note: "Linear open->seal->close, but the seal fans out a per-order cascade and close is a compound child-state aggregate."
+
+  - entity: Membership
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: LAPSED
+        trigger: "system (automatic at billing close when the period's monthly fee is unpaid)"
+        actor: system
+        preconditions:
+          - "logical clock >= current_period_end"
+          - "period fee unpaid"
+        side_effects:
+          - "period counters reset per membership_billing_close"
+      - from: LAPSED
+        to: ACTIVE
+        trigger: "POST /memberships/{membershipId}/renew"
+        actor: Customer
+        preconditions:
+          - "Membership must be LAPSED (ERR_INVALID_STATE)"
+          - "Acting customer must own the membership (ERR_UNAUTHORIZED)"
+          - "expected_customer_version must equal the owning Customer.version (OCC, ERR_STALE_VERSION)"
+        side_effects:
+          - "current_period_start := logical clock; current_period_end := clock + 30 days"
+          - "increments Membership.version and Customer.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /memberships/{membershipId}/cancel"
+        actor: Customer
+        preconditions:
+          - "Membership must be ACTIVE (ERR_INVALID_STATE)"
+          - "Acting customer must own the membership (ERR_UNAUTHORIZED)"
+          - "expected_customer_version must equal the owning Customer.version (OCC, ERR_STALE_VERSION)"
+        side_effects:
+          - "increments Membership.version and Customer.version by 1"
+    note: "Cyclic ACTIVE <-> LAPSED with a one-way CANCELLED exit."
+
+  - entity: DeliveryBag
+    initial_state: UNASSIGNED
+    terminal_states: [DELIVERED, FAILED]
+    transitions:
+      - from: UNASSIGNED
+        to: ASSIGNED
+        trigger: "POST /delivery-bags/{bagId}/assign (empty driver_id triggers the server-side selector)"
+        actor: SiteOps
+        preconditions:
+          - "DeliveryBag must be UNASSIGNED (ERR_INVALID_STATE)"
+          - "Parent Order must be AWAITING_HANDOFF (ERR_INVALID_STATE)"
+          - "Selector: candidate set = Drivers of the bag's site with status AVAILABLE whose current run (ASSIGNED + OUT_FOR_DELIVERY bags) carries strictly fewer than max_run_orders orders; rank by current run size ASC, tie-break Driver.created_at ASC; empty candidate set -> ERR_NO_DRIVER_AVAILABLE"
+        side_effects:
+          - "driver_id and assigned_at set"
+          - "increments DeliveryBag.version by 1"
+      - from: ASSIGNED
+        to: OUT_FOR_DELIVERY
+        trigger: "POST /delivery-bags/{bagId}/depart"
+        actor: Driver
+        preconditions: ["see Order.AWAITING_HANDOFF -> OUT_FOR_DELIVERY"]
+        side_effects: ["moves with the parent Order dispatch cascade"]
+      - from: OUT_FOR_DELIVERY
+        to: DELIVERED
+        trigger: "POST /delivery-bags/{bagId}/complete"
+        actor: Driver
+        preconditions: ["see Order.OUT_FOR_DELIVERY -> DELIVERED"]
+        side_effects: ["moves with the parent Order delivery cascade"]
+      - from: ASSIGNED
+        to: FAILED
+        trigger: "POST /delivery-bags/{bagId}/fail-handoff"
+        actor: Driver
+        preconditions: ["handoff_status must be REFUSED (ERR_REFUSAL_REQUIRED)"]
+        side_effects: ["parent Order -> HANDOFF_FAILED"]
+    note: "Parallel state dimensions: delivery_status (UNASSIGNED/ASSIGNED/OUT_FOR_DELIVERY/DELIVERED/FAILED) evolves independently of handoff_status (NONE/ID_SCANNED/AGE_VERIFIED/REFUSED) on the same row."
+
+  - entity: DeliveryBag.handoff_status
+    initial_state: NONE
+    terminal_states: [AGE_VERIFIED, REFUSED]
+    transitions:
+      - from: NONE
+        to: ID_SCANNED
+        trigger: "POST /delivery-bags/{bagId}/handoff-scan"
+        actor: Driver
+        preconditions:
+          - "Parent order must contain_age_restricted (ERR_HANDOFF_NOT_REQUIRED otherwise)"
+          - "handoff_status must be NONE (ERR_INVALID_STATE)"
+          - "delivery_status must be ASSIGNED — scanning happens after dispatch, before departure (ERR_INVALID_STATE)"
+          - "Acting driver must equal DeliveryBag.driver_id (ERR_UNAUTHORIZED)"
+        side_effects:
+          - "scanned_id_last4 recorded (audit)"
+      - from: ID_SCANNED
+        to: AGE_VERIFIED
+        trigger: "system (automatic inside the same handoff-scan request when the scanned document's birthdate makes the recipient >= MIN_AGE_RESTRICTED at the logical clock)"
+        actor: system
+        preconditions:
+          - "computed age >= MIN_AGE_RESTRICTED"
+        side_effects: []
+      - from: ID_SCANNED
+        to: REFUSED
+        trigger: "system (automatic inside the same handoff-scan request when computed age < MIN_AGE_RESTRICTED)"
+        actor: system
+        preconditions:
+          - "computed age < MIN_AGE_RESTRICTED"
+        side_effects:
+          - "The order is now eligible for POST /delivery-bags/{bagId}/fail-handoff"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: site-capacity-profile-stale-version
+    parent_entity: Site
+    write_endpoint: "PUT /sites/{siteId}/capacity-profile"
+    occ_field: "expected_site_version"
+    description: |
+      Updating a Site's capacity profile (batch_max_lines, batch_max_items,
+      expiry_horizon_days, fee_waiver_threshold_cents) against a Site whose
+      version has advanced since the client last observed it is rejected with
+      ERR_STALE_VERSION — the client is configuring caps and horizons it never
+      saw. OCC on Site.version resolves the conflict deterministically.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: membership-write-stale-customer-version
+    parent_entity: Customer
+    write_endpoint: "POST /memberships/{membershipId}/cancel"
+    occ_field: "expected_customer_version"
+    description: |
+      Cancelling (or renewing) a Membership while carrying a Customer version
+      that has since advanced — e.g. a loyalty accrual from a delivered order
+      bumped Customer.version — is rejected with ERR_STALE_VERSION. OCC on
+      Customer.version keeps membership lifecycle writes serialized against
+      wallet-mutating cascades.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: delivery_fee
+    trigger: "order placement (POST /orders), before loyalty credit application"
+    algorithm: tiered_pricing
+    formula: |
+      # Evaluation order is pinned: fee computed on the raw subtotal BEFORE
+      # loyalty credit absorption, because the waiver speaks of the basket
+      # (item subtotal), not the amount charged.
+      fee_cents = site.fee_schedule.base_cents
+      billable_miles = max(0, order.delivery_distance_miles - site.fee_schedule.included_miles)
+      fee_cents += round_half_up_to_cents(billable_miles * site.fee_schedule.per_mile_cents)
+      if is_peak(site.peak_windows, placement_clock):
+        fee_cents += site.fee_schedule.peak_surcharge_cents
+      fee_cents = max(site.fee_schedule.min_fee_cents, min(site.fee_schedule.max_fee_cents, fee_cents))
+      membership_active = exists Membership of order.customer_id with status == ACTIVE
+      if membership_active and order.subtotal_cents >= site.fee_waiver_threshold_cents:
+        fee_cents = 0   # waiver boundary: >=, exact threshold waives
+      order.delivery_fee_cents = fee_cents
+    input_set: "The placing order's distance, the site's fee_schedule, peak_windows and fee_waiver_threshold_cents, the customer's membership status at placement"
+    constants:
+      ROUNDING: "round_half_up to integer cents"
+    precision: "integer cents"
+    variants: []
+
+  - name: order_tax
+    trigger: "order placement"
+    algorithm: tiered_pricing
+    formula: |
+      # PINNED ROUNDING ORDER (mode b): tax is computed PER LINE, each line
+      # rounded half-up to integer cents, then summed. Summing raw amounts and
+      # rounding once is a different, valid-in-prose algorithm that yields
+      # different cents; this scaffold pins per-line-then-sum.
+      tax_cents = 0
+      for line in order.lines:
+        if product(line.product_id).product_class == AGE_RESTRICTED:
+          line_tax = round_half_up_to_cents(line.qty * product.price_cents * TOBACCO_TAX_RATE)
+        else:
+          line_tax = 0
+        tax_cents += line_tax
+      order.tax_cents = tax_cents
+    input_set: "Order lines with their products' product_class and price_cents"
+    constants:
+      TOBACCO_TAX_RATE: 0.07
+    precision: "integer cents, per-line round_half_up then sum"
+    variants:
+      - name: per_line_then_sum
+        when: "ALWAYS — the pinned production rule"
+        difference: "Round each taxed line to cents, then sum"
+      - name: sum_then_round
+        when: "NEVER in production — documented rejected alternative used by tests to prove divergence"
+        difference: "Sum all taxed raw amounts, round once; can differ by 1 cent or more from per_line_then_sum"
+
+  - name: loyalty_credit_accrual
+    trigger: "order delivered (POST /delivery-bags/{bagId}/complete)"
+    algorithm: threshold
+    formula: |
+      # Dual-variant on the Customer wallet domain: the same order either
+      # EARNS credit (record) or SAVES fee spend (absorb) — never both.
+      if order.loyalty_credit_applied_cents > 0:
+        earned_cents = 0    # absorb variant: wallet was consumed at placement
+      else:
+        earned_cents = min(LOYALTY_CAP_CENTS, round_half_up_to_cents(LOYALTY_RATE * (order.subtotal_cents + order.delivery_fee_cents)))
+      customer.wallet_credit_cents += earned_cents
+      membership.period_credit_earned_cents += earned_cents (if membership exists)
+    input_set: "The delivered order's subtotal_cents, delivery_fee_cents, loyalty_credit_applied_cents"
+    constants:
+      LOYALTY_RATE: 0.03
+      LOYALTY_CAP_CENTS: 500
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: record
+        when: "loyalty_credit_applied_cents == 0"
+        difference: "Earn min(500, 3% of subtotal + fee) into the wallet"
+      - name: absorb
+        when: "loyalty_credit_applied_cents > 0"
+        difference: "Earn exactly 0 — credit was already consumed at placement as a subtotal offset"
+
+  - name: loyalty_credit_application
+    trigger: "order placement, after subtotal computed and before delivery_fee"
+    algorithm: waterfall_allocation
+    formula: |
+      # Wallet absorbs the basket first (waterfall: single bucket), leaving a
+      # floor so the fee engine still sees the raw subtotal.
+      applicable = min(customer.wallet_credit_cents, max(0, order.subtotal_cents - WALLET_FLOOR_CENTS))
+      order.loyalty_credit_applied_cents = applicable
+      customer.wallet_credit_cents -= applicable
+    input_set: "Customer.wallet_credit_cents and order.subtotal_cents at placement"
+    constants:
+      WALLET_FLOOR_CENTS: 0
+    precision: "integer cents"
+
+  - name: age_at_handoff
+    trigger: "POST /delivery-bags/{bagId}/handoff-scan; also re-checked at batch append for pre-screening"
+    algorithm: threshold
+    formula: |
+      # Exact age on the logical clock's current date: full years elapsed from
+      # date_of_birth. Boundary precision: a recipient whose 21st birthday IS
+      # the current date counts as 21 (>= MIN_AGE_RESTRICTED passes).
+      age = years_between(date_of_birth, logical_clock_now)
+      verified = (age >= MIN_AGE_RESTRICTED)
+    input_set: "Customer.date_of_birth (placement pre-screen) or the scanned document birthdate (handoff), logical clock"
+    constants:
+      MIN_AGE_RESTRICTED: 21
+    precision: "whole years, birthday-on-today counts"
+
+  - name: batch_capacity_check
+    trigger: "appending an order to an OPEN PickBatch"
+    algorithm: threshold
+    formula: |
+      # Two capacity ceilings; BOTH use >= (at-capacity rejects the append).
+      if len(batch.order_ids) >= site.batch_max_lines: reject ERR_BATCH_FULL
+      if batch.total_items + sum(order line qty) > site.batch_max_items: reject ERR_BATCH_FULL
+      # line cap is inclusive (== cap is full); item cap rejects on overflow
+    input_set: "Batch order_ids, total_items, site batch_max_lines/batch_max_items, incoming order quantities"
+    constants: {}
+    precision: "integer counts"
+
+  - name: stockout_status
+    trigger: "InventoryBalance mutation (receipt, reserve, commit, return) and replenish place/finalize/cancel"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking: stockout weighs units already committed to vendors,
+      # not just what is on the shelf.
+      available = on_hand - reserved
+      stockout = (on_hand + on_order < min_par_level)
+      pickable(product, qty) = (available >= qty) and product.status == ACTIVE
+      # PERISHABLE extra gate: pickable only if enough FRESH-lot cover exists:
+      # sum(remaining_qty over StockLots with status == FRESH) >= qty
+    input_set: "InventoryBalance row, StockLots of the same (site, product) filtered to status FRESH"
+    constants: {}
+    precision: "integer units"
+
+  - name: lot_expiry_status
+    trigger: "every read of a StockLot and every pick eligibility check"
+    algorithm: threshold
+    formula: |
+      # Boundary semantics: expiry exactly AT the horizon edge is EXPIRING
+      # (blocked); expiry exactly AT now is EXPIRED (write-off eligible).
+      if lot.expires_at <= logical_clock_now: status = EXPIRED
+      elif lot.expires_at <= logical_clock_now + site.expiry_horizon_days * 86400s: status = EXPIRING
+      else: status = FRESH
+    input_set: "StockLot.expires_at, site.expiry_horizon_days, logical clock"
+    constants: {}
+    precision: "second precision on the logical clock"
+
+  - name: membership_billing_close
+    trigger: "POST /memberships/{membershipId}/close-period once logical clock >= current_period_end"
+    algorithm: aggregation
+    formula: |
+      # Circular-looking dependency, pinned evaluation order (mode c):
+      # the tenure discount for the NEXT period depends on periods_paid AFTER
+      # this close increments it, while the fee for THIS close uses the
+      # discount in force BEFORE the increment. Order of operations:
+      fee_charged = monthly_fee_cents * (1 - tenure_discount_bps / 10000)   # discount BEFORE increment
+      fee_charged = round_half_up_to_cents(fee_charged)
+      if period_fee_paid: periods_paid += 1
+      tenure_discount_bps = (TENURE_DISCOUNT_BPS if periods_paid >= TENURE_THRESHOLD_PERIODS else 0)  # recomputed AFTER increment
+      current_period_start = current_period_end
+      current_period_end = current_period_start + 30 days
+      period_orders_count = 0; period_credit_earned_cents = 0
+      if not period_fee_paid: status -> LAPSED
+    input_set: "The membership row at close; period_fee_paid supplied by the billing operator"
+    constants:
+      TENURE_DISCOUNT_BPS: 500       # 5% after tenure
+      TENURE_THRESHOLD_PERIODS: 12
+    precision: "integer cents, round_half_up"
+
+  - name: forecast_basket_lift
+    trigger: "site demand forecast read (GET /sites/{siteId}/demand-forecast)"
+    algorithm: weighted_scoring
+    formula: |
+      # Late-night and weather-driven spike projection. Weights normalize the
+      # trailing 7-day same-hour baseline by two bounded multipliers.
+      base = trailing_7d_same_hour_order_count (from delivered orders at this site)
+      night_mult = 1 + NIGHT_LIFT_PCT if placement hour in [22:00, 04:00) else 1
+      weather_mult = 1 + (precipitation_prob * WEATHER_LIFT_PCT)  # weather supplied on the request
+      projected = round_half_up(base * night_mult * weather_mult)
+    input_set: "Delivered orders at the site over the trailing 7 days bucketed by hour-of-day; request-supplied precipitation probability in [0,1]"
+    constants:
+      NIGHT_LIFT_PCT: 0.40
+      WEATHER_LIFT_PCT: 0.25
+    precision: "whole orders, round_half_up"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and (for entity-backed roles) X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all endpoints"
+  - priority: 2
+    category: auth
+    check: "Role is permitted for the endpoint per the RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all endpoints"
+  - priority: 3
+    category: existence
+    check: "Path ids exist (left to right), then body FK fields exist in the endpoint input declaration order"
+    error_id: "ERR_SITE_NOT_FOUND | ERR_PRODUCT_NOT_FOUND | ERR_CUSTOMER_NOT_FOUND | ERR_ORDER_NOT_FOUND | ERR_PICK_BATCH_NOT_FOUND | ERR_PICKER_NOT_FOUND | ERR_DRIVER_NOT_FOUND | ERR_DELIVERY_BAG_NOT_FOUND | ERR_REPLENISH_ORDER_NOT_FOUND | ERR_STOCK_LOT_NOT_FOUND | ERR_MEMBERSHIP_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path ids or body FKs"
+  - priority: 4
+    category: state
+    check: "Target resource is in a state from which the requested transition exists"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 5
+    category: business_safety
+    check: "Site posture: order placement requires Site.effective_status == OPERATING (SUSPENDED or OPENED_REPLENISH reject); replenish place requires OPERATING"
+    error_id: ERR_SITE_NOT_OPERATING
+    http_status: 409
+    applies_to: "POST /orders, POST /replenish-orders/{id}/place"
+  - priority: 6
+    category: business_safety
+    check: "Delivery distance <= site.delivery_radius_miles"
+    error_id: ERR_DELIVERY_RADIUS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /orders"
+  - priority: 7
+    category: business_safety
+    check: "Age compliance: order containing AGE_RESTRICTED lines requires customer age >= 21 at the logical clock (pre-screen at batch append); handoff scan computes age from the scanned document"
+    error_id: ERR_AGE_VERIFICATION_REQUIRED
+    http_status: 422
+    applies_to: "POST /pick-batches/{id}/orders, POST /delivery-bags/{id}/handoff-scan"
+  - priority: 8
+    category: business_safety
+    check: "Segregation of duties: batch sealer must differ from batch picker_id"
+    error_id: ERR_SELF_SEAL_FORBIDDEN
+    http_status: 403
+    applies_to: "POST /pick-batches/{id}/seal"
+  - priority: 9
+    category: business_constraint
+    check: "Batch capacity: batch_max_lines (inclusive) and batch_max_items (overflow) ceilings"
+    error_id: ERR_BATCH_FULL
+    http_status: 409
+    applies_to: "POST /pick-batches/{id}/orders"
+  - priority: 10
+    category: business_constraint
+    check: "Product orderable: status ACTIVE (checked at placement); PERISHABLE lines additionally require sufficient FRESH-lot cover (checked at batch append)"
+    error_id: ERR_PRODUCT_UNSELLABLE
+    http_status: 422
+    applies_to: "POST /orders (ACTIVE check), POST /pick-batches/{id}/orders (FRESH-cover check)"
+  - priority: 11
+    category: business_fiscal
+    check: "Stock availability: on_hand - reserved >= line qty for every line at batch append"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 422
+    applies_to: "POST /pick-batches/{id}/orders"
+  - priority: 12
+    category: business_fiscal
+    check: "OCC: expected_*_version matches the parent's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "PUT /sites/{id}/capacity-profile, POST /memberships/{id}/cancel, POST /memberships/{id}/renew"
+  - priority: 13
+    category: business_referential
+    check: "Uniqueness and referential integrity: sku unique, lot_code unique per (site, product), replenish reference unique per site, one DeliveryBag per order, one Membership per customer"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "creation endpoints"
+  - priority: 14
+    category: business_constraint
+    check: "Payload well-formedness: required fields present, enum membership, numeric ranges, non-empty arrays, idempotency_key present where declared"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table (46 endpoints)
+# =============================================================================
+endpoints:
+  # --- clock (test-driving; mandatory default) ---
+  - method: POST
+    path: "/mfc/_clock/set_current_utc"
+    description: "Set the logical clock. Server startup default is exactly 2026-09-01T00:00:00Z; before any set call the logical clock reads that instant and never falls back to wall-clock time. All expiry, age, peak-window, and billing computations read this clock."
+    roles: [SiteOps]
+    code: 200
+    input: ["current_utc"]
+    output: { current_utc: datetime }
+    side_effects: ["logical clock advanced; derived StockLot statuses and Site postures reflect the new instant on next read"]
+
+  # --- Site ---
+  - method: POST
+    path: "/mfc/sites"
+    description: "Create a micro-fulfillment site with its fee schedule, capacity profile, and peak windows"
+    roles: [SiteOps]
+    code: 201
+    input: ["code", "name", "delivery_radius_miles", "fee_schedule", "fee_waiver_threshold_cents", "batch_max_lines", "batch_max_items", "expiry_horizon_days", "peak_windows?"]
+    output: Site
+    side_effects: ["status OPERATING, version 1"]
+  - method: GET
+    path: "/mfc/sites"
+    description: "List sites"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Site[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/sites/{siteId}"
+    description: "Get a site including computed effective_status"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+  - method: PUT
+    path: "/mfc/sites/{siteId}/capacity-profile"
+    description: "Update batch caps, expiry horizon, and fee-waiver threshold under OCC"
+    roles: [SiteOps]
+    code: 200
+    input: ["expected_site_version", "batch_max_lines?", "batch_max_items?", "expiry_horizon_days?", "fee_waiver_threshold_cents?"]
+    output: Site
+    side_effects: ["increments Site.version by 1", "ERR_STALE_VERSION on version mismatch"]
+  - method: POST
+    path: "/mfc/sites/{siteId}/suspend"
+    description: "Suspend a site (no open batches or in-flight orders)"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: Site
+    side_effects: ["status -> SUSPENDED", "increments Site.version by 1"]
+  - method: POST
+    path: "/mfc/sites/{siteId}/resume"
+    description: "Resume a suspended site"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: Site
+    side_effects: ["status -> OPERATING", "increments Site.version by 1"]
+  - method: GET
+    path: "/mfc/sites/{siteId}/demand-forecast"
+    description: "Hourly demand projection for the next 24 hours using forecast_basket_lift"
+    roles: [SiteOps]
+    code: 200
+    input: ["precipitation_prob?"]
+    output: { site_id: string, hours: array }
+    side_effects: []
+
+  # --- Product ---
+  - method: POST
+    path: "/mfc/products"
+    description: "Create a catalog product"
+    roles: [SiteOps]
+    code: 201
+    input: ["sku", "name", "price_cents", "product_class"]
+    output: Product
+    side_effects: ["status ACTIVE; restricted/perishable mirrors computed from product_class"]
+  - method: GET
+    path: "/mfc/products"
+    description: "List products"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: ["product_class?", "status?", "limit?", "offset?"]
+    output: "Product[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/products/{productId}"
+    description: "Get a product"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: POST
+    path: "/mfc/products/{productId}/retire"
+    description: "Retire a product (blocked while referenced by in-flight orders)"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: Product
+    side_effects: ["status -> RETIRED", "increments Product.version by 1"]
+
+  # --- InventoryBalance ---
+  - method: POST
+    path: "/mfc/inventory-balances"
+    description: "Create the (site, product) balance row; initial on_hand is seeded via a stock adjustment, not here"
+    roles: [SiteOps]
+    code: 201
+    input: ["site_id", "product_id", "min_par_level?"]
+    output: InventoryBalance
+    side_effects: ["on_hand 0, reserved 0, on_order 0"]
+  - method: GET
+    path: "/mfc/inventory-balances"
+    description: "List balances, filterable by site and product"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: ["site_id?", "product_id?", "limit?", "offset?"]
+    output: "InventoryBalance[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/inventory-balances/{balanceId}"
+    description: "Get one balance row"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: []
+    output: InventoryBalance
+    side_effects: []
+  - method: POST
+    path: "/mfc/inventory-balances/{balanceId}/adjustments"
+    description: "Stock adjustment: RECEIPT seeds on_hand (opening stock, count corrections); SHRINK_DISPOSE writes off units from a specific stock lot"
+    roles: [SiteOps]
+    code: 201
+    input: ["kind", "qty?", "lot_id?", "reason?"]
+    output: { balance_id: string, on_hand: integer, applied_qty: integer }
+    side_effects:
+      - "kind RECEIPT: on_hand += qty (qty required, >= 1)"
+      - "kind SHRINK_DISPOSE: lot_id required; lot must be EXPIRED at the logical clock; lot.remaining_qty decremented by qty, on_hand decremented by qty; qty must be <= lot.remaining_qty (ERR_SHRINK_EXCEEDS_LOT)"
+
+  # --- StockLot ---
+  - method: GET
+    path: "/mfc/stock-lots"
+    description: "List stock lots with computed expiry status; filterable"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: ["site_id?", "product_id?", "status?", "limit?", "offset?"]
+    output: "StockLot[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/stock-lots/{lotId}"
+    description: "Get one stock lot"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: []
+    output: StockLot
+    side_effects: []
+
+  # --- Customer ---
+  - method: POST
+    path: "/mfc/customers"
+    description: "Register a customer"
+    roles: [Customer]
+    code: 201
+    input: ["email", "full_name", "date_of_birth"]
+    output: Customer
+    side_effects: ["status ACTIVE, wallet_credit_cents 0"]
+  - method: GET
+    path: "/mfc/customers"
+    description: "List customers"
+    roles: [SiteOps]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Customer[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/customers/{customerId}"
+    description: "Get a customer (SiteOps any; Customer only self)"
+    roles: [SiteOps, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: POST
+    path: "/mfc/customers/{customerId}/wallet/adjustments"
+    description: "Operator credit/debit of the loyalty wallet (positive or negative amount_cents)"
+    roles: [SiteOps]
+    code: 201
+    input: ["amount_cents", "reason"]
+    output: Customer
+    side_effects: ["wallet_credit_cents += amount_cents (floored at 0)", "increments Customer.version by 1"]
+
+  # --- Membership ---
+  - method: POST
+    path: "/mfc/memberships"
+    description: "Enroll a customer in the FAM tier; at most one membership per customer"
+    roles: [Customer]
+    code: 201
+    input: ["customer_id", "tier", "monthly_fee_cents", "auto_renew?"]
+    output: Membership
+    side_effects: ["status ACTIVE; current_period_start := logical clock; current_period_end := +30 days; counters zeroed"]
+  - method: GET
+    path: "/mfc/memberships"
+    description: "List memberships, filterable by customer"
+    roles: [SiteOps, Customer]
+    code: 200
+    input: ["customer_id?", "status?", "limit?", "offset?"]
+    output: "Membership[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/memberships/{membershipId}"
+    description: "Get a membership"
+    roles: [SiteOps, Customer]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: POST
+    path: "/mfc/memberships/{membershipId}/close-period"
+    description: "Run the billing close at or after current_period_end (ops-run checkpoint)"
+    roles: [SiteOps]
+    code: 200
+    input: ["period_fee_paid"]
+    output: Membership
+    side_effects: ["membership_billing_close evaluation-order-pinned recompute", "possible ACTIVE -> LAPSED", "increments Membership.version by 1"]
+  - method: POST
+    path: "/mfc/memberships/{membershipId}/renew"
+    description: "Renew a LAPSED membership under OCC on the owning Customer"
+    roles: [Customer]
+    code: 200
+    input: ["expected_customer_version"]
+    output: Membership
+    side_effects: ["status -> ACTIVE with a fresh 30-day period", "increments Membership.version and Customer.version by 1"]
+  - method: POST
+    path: "/mfc/memberships/{membershipId}/cancel"
+    description: "Cancel an ACTIVE membership under OCC on the owning Customer"
+    roles: [Customer]
+    code: 200
+    input: ["expected_customer_version"]
+    output: Membership
+    side_effects: ["status -> CANCELLED", "increments Membership.version and Customer.version by 1"]
+
+  # --- ReplenishOrder ---
+  - method: POST
+    path: "/mfc/replenish-orders"
+    description: "Create a DRAFT vendor purchase order (idempotent on idempotency_key per site)"
+    roles: [SiteOps]
+    code: 201
+    input: ["site_id", "reference", "lines", "expected_at", "idempotency_key"]
+    output: ReplenishOrder
+    side_effects: ["status DRAFT", "replay with the same idempotency_key returns the original record without re-creating"]
+  - method: GET
+    path: "/mfc/replenish-orders"
+    description: "List replenish orders"
+    roles: [SiteOps]
+    code: 200
+    input: ["site_id?", "status?", "limit?", "offset?"]
+    output: "ReplenishOrder[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/replenish-orders/{replenishOrderId}"
+    description: "Get a replenish order"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: ReplenishOrder
+    side_effects: []
+  - method: POST
+    path: "/mfc/replenish-orders/{replenishOrderId}/place"
+    description: "Place the purchase order with the vendor"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: ReplenishOrder
+    side_effects: ["status -> PLACED; on_order credited per line; site posture may become OPENED_REPLENISH", "increments ReplenishOrder.version by 1"]
+  - method: POST
+    path: "/mfc/replenish-orders/{replenishOrderId}/finalize"
+    description: "Receive the goods: on_order -> on_hand, StockLots created for perishable lines (bulk, all-or-nothing)"
+    roles: [SiteOps]
+    code: 200
+    input: ["lot_expiries?"]
+    output: ReplenishOrder
+    side_effects: ["status -> FINALIZED; per-line balance moves; StockLot per perishable line (lot_expiries supplies expires_at per product_id; required for perishable lines)", "site posture recompute", "increments ReplenishOrder.version by 1"]
+  - method: POST
+    path: "/mfc/replenish-orders/{replenishOrderId}/cancel"
+    description: "Cancel a placed purchase order (vendor short)"
+    roles: [SiteOps]
+    code: 200
+    input: []
+    output: ReplenishOrder
+    side_effects: ["status -> CANCELLED; on_order debited per line", "increments ReplenishOrder.version by 1"]
+
+  # --- Picker / Driver rosters ---
+  - method: POST
+    path: "/mfc/pickers"
+    description: "Roster a picker at a site"
+    roles: [SiteOps]
+    code: 201
+    input: ["site_id", "name", "status?"]
+    output: Picker
+    side_effects: []
+  - method: GET
+    path: "/mfc/pickers"
+    description: "List pickers"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: ["site_id?", "status?", "limit?", "offset?"]
+    output: "Picker[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/pickers/{pickerId}"
+    description: "Get a picker"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: []
+    output: Picker
+    side_effects: []
+  - method: POST
+    path: "/mfc/drivers"
+    description: "Roster a driver at a site"
+    roles: [SiteOps]
+    code: 201
+    input: ["site_id", "name", "max_run_orders", "status?"]
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/mfc/drivers"
+    description: "List drivers"
+    roles: [SiteOps, Driver]
+    code: 200
+    input: ["site_id?", "status?", "limit?", "offset?"]
+    output: "Driver[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/drivers/{driverId}"
+    description: "Get a driver"
+    roles: [SiteOps, Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+
+  # --- Order ---
+  - method: POST
+    path: "/mfc/orders"
+    description: "Place an order (customer must be self); computes subtotal, loyalty absorb, tax, and delivery fee in pinned order"
+    roles: [Customer]
+    code: 201
+    input: ["customer_id", "site_id", "lines", "delivery_distance_miles"]
+    output: Order
+    side_effects: ["status PLACED", "loyalty_credit_application then order_tax then delivery_fee", "wallet debited by absorbed credit", "increments Customer.version by 1 when credit absorbed"]
+  - method: GET
+    path: "/mfc/orders"
+    description: "List orders"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: ["customer_id?", "site_id?", "status?", "pick_batch_id?", "limit?", "offset?"]
+    output: "Order[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/orders/{orderId}"
+    description: "Get an order"
+    roles: [SiteOps, Picker, Driver, Customer]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: POST
+    path: "/mfc/orders/{orderId}/cancel"
+    description: "Cancel a PLACED order (reason CUSTOMER, by owning customer) or a HANDOFF_FAILED order (reason RETURN_TO_STOCK, by SiteOps)"
+    roles: [Customer, SiteOps]
+    code: 200
+    input: ["reason"]
+    output: Order
+    side_effects: ["status -> CANCELLED", "wallet refund of absorbed credit", "RETURN_TO_STOCK restocks non-perishable lines via new StockLots"]
+
+  # --- PickBatch ---
+  - method: POST
+    path: "/mfc/pick-batches"
+    description: "Open a pick batch owned by a single picker"
+    roles: [SiteOps, Picker]
+    code: 201
+    input: ["site_id", "picker_id"]
+    output: PickBatch
+    side_effects: ["status OPEN, order_ids empty, total_items 0"]
+  - method: GET
+    path: "/mfc/pick-batches"
+    description: "List pick batches"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: ["site_id?", "picker_id?", "sealed_by_id?", "status?", "limit?", "offset?"]
+    output: "PickBatch[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/pick-batches/{batchId}"
+    description: "Get a pick batch"
+    roles: [SiteOps, Picker]
+    code: 200
+    input: []
+    output: PickBatch
+    side_effects: []
+  - method: POST
+    path: "/mfc/pick-batches/{batchId}/orders"
+    description: "Append a PLACED order to an OPEN batch (reserves stock, screens age, enforces both capacity ceilings)"
+    roles: [Picker]
+    code: 200
+    input: ["order_id"]
+    output: PickBatch
+    side_effects: ["Order PLACED -> PICKING with reserve cascade", "batch order_ids/total_items recomputed", "increments PickBatch.version by 1"]
+  - method: POST
+    path: "/mfc/pick-batches/{batchId}/seal"
+    description: "Seal the batch — a DIFFERENT picker than the owner; commits picks and frees reservations"
+    roles: [Picker]
+    code: 200
+    input: []
+    output: PickBatch
+    side_effects: ["status -> SEALED with sealed_at/sealed_by_id", "each appended Order -> AWAITING_HANDOFF with commit cascade and perishable lot attribution", "increments PickBatch.version by 1"]
+
+  # --- DeliveryBag ---
+  - method: POST
+    path: "/mfc/delivery-bags"
+    description: "Create the delivery bag for an AWAITING_HANDOFF order (one per order)"
+    roles: [SiteOps]
+    code: 201
+    input: ["order_id"]
+    output: DeliveryBag
+    side_effects: ["delivery_status UNASSIGNED, handoff_status NONE"]
+  - method: GET
+    path: "/mfc/delivery-bags"
+    description: "List delivery bags"
+    roles: [SiteOps, Driver]
+    code: 200
+    input: ["order_id?", "driver_id?", "delivery_status?", "limit?", "offset?"]
+    output: "DeliveryBag[]"
+    side_effects: []
+  - method: GET
+    path: "/mfc/delivery-bags/{bagId}"
+    description: "Get a delivery bag"
+    roles: [SiteOps, Driver]
+    code: 200
+    input: []
+    output: DeliveryBag
+    side_effects: []
+  - method: POST
+    path: "/mfc/delivery-bags/{bagId}/assign"
+    description: "Assign the bag: explicit driver_id, or omitted driver_id invokes the selector (AVAILABLE, run-size ASC, created_at ASC tie-break)"
+    roles: [SiteOps]
+    code: 200
+    input: ["driver_id?"]
+    output: DeliveryBag
+    side_effects: ["delivery_status -> ASSIGNED; driver_id/assigned_at set", "increments DeliveryBag.version by 1"]
+  - method: POST
+    path: "/mfc/delivery-bags/{bagId}/handoff-scan"
+    description: "Scan the recipient's identification at handoff (age-restricted orders only); verifies or refuses by computed age"
+    roles: [Driver]
+    code: 200
+    input: ["scanned_birthdate", "scanned_id_last4"]
+    output: DeliveryBag
+    side_effects: ["handoff_status NONE -> ID_SCANNED -> AGE_VERIFIED or REFUSED", "scanned_id_last4 recorded"]
+  - method: POST
+    path: "/mfc/delivery-bags/{bagId}/depart"
+    description: "Driver departs the site with the bag"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: DeliveryBag
+    side_effects: ["Order -> OUT_FOR_DELIVERY; bag delivery_status -> OUT_FOR_DELIVERY"]
+  - method: POST
+    path: "/mfc/delivery-bags/{bagId}/complete"
+    description: "Mark the delivery completed; accrues loyalty credit (record variant)"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: DeliveryBag
+    side_effects: ["Order -> DELIVERED; bag -> DELIVERED; loyalty_credit_accrual", "batch may auto-close when its last order goes terminal"]
+  - method: POST
+    path: "/mfc/delivery-bags/{bagId}/fail-handoff"
+    description: "Record a failed handoff after a refusal"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: DeliveryBag
+    side_effects: ["Order -> HANDOFF_FAILED; bag delivery_status -> FAILED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role header missing or malformed, or X-User-ID missing for an entity-backed role" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted for the endpoint, or an entity-backed caller acts on a resource it does not own (customer on another's order/membership, driver on another's bag)" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, type mismatch, out-of-range numeric, out-of-enum value, empty lines array, or missing idempotency_key" }
+  - { id: ERR_SITE_NOT_FOUND, http: 404, condition: "site id does not exist" }
+  - { id: ERR_PRODUCT_NOT_FOUND, http: 404, condition: "product id does not exist" }
+  - { id: ERR_CUSTOMER_NOT_FOUND, http: 404, condition: "customer id does not exist" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "order id does not exist" }
+  - { id: ERR_PICK_BATCH_NOT_FOUND, http: 404, condition: "pick batch id does not exist" }
+  - { id: ERR_PICKER_NOT_FOUND, http: 404, condition: "picker id does not exist" }
+  - { id: ERR_DRIVER_NOT_FOUND, http: 404, condition: "driver id does not exist" }
+  - { id: ERR_DELIVERY_BAG_NOT_FOUND, http: 404, condition: "delivery bag id does not exist" }
+  - { id: ERR_REPLENISH_ORDER_NOT_FOUND, http: 404, condition: "replenish order id does not exist" }
+  - { id: ERR_STOCK_LOT_NOT_FOUND, http: 404, condition: "stock lot id does not exist" }
+  - { id: ERR_MEMBERSHIP_NOT_FOUND, http: 404, condition: "membership id does not exist" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource is not in a state from which the requested transition exists (includes terminal lockdown and handoff-scan on a bag whose handoff is already terminal)" }
+  - { id: ERR_SITE_NOT_OPERATING, http: 409, condition: "Site effective_status is SUSPENDED or OPENED_REPLENISH where OPERATING is required" }
+  - { id: ERR_SITE_BUSY, http: 409, condition: "Suspend requested while open batches or in-flight orders exist at the site" }
+  - { id: ERR_DELIVERY_RADIUS_EXCEEDED, http: 422, condition: "delivery_distance_miles exceeds the site's delivery_radius_miles" }
+  - { id: ERR_AGE_VERIFICATION_REQUIRED, http: 422, condition: "Age-restricted content but customer or scanned recipient is under 21 at the logical clock" }
+  - { id: ERR_SELF_SEAL_FORBIDDEN, http: 403, condition: "Batch sealer is the same picker who owns the batch (segregation of duties)" }
+  - { id: ERR_BATCH_FULL, http: 409, condition: "Appending would exceed batch_max_lines (inclusive) or batch_max_items (overflow)" }
+  - { id: ERR_BATCH_EMPTY, http: 409, condition: "Seal requested on a batch with no orders" }
+  - { id: ERR_PRODUCT_UNSELLABLE, http: 422, condition: "Product RETIRED, or a perishable line lacks sufficient FRESH-lot cover" }
+  - { id: ERR_INSUFFICIENT_STOCK, http: 422, condition: "on_hand - reserved is below a requested line quantity" }
+  - { id: ERR_PRODUCT_IN_USE, http: 409, condition: "Retire requested while an in-flight order references the product" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_*_version does not match the parent entity's current version (OCC)" }
+  - { id: ERR_DUPLICATE_RESOURCE, http: 409, condition: "Uniqueness violation: sku, lot_code per (site, product), replenish reference per site, second bag for an order, second membership for a customer" }
+  - { id: ERR_NO_DRIVER_AVAILABLE, http: 409, condition: "Dispatch selector found no AVAILABLE driver with remaining run capacity" }
+  - { id: ERR_BAG_NOT_ASSIGNED, http: 409, condition: "depart requires delivery_status ASSIGNED" }
+  - { id: ERR_HANDOFF_NOT_VERIFIED, http: 409, condition: "Age-restricted order departing without handoff_status AGE_VERIFIED" }
+  - { id: ERR_HANDOFF_NOT_REQUIRED, http: 409, condition: "handoff-scan on an order with no age-restricted lines" }
+  - { id: ERR_REFUSAL_REQUIRED, http: 409, condition: "fail-handoff requires handoff_status REFUSED" }
+  - { id: ERR_SHRINK_EXCEEDS_LOT, http: 422, condition: "SHRINK_DISPOSE qty exceeds the lot's remaining_qty, or the lot is not EXPIRED at the logical clock" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Customer
+    description: "End customer placing orders and managing their own membership"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /orders — place an order (customer_id must equal X-User-ID)"
+      - "POST /memberships — enroll self"
+      - "POST /memberships/{id}/renew, POST /memberships/{id}/cancel — own membership only, with expected_customer_version"
+      - "POST /orders/{id}/cancel with reason CUSTOMER — own PLACED order only"
+    shared_operations:
+      - "GET /sites, /sites/{id}, /products, /products/{id}, /orders, /orders/{id}, /customers/{id} (self), /memberships (self)"
+  - name: Picker
+    description: "Site picker who owns pick batches and appends orders; a picker may never seal a batch they own"
+    identity: "entity_backed:Picker"
+    exclusive_operations:
+      - "POST /pick-batches/{id}/orders — append an order (must be the batch's picker or any ACTIVE picker per site policy; sealer exclusion applies at seal)"
+    shared_operations:
+      - "POST /pick-batches, POST /pick-batches/{id}/seal (sealer must differ from picker_id)"
+      - "GET /sites, /products, /inventory-balances, /stock-lots, /orders, /pick-batches, /pickers"
+  - name: Driver
+    description: "Delivery driver dispatched from the fixed site; cannot verify handoffs on bags assigned to another driver"
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /delivery-bags/{id}/handoff-scan, /depart, /complete, /fail-handoff — own assigned bags only"
+    shared_operations:
+      - "GET /sites, /products, /orders, /delivery-bags, /drivers"
+  - name: SiteOps
+    description: "Site operator / platform operations; opaque operator id, full configuration and exception authority"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+      - "Site, product, roster (picker/driver), inventory, replenish-order, wallet-adjustment, billing-close writes"
+      - "POST /delivery-bags and POST /delivery-bags/{id}/assign (dispatch)"
+      - "POST /orders/{id}/cancel with reason RETURN_TO_STOCK"
+    shared_operations:
+      - "All GET endpoints"

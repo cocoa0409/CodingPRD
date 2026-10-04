@@ -1,0 +1,498 @@
+# CPT Code Set Maintenance and Editorial Panel Review API — Product Requirements Document
+
+## 1. Introduction
+
+Every January the American Medical Association publishes a new edition of the Current Procedural Terminology code set, and behind that single publication date sits twelve months of intake, screening, committee deliberation, public comment, panel balloting, valuation and licensing work. This document specifies the API that runs that machinery. It is written for the engineers who will build the service that specialty societies, manufacturers, payers, health-IT vendors, educators and internal editorial staff all touch: an application pipeline that accepts code change submissions, an editorial workflow that carries those submissions through public posting and panel determination, a separate valuation track that feeds relative values into payment systems, and a licensing and distribution layer that governs who may reproduce the code set and in what form.
+
+The domain is unusual in that most of its rules are simultaneously procedural and adversarial. A society with more voting seats carries more weight when a motion is called, but citation-only meetings deliberately flatten that weight back to one ballot per society. A descriptor addition that looks clinically reasonable can still be refused because the descriptor budget had already been consumed by an earlier release. A published payment figure can be corrected retroactively, but only by prorating the correction across the remaining days of the release year, and only while the errata window is still open. The API therefore has to hold several distinct reconciliations — seat-weighted tallies, credit balances, descriptor pools, dollar splits, proration ratios — consistent with one another at every mutation.
+
+The third theme is auditability. Determinations, errata corrections, licence terminations and meeting closures all leave a trail: instants are stamped, superseded rows are retained rather than erased, and recomputed figures are stored even when the correction that produced them is later withdrawn. Nothing in this specification should be read as permitting a silent overwrite of a determinative record.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section collects the rules that apply across the whole surface of the API: how requests are authenticated, how responses are shaped, how identifiers and timestamps behave, and how the numeric and concurrency disciplines are applied. Where a rule is numeric — a threshold, a floor, a rounding method — it is stated exactly, because downstream consumers of the code set depend on being able to reproduce the published figures to the cent.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers. `X-User-ID` identifies the acting user or organization, and `X-User-Role` names the capacity in which that identity is acting. A request that omits either header, that carries a malformed value, or that names a role outside the declared set is rejected before any business rule is consulted, and the rejection carries `ERR_UNAUTHENTICATED` with a 401 status. This check is the first gate on every endpoint in the system, without exception.
+
+Six roles are recognized: `EditorialStaff`, `EditorialPanelChair`, `CommitteeReviewer`, `LicensingOfficer`, `Licensee` and `ChangeApplicant`. Their spellings are normative — a request naming `EditorialPanelchair`, `Reviewer` or `LicenseHolder` will not resolve.
+
+The identity semantics differ between the roles, and the difference matters for ownership checks. When `X-User-Role` is `EditorialStaff`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it where a workflow writes an operator reference, but it is never compared against any entity's `id`. The same is true of `EditorialPanelChair` and `LicensingOfficer`: each is an opaque operator identity, recorded for audit but not matched against a persisted row.
+
+Three roles are backed by persisted entities, and for those the header value is an entity identifier rather than an opaque string. When `X-User-Role` is `CommitteeReviewer`, `X-User-ID` is the `id` of the acting `AdvisoryCommitteeReview`; ownership checks on any resource that references an `AdvisoryCommitteeReview` compare the resource's foreign-key field to `X-User-ID`. When `X-User-Role` is `Licensee`, `X-User-ID` is the `id` of the acting `LicensingAgreement`; ownership checks on any resource that references a `LicensingAgreement` compare the resource's foreign-key field to `X-User-ID`. When `X-User-Role` is `ChangeApplicant`, `X-User-ID` is the `id` of the acting `ChangeApplicant`; ownership checks on any resource that references a `ChangeApplicant` compare the resource's foreign-key field to `X-User-ID`.
+
+Beyond the header check, a second gate enforces role authorization and segregation of duties. An acting role that is not permitted for the requested operation is rejected with `ERR_UNAUTHORIZED` at 403. Segregation of duties is enforced on the same code path: the same `X-User-ID` that created a `CodeChange` may not later record that change's panel determination, and the same `X-User-ID` may not both publish an `ErrataNotice` and reverse it. Both violations surface as `ERR_UNAUTHORIZED`, not as a distinct code.
+
+Certain operations belong to exactly one role and are never shared. Releasing the annual code set, publishing an errata notice and posting a change for public comment are reserved to `EditorialStaff` alone. Recording a panel determination, closing a meeting and deciding an errata review outcome are reserved to `EditorialPanelChair`. Closing an advisory committee review and publishing a committee's recommended work relative value are reserved to `CommitteeReviewer`. Creating a licensing agreement, reserving a distribution territory and marking a delivery ready for release are reserved to `LicensingOfficer`. Filing a public comment on a posted change is reserved to `Licensee` alone. Withdrawing a change application and withdrawing one's own public comment are reserved to `ChangeApplicant`. Other operations are shared: filing a code change is open to `EditorialStaff` and `ChangeApplicant`, terminating a licence is open to `EditorialStaff` and `LicensingOfficer`, resolving a value recommendation by ballot is open to `CommitteeReviewer` and `EditorialPanelChair`, and reserving a content delivery order is open to `Licensee` and `LicensingOfficer`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept `limit` and `offset` as query parameters. `limit` caps the number of records returned and defaults to 10; it may not be lower than 1 and may not exceed 100, and a value outside that range is rejected rather than clamped. `offset` skips that many leading records and defaults to 0. Unless an endpoint's own sorting rule says otherwise, list responses are ordered by creation timestamp ascending, so the oldest record in the matching set appears first.
+
+Beyond the two pagination controls, list endpoints expose their own filter parameters as query-string fields: code values can be narrowed by a payment range through `min_payment_cents` and `max_payment_cents`, licences by a royalty range through `min_royalty_fee_cents` and `max_royalty_fee_cents`, code changes by an evidence ceiling through `evidence_sufficiency_index_max`, and errata notices by a date window through `errata_effective_date_from` and `errata_effective_date_to`. Every list response carries `limit`, `offset`, `total_count` and `has_more` in the `meta` object of the envelope. `total_count` reflects the size of the full matching set before pagination is applied, and `has_more` is true whenever further pages remain beyond the current window.
+
+### 2.4. Editorial Segregation of Duties and Administrative Identity
+
+The workflow model assumes that the party who files a submission is not the party who adjudicates it. Filing a code change application and then recording its panel disposition from the same identity is a conflict of interest, and the API refuses it. Publication of an errata correction and reversal of that same correction are likewise split. Both refusals are enforced as authorization failures and are described in §2.1.
+
+Validation precedence is fixed rather than incidental, and the order is observable whenever a request violates more than one rule at once. Identity is evaluated first: a request whose headers are absent, malformed or name an undeclared role is rejected with `ERR_UNAUTHENTICATED` before any resource is even looked up. Authorization and segregation of duties are evaluated second, so a caller who is authenticated but acting outside their permitted role set, or acting against their own prior submission, receives `ERR_UNAUTHORIZED`. Resolution of path-identified resources and of referenced body foreign keys is evaluated third, left to right, carrying `ERR_NOT_FOUND`. Only after all three tiers have passed are an endpoint's own business constraints consulted. A lower tier therefore always surfaces its own identifier in preference to a higher-tier rule that would also have failed, and within a tier the rules are evaluated in the fixed sequence described for each workflow in §3.
+
+Administrative screening is a separate, earlier gate from adjudication. Every newly filed `CodeChange` begins in `UNDER_ADMIN_REVIEW` and its `review_status` begins at `DRAFT`. Only after the editorial office has screened the packet does the change become `ADMIN_COMPLETE`; a packet that fails screening is set to `ADMIN_RETURNED` and cannot be posted. The screening outcome lives in the change's `administrative_review_status`, which moves only between `UNDER_ADMIN_REVIEW`, `ADMIN_COMPLETE` and `ADMIN_RETURNED`.
+
+### 2.5. Common Resource Properties and Record Identity
+
+Every top-level resource in this API is addressable by an `id` that the server mints. The `id` is a UUID string and carries no type prefix — a `CodeChange` identifier and a `ReleaseCycle` identifier are indistinguishable in form, and neither is prefixed with an entity name. Alongside `id`, every record carries `created_at`, an ISO 8601 timestamp in UTC rendered with exactly three fractional digits, for example `2025-05-24T10:30:00.123Z`.
+
+Records that can be modified also carry `updated_at` and `version`. `updated_at` is an ISO 8601 UTC timestamp with three fractional digits that is refreshed on every mutation of the record, including mutations performed by the server on the server's own initiative rather than in response to a client request. `version` is an integer that starts at its initial value and increments by exactly one on each such mutation. It is the field that optimistic concurrency control reads, and it is a reliable signal that a record has moved since a client last observed it.
+
+All entities in this specification use the full complement of common fields — `id`, `created_at`, `updated_at` and `version` — because every entity is declared with the common field set enabled. There is no entity in this system that omits `updated_at` or `version`; any record that can be mutated will show both.
+
+### 2.6. Nested Resource Retrieval and Left-to-Right Path Validation
+
+Several endpoints address a resource through a path that names more than one record. Where that happens, the server resolves identifiers strictly from left to right, and the first identifier that does not resolve aborts the request with `ERR_NOT_FOUND` at 404. A request that names a code change under a specialty society that does not exist fails on the society, not on the change, and the error does not disclose whether the change exists. The same left-to-right rule governs body-supplied foreign keys: a referenced row that does not resolve produces `ERR_NOT_FOUND` rather than a validation error, and this check runs before business constraints are consulted.
+
+### 2.7. Descriptor Format, Evidence Screening and Numbering Integrity
+
+Descriptor numbers are the primary key of the code set in everything but name. A descriptor number is supplied in the `code` field and must be exactly 5 characters long. When the final character of a descriptor is a letter rather than a digit, that letter must fall within A through J inclusive; a descriptor ending in K, or in any letter beyond that range, is malformed. A malformed descriptor is rejected with `ERR_CODE_FORMAT_INVALID` at 422.
+
+Descriptor numbers are unique across the entire code change corpus. Filing a second change bearing a descriptor number that already exists is rejected with `ERR_CODE_ALREADY_EXISTS` at 409, regardless of which applicant filed it or what kind of change it proposes.
+
+Evidence screening is graded rather than binary. Each change declares a `clinical_evidence_tier`, one of `TIER_I`, `TIER_II`, `TIER_III` or `TIER_IV`, and a numeric `evidence_sufficiency_index` supplied by the applicant. The weakest tier, `TIER_IV`, is acceptable for a `REVISION` or a `DELETION` without further qualification, but a `TIER_IV` `ADDITION` is acceptable only when the change also declares a `procedure_volume_threshold` of at least 100 procedures annually. A `TIER_IV` addition below that volume is rejected with `ERR_EVIDENCE_INSUFFICIENT` at 422. Separately, an addition sitting on the `CATEGORY_III` emerging-technology track cannot be advanced without supporting data in its evidence packet; advancing it anyway produces `ERR_SUPPORT_DATA_REQUIRED` at 422.
+
+Descriptor text completeness is a distinct check from evidence strength. A change of type `REVISION` must supply a `descriptor_proposed`; a revision filed without one is rejected with `ERR_DELEGATION_REQUIRED` at 422. A change whose category puts it on the delegation track must supply `parenthetical_instructions`; omitting them produces the same `ERR_DELEGATION_REQUIRED`. Both checks apply at filing time and again whenever a change is returned to draft for amendment.
+
+Finally, the numbering space itself must remain gapless in the ranges a release publishes. A hole in the descriptor numbering inside a range that a release would publish blocks that release with `ERR_MISSING_DESCRIPTOR` at 422.
+
+### 2.8. Comment Window Governance and the Logical Clock
+
+Public comment windows recur at three levels — on a change, on a meeting and on a release cycle — and all three obey the same duration rule. A comment window is measured as the whole-day difference between its close instant and its open instant, and it is acceptable only when that difference is at least 30 whole days. Windows falling short, including a window that misses the floor by a single day, are rejected with `ERR_COMMENT_PERIOD_TOO_SHORT` at 422.
+
+The addendum window is the one exception. An addendum comment period closes at the release cycle's `addendum_comment_close` rather than at a client-supplied instant, and it is exempt from the 30-day floor. Its validity is measured against that November 15 close date alone. Conversely, a full public posting period is not exempt: the full 30-day window applies and the floor is enforced.
+
+Time-dependent rules in this API do not read wall-clock time. The server maintains a logical clock which reads `2026-09-01T00:00:00Z` before any call is made, and which never falls back to the host's wall clock. Deadlines, expiries and window comparisons all resolve against that logical clock. Setting the clock forward is a test-driving capability that takes the target instant in a `to_iso8601` field; it is described in §4 and also applies every time-triggered transition whose precondition the new instant satisfies — including the comment-window closure that moves a change out of `POSTED_FOR_COMMENT` into `ADMIN_REVIEW`.
+
+### 2.9. Monetary Precision, Rounding Variants and Payment Figures
+
+Payment figures in this API are held as integer cents. Whenever a computation produces a fractional cent, the result is rounded half up at zero decimal places to land on a whole cent. Where a figure is expressed as a percentage — committee support, panel support — the stored value carries 4 decimal places rounded half up, except the meeting-level panel percentage, which is held at 2 decimal places rounded half up. Credit balances and awarded credits carry 2 decimal places rounded half up. Educations credits are the one place where a different rule applies, and §3.7 states it explicitly.
+
+Rounding order matters as much as rounding method, and the system exposes that choice rather than hiding it. Each code value declares a `rounding_variant`. Under `AGGREGATE_ROUNDING` the facility payment is produced by summing the adjusted RVU components first and rounding the resulting dollar product once. Under `COMPONENT_ROUNDING` each adjusted component's dollar product is rounded individually and the three rounded figures are then summed. The two orders can differ by a cent in either direction, and both are legitimate published outcomes — the variant field records which one governs a given value row.
+
+Every code value carries four derived cost fields. `facility_payment_cents` holds the facility total under the governing variant. `nonfacility_payment_cents` holds the nonfacility total, computed the same way but with the nonfacility practice-expense component in place of the facility one. `component_round_total_cents` and `aggregate_round_total_cents` are computed for both variants regardless of which one is in force, so that the divergence between the two orders is always inspectable. `dollar_split_shortfall_cents` records the difference between the nonfacility adjusted total and the sum of the rounded components, exposing the cent-level residue of the split. The `release_month` field records the calendar month used as the numerator basis when a partial-year figure must be prorated.
+
+### 2.10. Optimistic Concurrency on Version-Sensitive Writes
+
+Two writes in this API are version-sensitive, and each requires the client to echo the last version it observed. Reserving a new content delivery order against a licence requires the request to carry `expected_license_version`; submitting code changes into a release cycle's descriptor pool requires the request to carry `expected_change_version`. Both fields are non-optional — a request that omits them is not processed.
+
+For a delivery reservation, `expected_license_version` must equal the current `version` of the `LicensingAgreement` the reservation names. If the licence's version has advanced since the client last read it — for instance because an earlier delivery reservation against the same licence legitimately advanced it — the reservation is rejected with `ERR_STALE_VERSION` at 412. For a cycle submission, `expected_change_version` must equal the current `version` of each `CodeChange` being submitted; if any named change's version has advanced since the submitter last observed it — for instance because a prior submission advanced it — the submission is rejected with `ERR_STALE_VERSION` at 412. Both rules exist so that a client cannot write against a view of the world it has not actually observed. Endpoints that are not named in this paragraph do not accept a version field at all.
+
+### 2.11. Editorial Budget and Descriptor Pool Accounting
+
+Each release cycle declares a `code_set_capacity` — the number of new descriptors the code set can absorb in that release — and derives four pool figures from it. `editorial_reserved_codes` is 40 percent of capacity, floored to a whole number, set aside for editorial panel discretion. `additions_pool_codes` is 35 percent of capacity floored, capped at 140 descriptors, and made available to billable additions. `catiii_pool_codes` is 5 percent of capacity floored, capped at 25 descriptors, and made available to emerging-technology tracking codes. `discretionary_codes` is what remains after subtracting those three pools from capacity, in the order just given: editorial reserve first, then the additions pool, then the category III pool.
+
+The ordering of the floors is load-bearing rather than cosmetic. By default each bucket is floored to a whole descriptor before it is subtracted, and under that default a capacity of 200 yields a discretionary pool of 40. When a cycle instead sets `single_floor_budgeting`, the three unbounded percentages are summed first and the sum is floored once; that variant can yield a discretionary pool one descriptor lower than the default for the same capacity, and can therefore trip a gate the default would clear.
+
+The gate itself reads `budget_gate_status`. It is `OPEN` while the discretionary pool holds 40 or more descriptors and becomes `EXHAUSTED` once the pool falls below 40. `submission_count` counts the changes currently bound to the cycle and is refreshed on every pool recalculation.
+
+### 2.12. Cascade, Quorum and Derivation Semantics
+
+Several operations in this API are described as cascades because a single request mutates more than one record. When a cascade runs, each record it touches is mutated individually: its `updated_at` is refreshed and its `version` is incremented, exactly as if the mutation had been requested directly. A cascade is not a partial write — a request that requires a cascade either performs all of its hops or fails.
+
+Derived fields are recomputed rather than merely stored. `quorum_present` on a meeting, the three `weighted_yes`, `weighted_no` and `weighted_abstain` totals, `cea_credits` on a change, `cea_credit_balance` on a society, the four pool figures on a cycle and the payment figures on a code value are all functions of other rows, and any mutation that changes those other rows triggers the corresponding recomputation before the response is returned. Where a recomputation is named in §3, the derivation that governs it is stated with it.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Filing a Code Change Application
+
+A code change application originates with a stakeholder, and the stakeholder is registered before the application. A `ChangeApplicant` carries a `name`, an `applicant_type` drawn from `PHYSICIAN`, `SPECIALTY_SOCIETY`, `MANUFACTURER`, `PAYER`, `HIT_VENDOR` or `OTHER`, a `contact_email` for panel correspondence, and two standing flags. The `is_entity_member` flag records whether the applicant currently holds a member seat at an editorial panel meeting, and the `dues_paid_current` flag records whether policyholder dues are paid through the current cycle, which is what gates royalty fee eligibility. An applicant that files on behalf of a seated specialty society carries that society's identifier in `society_id`; the field is nullable for an applicant filing independently. Applicant standing is tracked in a `status` field whose values are `ACTIVE` and `SUSPENDED`.
+
+Specialty societies are registered separately because they hold the voting seats and, later, sponsor changes. A `SpecialtySociety` is identified by a `name` and by a `specialty_code` such as `ACS`, `ACR` or `AAN`; both must be unique across the society table. Its `voting_seat_count` records how many editorial panel voting seats it holds and defaults to 0, and a society sitting at 0 is advisory only and carries no votes. Its geographic practice cost indices — `gpci_work`, `gpci_pe` and `gpci_mp` — each default to 1.0000 and are applied later when RVUs are converted to dollars. A society's `status` is `ACTIVE` or `SUSPENDED`. The derived `cea_credit_balance` on a society is the sum of `cea_credits` across every `CodeChange` row that names it as sponsoring society and whose `determination` has reached `APPROVED`; it is recomputed on every change of determination, and it is initialized to 0 when the society is registered.
+
+With a society and an applicant on record, a `CodeChange` is filed through a payload that carries the descriptor number in `code`, a `change_type` of `ADDITION`, `REVISION` or `DELETION`, a `category` of `CATEGORY_I`, `CATEGORY_II` or `CATEGORY_III`, and a `code_family` prefix that groups related descriptors, such as `99` or `0X0`. The payload names the filer through `applicant_id` and, when a society is sponsoring the work, through `society_id`; that society is the one whose credit balance is credited on approval, and the field is nullable. Evidence strength is declared through `clinical_evidence_tier` and the applicant's own numeric `evidence_sufficiency_index`, which defaults to 0. The clinical justification rests on `procedure_volume_threshold`, the US annual procedure volume relied upon, and on `organ_system_count`, the number of organ systems the code addresses, which defaults to 1 and where a value of 1 means the change addresses a single organ system. The descriptive content of the change is carried in `descriptor_current`, `descriptor_proposed`, `guidelines` and `parenthetical_instructions`, and `cycles_in_process` records how many editorial panel meetings the change has already been carried forward, defaulting to 0.
+
+On creation the server sets three fields that the client does not supply. `administrative_review_status` begins at `UNDER_ADMIN_REVIEW`, `posting_state` begins at `NOT_POSTED`, and `review_status` begins at `DRAFT`. The remaining workflow fields — the comment window instants `comment_period_open_at` and `comment_period_close_at`, the docket link `meeting_id`, the disposition `determination` (which begins at `PENDING`), the `held_for_full_panel` flag (which begins false), the credit award `cea_credits` (which begins at 0), the verdict instant `verdict_recorded_at`, the release link `cycle_id` and the target `effective_date` — are all stamped by the server as the change advances, and none of them is supplied at filing.
+
+The filing checks are ordered. Where a filing violates more than one rule at once, the descriptor format check runs before the uniqueness check, and both run before the evidence sufficiency check; a descriptor that is simultaneously malformed and already on file is therefore reported as `ERR_CODE_FORMAT_INVALID` rather than `ERR_CODE_ALREADY_EXISTS`. The evidence sufficiency check in turn runs before the descriptor text completeness check, so a `TIER_IV` addition that is below the volume floor and also missing its supporting text reports `ERR_EVIDENCE_INSUFFICIENT` rather than `ERR_DELEGATION_REQUIRED`.
+
+Two filing rules operate on the descriptor itself. The `code` value must be exactly 5 characters and, when its last character is a letter rather than a digit, that letter must fall in the range A through J; a violation is rejected with `ERR_CODE_FORMAT_INVALID` at 422. A descriptor number must be unique across the corpus; a second filing bearing an existing number is rejected with `ERR_CODE_ALREADY_EXISTS` at 409. The applicant's `society_id` on the change is the society that will be credited, and it is the same field consulted later when the change is submitted into a release cycle.
+
+A change can be withdrawn by its filer while it is still in `DRAFT` or in `POSTED_FOR_COMMENT`, and only then. Withdrawal from either state requires the change not yet to have entered a release cycle — `cycle_id` must be null — and from `DRAFT` it additionally requires the administrative screening to be in progress or complete, that is, `administrative_review_status` must be `UNDER_ADMIN_REVIEW` or `ADMIN_COMPLETE`. Withdrawing sets the change's `determination` to `WITHDRAWN` and leaves `review_status` and `posting_state` untouched; from `POSTED_FOR_COMMENT` it also stamps `withdrawn_at` on every `PublicComment` row filed against that change. Withdrawal is recorded through the `withdrawal_reason` field supplied with the request. Because the credit formula reads the determination, a withdrawal drives `cea_credits` to 0, and when the change names a sponsoring society the society's balance is recomputed in the same operation.
+
+### 3.2. Administrative Screening, Posting and the Public Comment Docket
+
+The editorial office screens every filed change before the public sees it. A change cannot be posted while its `administrative_review_status` is `ADMIN_RETURNED`; posting requires the screening outcome to be anything other than returned, and posting also requires the change to have entered a release cycle, meaning `cycle_id` must be non-null. The third posting precondition is temporal: the window supplied with the posting must run at least 30 whole days between `comment_period_open_at` and `comment_period_close_at`, and a window one day short is rejected with `ERR_COMMENT_PERIOD_TOO_SHORT` at 422.
+
+A successful posting moves `review_status` from `DRAFT` to `POSTED_FOR_COMMENT`, sets `administrative_review_status` to `ADMIN_COMPLETE`, sets `posting_state` to `POSTED`, and stamps the two window instants supplied in the request. The posting follow-on then sets `posting_state` onward to `COMMENT_OPEN`, which is the state that signals the docket is live. Posting performs no errata recalculation, and any review of an errata notice remains at `applied_status` `NONE` throughout. The reason is procedural: posting concerns a descriptor's wording, whereas errata concern a published value, and the two are decoupled by design.
+
+The editorial office can also send a posted change backwards. A posted change whose screening is `ADMIN_COMPLETE` may be returned to administrative review through the `reason` field, which sets `administrative_review_status` back to `ADMIN_RETURNED`, sets `posting_state` back to `NOT_POSTED`, and moves `review_status` from `POSTED_FOR_COMMENT` back to `DRAFT`. Returning a posted change in this way also measures the comment-period duration that the change was carrying and stores the result on the change; because the change is being pulled off the docket, that measurement resolves to under 30 days.
+
+The public comment window on a change closes on its own. When the logical clock reaches a change's `comment_period_close_at` while its `posting_state` is `COMMENT_OPEN`, the change moves from `POSTED_FOR_COMMENT` to `ADMIN_REVIEW` without any client request. The closure sets `posting_state` from `COMMENT_OPEN` back to `POSTED`, leaving every `PublicComment` row that has not been withdrawn standing, and it dockets the change by setting `meeting_id` to the earliest meeting whose `meeting_status` is `SCHEDULED` among the meetings listed in the change's cycle's `meeting_ids`.
+
+Comments themselves come from stakeholders. A `PublicComment` records the change under comment in `change_id`, the filing stakeholder in `commenter_id`, the class of commenter at the time of filing in `commenter_type` — one of `SPECIALTY_SOCIETY`, `PAYER`, `MANUFACTURER`, `HIT_VENDOR` or `INDIVIDUAL` — a `citation_submitted` flag indicating whether published literature accompanies the comment, and the comment text in `body`. The server stamps `posted_at` when the comment enters the docket and leaves `withdrawn_at` null while the comment stands. Withdrawing a comment is reserved to the filing applicant, requires a `reason`, and stamps `withdrawn_at` on the row rather than deleting it.
+
+### 3.3. Advisory Committee Review
+
+Before a change reaches the editorial panel, the standing advisory committees may review it, and a change is eligible for that review only under fairly tight conditions. The review may be opened only against a change whose `clinical_evidence_tier` is `TIER_I`, `TIER_II` or `TIER_III` — a `TIER_IV` change is not reviewable — and only while that change's `administrative_review_status` is still `UNDER_ADMIN_REVIEW`, that is, before the editorial office has completed screening. A review attempted outside those conditions is rejected with `ERR_ADVISORY_REVIEW_NOT_READY` at 409. Separately, where the change sits on the `CATEGORY_III` emerging-technology track and is an addition, it must declare supporting data in its evidence packet or the review is refused with `ERR_SUPPORT_DATA_REQUIRED` at 422.
+
+Where a change violates both the reviewability conditions and the supporting-data condition, the reviewability conditions are evaluated first, so `ERR_ADVISORY_REVIEW_NOT_READY` is reported in preference to `ERR_SUPPORT_DATA_REQUIRED`.
+
+Each review names the change under review in `change_id` and the reviewing body in `committee_name`, one of `CPT_ADVISOR`, `CPT_ASSISTANT`, `HCPAC` or `RUC_HEALTH_CARE_PROFESSIONALS`. Ballot counts are recorded on the review row itself, with `yes_votes` and `no_votes` each defaulting to 0, and `quorum_met` recording whether the committee achieved quorum, defaulting to false. A review opens with `decision` at `PENDING` and `review_status` at `OPEN`, and its `reviewed_at` instant is left empty until the review closes.
+
+Closing a review requires three things at once: `quorum_met` must be true, the sum of `yes_votes` and `no_votes` must be greater than 0, and the request must carry the committee's `recommendation`, which is one of `RECOMMEND_APPROVE`, `RECOMMEND_REJECT` or `RECOMMEND_MODIFY`. A close attempted without quorum, or without a positive ballot total, is rejected with `ERR_ADVISORY_REVIEW_INCOMPLETE` at 409. On a valid close the review computes `vote_percent`, sets `decision` to `RECOMMENDED` when that percentage is at least 66.0000 and to `DEEMED_NOT_RECOMMENDED` otherwise, moves `review_status` to `COMPLETE`, and stamps `reviewed_at`. The support percentage that drives that branch is computed as affirmative votes divided by the sum of affirmative and negative votes, multiplied by 100, rounded half up to 4 decimal places; abstentions and absences are excluded from the denominator entirely.
+
+Two follow-on effects accompany a committee close. The reviewed change's `cea_credits` is recomputed by the credit formula, and when that change names a sponsoring society, the society's `cea_credit_balance` is recomputed in the same operation. A committee may also record its consideration of the public comment record by supplying the number of comments examined in `comment_count_considered` together with free-text `notes`; that recording advances the review's version but does not alter its decision.
+
+### 3.4. The Editorial Panel Meeting and Its Docket
+
+Editorial panel meetings are the forum in which changes are decided, and a meeting runs on two independent clocks. A `EditorialPanelMeeting` is scheduled with a `meeting_code` such as `FEB2026`, which must be unique across meetings, and a `meeting_month`, one of `FEBRUARY`, `APRIL`, `JUNE`, `AUGUST`, `OCTOBER` or `DECEMBER`. Its `starts_at` and `ends_at` instants bound the sitting, and the scheduled closing must be at least 8 hours after the scheduled opening. A `citation_mode` flag, defaulting to false, declares that the meeting is conducted in citation-only mode, which materially changes how ballots are weighted later.
+
+The meeting's first dimension is `meeting_status`, which begins at `SCHEDULED`. The meeting's public comment window opens only when the supplied `public_comment_open_at` and `public_comment_close_at` span at least 30 whole days; a shorter window is rejected with `ERR_COMMENT_PERIOD_TOO_SHORT` at 422. Opening the window moves `meeting_status` to `PUBLIC_COMMENT_OPEN` and stamps both instants, and as a cascade it sets `posting_state` to `COMMENT_OPEN` on every `CodeChange` docketed at that meeting whose `review_status` is `ADMIN_REVIEW`.
+
+Closing the meeting's comment window requires the logical clock to have reached `public_comment_close_at` and moves `meeting_status` to `OPEN`. The cascade for that closure is the mirror of the opening cascade: every change docketed at the meeting whose `review_status` is `ADMIN_REVIEW` has its `posting_state` set to `POSTED`. A meeting whose comment window closed with no comments filed at all can be reversed back — the reversal requires that no `PublicComment` row exists for any change docketed at the meeting — and it returns `meeting_status` to `SCHEDULED` and clears both public comment instants.
+
+The meeting's second dimension is `agenda_status`, which begins at `UNSET`. Setting the agenda is how changes enter the meeting's docket. The agenda can be set while `meeting_status` is `SCHEDULED` or `PUBLIC_COMMENT_OPEN`, and the request must carry at least one change identifier in `change_ids`. Each named change is moved to `AGENDA_SET` and has its `meeting_id` pointed at the meeting; the meeting's own `agenda_status` moves to `SET` as a cascade, and `quorum_present` is recomputed.
+
+Docketing is further constrained. A change may be docketed only at a meeting whose `meeting_status` is `SCHEDULED` or `PUBLIC_COMMENT_OPEN`; attempting otherwise is rejected with `ERR_MEETING_NOT_OPEN` at 409. A change that already carries a non-null `meeting_id` may not be docketed at a second meeting while that first docket slot is open, and such an attempt is rejected with `ERR_MEETING_SLOT_OCCUPIED` at 409. And a `TIER_IV` change may not be docketed at a February, April, August, October or December meeting, which admit only frequent-family exemplars; that attempt is rejected with `ERR_FREQUENT_FAMILY_EXEMPLAR_REQUIRED` at 422. The three docketing guards are ordered: the meeting-open check runs first, then the frequency allowance for the meeting's month, and the docket slot occupancy check last, so a change that is both ineligible for the month and already docketed elsewhere reports `ERR_FREQUENT_FAMILY_EXEMPLAR_REQUIRED`. At docketing the change's own preconditions also apply: its `administrative_review_status` must be `UNDER_ADMIN_REVIEW` or `ADMIN_COMPLETE`.
+
+A docketed change can be pulled back off the agenda. Returning a change from `AGENDA_SET` to `DRAFT` requires the change to carry a `meeting_id` and requires that meeting's `meeting_status` to be `SCHEDULED` or `PUBLIC_COMMENT_OPEN`; a violation of the meeting condition is rejected with `ERR_MEETING_NOT_OPEN` at 409. The return clears the change's `meeting_id` and moves the meeting's `agenda_status` back to `UNSET`. The same return path serves a second purpose once a change has been referred, described in §3.5, where it is the mechanism by which a change carried through three cycles is finally sent back to draft.
+
+Opening the meeting for deliberation is the chair's act and requires the agenda to be `SET` and each change's screening to be `UNDER_ADMIN_REVIEW` or `ADMIN_COMPLETE`. It moves `meeting_status` to `OPEN`, and — as a bulk cascade — every change whose `meeting_id` is this meeting and whose `review_status` is `AGENDA_SET` moves to `PANEL_REVIEW`. The chair can recess an open meeting provided the agenda is `SET`; a recess moves `meeting_status` to `RECESSED` and deliberately leaves `conducted_at` empty. Reopening a recessed meeting requires `agenda_status` to be `ADDENDUM_OPEN`.
+
+The addendum is how late business reaches a convened meeting. An addendum may be opened while `meeting_status` is `OPEN` or `RECESSED`, and only when the logical clock is at or before the `addendum_comment_close` of the release cycle that names this meeting; opening it moves `agenda_status` from `SET` to `ADDENDUM_OPEN` and is recorded with an `addendum_note`. Closing the addendum requires `meeting_status` to be `OPEN` or `RECESSED` and returns `agenda_status` to `SET`.
+
+Quorum is derived rather than declared. A meeting has `quorum_present` true only while at least three distinct `CodeChange` rows carry this meeting's identifier as their `meeting_id` with a `review_status` of `AGENDA_SET`, `PANEL_REVIEW` or `DETERMINED`. The three are counted by distinct change identity, not by descriptor number, so three revisions of the same descriptor spread across three change rows would not satisfy it. `quorum_present` is recomputed whenever the agenda, the docket or a change's review status moves.
+
+Closing a meeting is the chair's act and exists in two forms. Closing from `OPEN` requires `quorum_present` to be true and requires at least one change docketed at the meeting to have reached `review_status` `DETERMINED`. Closing from `RECESSED` requires only that the agenda be `SET`. Either form stamps `conducted_at` with the logical clock, moves `meeting_status` to `CLOSED`, and recomputes the meeting's weighted tallies. A meeting with fewer than three docketed changes cannot satisfy the quorum precondition of the open-form closure, and the attempt surfaces as `ERR_NO_QUORUM` at 409.
+
+### 3.5. Balloting, Quorum and Determination
+
+Ballots are cast by seated societies. An `EditorialVote` names the motion in `change_id`, the sitting in `meeting_id`, the casting society in `society_id`, and the position in `vote`, which is one of `YES`, `NO` or `ABSTAIN`. The server stamps `cast_at` when the ballot is recorded and computes `votes_carried` as the voting seats the casting society carries — that is, the society's `voting_seat_count` as read at the moment the ballot is cast. Recording a ballot immediately triggers a recomputation of the meeting's `weighted_yes`, `weighted_no` and `weighted_abstain`.
+
+Only a seated society may cast the single ballot it is entitled to on a given change at a given meeting. A society attempting a second ballot on the same change at the same meeting has its earlier ballot superseded rather than accumulated — the later ballot replaces the earlier one — and an attempt that does not supersede is rejected with `ERR_DUPLICATE_VOTE` at 409. Supersession is resolved by keeping, for each society and change pair, only the ballot with the greatest `cast_at`, with ties broken by creation instant ascending.
+
+The tallies themselves are assembled carefully. The included ballot set is the `EditorialVote` rows for the meeting whose `vote` is `YES`, `NO` or `ABSTAIN`, whose `change_id` names a `CodeChange` still in `PANEL_REVIEW` or `DETERMINED`, and which were cast no later than the meeting's `conducted_at` if that instant is set, or no later than the current logical clock instant if it is not. `weighted_yes` is the sum of `votes_carried` over included ballots marked `YES`; `weighted_no` is the same sum over `NO`; `weighted_abstain` is the same sum over `ABSTAIN`. The meeting-level support percentage is held in `vote_percent` and is the weighted affirmative total divided by the sum of the weighted affirmative and negative totals, multiplied by 100, rounded half up to 2 decimal places. Abstentions are excluded from that denominator. The weighted totals themselves are rounded half up to 2 decimal places. A motion is carried when the support percentage is at least 66.00 and the combined weighted affirmative and negative total is greater than 0.
+
+Citation-only meetings change the arithmetic without changing the machinery. When a meeting sets `citation_mode`, `votes_carried` is forced to 1 for every ballot regardless of the casting society's `voting_seat_count`, so the weighted totals become raw ballot counts rather than seat counts. The approval floor shifts with it: in citation-only mode the threshold is 66.6667 percent rather than 66.00 percent. The scaffold's own worked illustration of the difference is a seat tally of 22 to 11, which approves, against a seat tally of 21 to 11, which does not. The citation-mode floor is also enforced by truncating the weighted percentage to three decimals before comparing it with 66.667; as a consequence, a tally that resolves to exactly 66.6667 percent falls below the floor and is refused.
+
+Recording a determination is the chair's act on a change sitting in `PANEL_REVIEW`. Four preconditions hold at once: `held_for_full_panel` must be false, `review_status` must be `PANEL_REVIEW`, the meeting must have `quorum_present` true, and the requested `determination` must be one of `APPROVED`, `REJECTED` or `TABLED`, supplied alongside a `determination_basis`. A change already held for full-panel action may not be determined and must be carried to the June minutes instead; that attempt is rejected with `ERR_ALREADY_REFERRED_TO_JUNE_MINUTES` at 409. These determination checks are not evaluated in an arbitrary order. The one-percent outside-cast limit on the weighted affirmative vote is evaluated ahead of everything else on this path. Meeting quorum is then evaluated before the full-panel hold check, so a determination attempted at a meeting without quorum reports `ERR_NO_QUORUM` rather than `ERR_ALREADY_REFERRED_TO_JUNE_MINUTES`, and the full-panel hold check is evaluated before the approval percentage floor, so a held change reports `ERR_ALREADY_REFERRED_TO_JUNE_MINUTES` rather than `ERR_APPROVAL_PERCENT_TOO_LOW`. Admissibility of the change's current `review_status` is evaluated last of all, and only surfaces `ERR_INVALID_STATE` when no earlier rule has already fired. A determination attempted at a meeting without quorum is rejected with `ERR_NO_QUORUM` at 409. In citation-only mode, a determination whose weighted percentage falls below the 66.667 floor is rejected with `ERR_APPROVAL_PERCENT_TOO_LOW` at 409, and the same code and status are returned when more than one percent of the meeting's weighted affirmative vote was cast from outside the seated societies — that is, when the outside cast share exceeds one percent of the weighted affirmative total. The same outside-cast limit also guards closing the meeting.
+
+A successful determination moves `review_status` to `DETERMINED`, records the requested value in `determination`, stamps `verdict_recorded_at`, recomputes the change's `cea_credits`, recomputes the sponsoring society's `cea_credit_balance` when a society is named, and recomputes the meeting's three weighted totals. It is worth stating plainly that a change whose determination is already `APPROVED` is terminal and may not be reverted to draft; such an attempt is rejected with `ERR_ALREADY_TERMINAL` at 409.
+
+Referral is the alternative to determination. The chair may refer a change back to the June minutes, which requires `held_for_full_panel` to be false and requires an `AdvisoryCommitteeReview` row for that change to have reached `review_status` `COMPLETE`. A referral sets `held_for_full_panel` to true, sets `determination` to `REFERRED_TO_JUNE_MINUTES`, recomputes the change's credits and the society's balance, and moves the meeting to `RECESSED`. The `reason` supplied with the referral doubles as the hold basis, and a referral that does not name a hold basis is rejected with `ERR_NO_HOLD_KIND` at 422. Reopening a referred change for a subsequent meeting is the supplementary-report path, and it carries the body of the report in `report_text`. It requires `cycles_in_process` to be at most 2 and requires `held_for_full_panel` to be true. It increments `cycles_in_process` by one, clears `held_for_full_panel`, moves the change back to `POSTED_FOR_COMMENT`, sets `posting_state` to `NOT_POSTED`, and the supplementary posting follow-on then reopens the docket by setting `posting_state` to `COMMENT_OPEN`. Carrying a change into a fourth cycle is refused: a supplementary report filed against a change whose `cycles_in_process` is already 3 is rejected with `ERR_CYCLE_LIMIT_EXCEEDED` at 422.
+
+The second return path from `REFERRED` applies once carrying forward is exhausted. A referred change whose `cycles_in_process` is at least 3 returns to `DRAFT`; the return resets `determination` back to `PENDING`, recomputes `cea_credits`, and clears `held_for_full_panel`. The same return path also serves docketed changes, as described in §3.4.
+
+Reopening a determined change is narrow. A change sitting in `DETERMINED` may be reverted to `DRAFT` when its `determination` is `REFERRED_TO_JUNE_MINUTES` or `TABLED`; where the determination is `REFERRED_TO_JUNE_MINUTES`, the meeting named by the change's `meeting_id` must have `meeting_month` `JUNE`. The revert increments `cycles_in_process` by one, resets `determination` to `PENDING`, recomputes the change's credits, and recomputes the sponsoring society's balance when a society is named. A change whose determination is `APPROVED` cannot travel this path at all.
+
+One further guard protects the transition into panel review. A change may not be advanced to `PANEL_REVIEW` while a `PublicComment` on that same change names an interested party that is also one of the seats counting toward the meeting's quorum. That conflict is rejected with `ERR_CHANGE_NOT_READY_FOR_PANEL` at 409. Where a change's `review_status` does not admit the operation being requested at all, the rejection is `ERR_INVALID_STATE` at 409.
+
+The credit award that accompanies determination is the same formula in every path that recomputes it. A change whose `determination` is anything other than `APPROVED` contributes 0 credits. A change whose determination is `APPROVED` begins from a base award of 2.0 credits, and then: if the code applies to a single organ system — that is, if `organ_system_count` is 1 — 0.5 credits are added; if the change's `procedure_volume_threshold` is greater than 0 and no greater than 10000, 0.5 credits are added; and if the change's `clinical_evidence_tier` is `TIER_I`, 1.0 credit is added. The resulting total is rounded half up to 2 decimal places and stored in `cea_credits`. The society's `cea_credit_balance` is then the sum of `cea_credits` across every change naming it whose determination is `APPROVED`; changes with any other determination contribute 0 to that sum, and changes with no sponsoring society contribute to no society at all.
+
+### 3.6. The Annual Release Cycle and Descriptor Pool Management
+
+The release cycle is the container that turns determined changes into a published code set. A `ReleaseCycle` is created with a `year`, which must be unique across cycles, and with a `comment_open` instant of January 1 on which the cycle's public comment period opens and a `comment_close` instant at least 30 whole days later. It carries an `addendum_comment_close` instant, the November 15 addendum close for the cycle, and an ordered, non-empty list of editorial panel meeting identifiers in `meeting_ids` that bound the cycle. Its `code_set_capacity` declares how many new descriptors the code set can absorb for that year, and `submission_count` counts the changes currently bound to it. The cycle's own `effective_date` is January 1 of the year following its release year. Two further inputs shape its behaviour: `errata_deadline`, the latest instant at which an errata notice may take effect for the release, which defaults to `2027-06-30`, and `single_floor_budgeting`, which selects the single-floor pool variant and defaults to false.
+
+Creating a cycle immediately derives its pools. `editorial_reserved_codes`, `additions_pool_codes`, `catiii_pool_codes` and `discretionary_codes` are computed from `code_set_capacity` alone, using the rules set out in §2.11: 40 percent floored for the editorial reserve, 35 percent floored and capped at 140 for the additions pool, 5 percent floored and capped at 25 for the category III pool, and the remainder after subtracting the three pools in that order. Under the default per-bucket flooring a capacity of 192 clears the discretionary gate with 40 codes to spare; under `single_floor_budgeting` the same capacity yields only 39 and trips the gate. The cycle also carries `budget_gate_status`, which is `OPEN` initially and becomes `EXHAUSTED` once the discretionary pool falls below 40.
+
+A newly created cycle sits in `PLANNING`. Opening it for submissions requires the comment window to span at least 30 whole days between `comment_open` and `comment_close` and requires `meeting_ids` to be non-empty; a cycle opening with a short window is rejected with `ERR_COMMENT_PERIOD_TOO_SHORT` at 422. Opening moves `cycle_status` to `OPEN`. No change is enrolled merely by opening the cycle — every membership change keeps a null `cycle_id` until it is explicitly submitted.
+
+Submission is the step that enrolls changes and consumes pool capacity, and it is the version-sensitive write described in §2.10. A submission names the changes in `change_ids` and must carry `expected_change_version` matching each named change's current `version`; a mismatch is rejected with `ERR_STALE_VERSION` at 412. Submission may occur only while the logical clock is at or before the cycle's `comment_close`. Every named change has its `cycle_id` set to the cycle and its `effective_date` stamped to January 1 of the cycle's year plus one. The count of changes bound to the cycle is then recomputed, which in turn recomputes `discretionary_codes` and, where the discretionary pool has fallen below 40, sets `budget_gate_status` to `EXHAUSTED`; otherwise the gate stays `OPEN`.
+
+A change entering the pool must also carry a sponsoring society on record. A change whose `society_id` is null is refused with `ERR_SPONSOR_REQUIRED` at 422. This is a separate rule from the version check and is evaluated on its own.
+
+A cycle that was opened but never populated can be returned to planning. The return requires `submission_count` to be exactly 0, and it recomputes `discretionary_codes` before moving `cycle_status` back to `PLANNING`.
+
+Closing a cycle is the editorial office's gate on publication readiness. Three conditions hold at once: `submission_count` must be greater than 0, the logical clock must have reached the cycle's `comment_close`, and `discretionary_codes` must be at least 40. A close attempted while the discretionary pool is below 40 is rejected with `ERR_EDITORIAL_BUDGET_EXHAUSTED` at 422. A successful close recomputes `budget_gate_status` to `OPEN` and moves `cycle_status` to `CLOSED`.
+
+Releasing is the final act and belongs to `EditorialStaff` alone. A release requires at least one `CodeValue` row to carry this cycle as its `release_id`, and requires the logical clock to have reached the cycle's `comment_close`. A release attempted where a descriptor hole falls inside the range the release would publish is refused with `ERR_MISSING_DESCRIPTOR` at 422. A successful release recomputes `released_code_values` — the identifiers of the `CodeValue` rows bound to the cycle, ordered by `code` ascending with `created_at` ascending as the tie-break — sets every `CodeValue` bound to the cycle to `value_status` `ACTIVE`, stamps `released_at`, and moves `cycle_status` to `RELEASED`.
+
+### 3.7. Valuation of Codes and Forwarding to Payment Systems
+
+Relative-value work runs on its own track, separate from the descriptor workflow, and it is conducted by the recommending committee rather than the editorial panel. A `RUCValueRecommendation` is opened for a descriptor identified in `code`, carrying the committee's proposed component values: `work_rvu` for physician work, `facility_pe_rvu` and `nonfacility_pe_rvu` for practice expense in the facility and nonfacility settings, and `mp_rvu` for malpractice. It carries `survey_median_minutes`, the median intraservice time from the specialty survey, and `specialty_id`, the specialty whose geographic practice cost indices are applied — a field that may be absent, in which case no geographic adjustment is applied. It also carries a `conversion_factor_tier` of `AMBULATORY`, `SURGICAL` or `DIAGNOSTIC`, and a `code_value_id` linking it to a released code value once one exists. A new recommendation opens with `status` at `BEING_CONVENED`, `recommendation_status` at `PENDING`, `forward_status` at `WITHHELD` and `payability_status` at `NOT_PAYABLE`.
+
+The committee convenes on a valuation by ballot. The ballot supplies `yes_votes` and `no_votes`, whose sum must be greater than 0, and the move occurs only from `status` `BEING_CONVENED`. The recorded support percentage is affirmative votes divided by the sum of affirmative and negative votes, multiplied by 100, rounded half up to 4 decimal places; abstentions and absences are excluded from the denominator. The committee's `recommendation_status` becomes `RECOMMENDED` when that percentage is at least 66.0000 and `DEEMED_NOT_RECOMMENDED` otherwise, the valuation's `status` moves to `CONVENED`, and `forward_status` is set to `WITHHELD`. A committee that convenes without reaching a recommendation records a refusal, which sets `recommendation_status` to `DEEMED_NOT_RECOMMENDED` and recomputes the published work RVU; critically, a refusal creates or mutates no code value at all.
+
+The published work RVU is computed differently depending on whether the committee reached a recommendation. A valuation whose `recommendation_status` is `RECOMMENDED` publishes `work_rvu` unchanged as `recommended_work_rvu`. A valuation whose `recommendation_status` is `DEEMED_NOT_RECOMMENDED` publishes a reference-committee median instead, derived by taking the magnitude weight appropriate to the valuation's `survey_median_minutes` and multiplying it by 1.0000, with the result rounded half up to 2 decimal places. The magnitude weighting is tiered: 0.35 for the low band, 0.12 for the first band above it, and 0.06 for the high band. Either way the result is held in `recommended_work_rvu` at 2 decimal places rounded half up, and either way the valuation's `effective_date` is January 1 of the release year following the cycle year.
+
+A valuation is published to the payment systems through a recommendation, which requires `status` `CONVENED`, `recommendation_status` `RECOMMENDED`, `forward_status` `WITHHELD`, and an `effective_date` that is either absent or still in the future relative to the logical clock. Publishing a recommendation upserts a `CodeValue` row for the valuation's `code`, copying `work_rvu`, `facility_pe_rvu`, `nonfacility_pe_rvu` and `mp_rvu` from the recommendation, recomputes that code value's facility and nonfacility payment figures, and moves the valuation's `status` to `RECOMMENDED`. The `narrative` field accompanying the publication records the committee's reasoning.
+
+Forwarding takes the valuation the last step into the payment systems, and it is driven by `EditorialStaff`. It requires the valuation's `effective_date` to be set and the logical clock to be strictly before that date, and it requires `payability_status` to be `NOT_PAYABLE`. A forward attempted at or after the effective date, or while payability is already locked, is rejected with `ERR_VALUATION_NOT_FORWARDABLE` at 409. A forward sets `forward_status` to `FORWARDED`, sets `status` to `FORWARDED`, sets `payability_status` to `PAYABLE_LOCKED`, and sets `value_status` to `ACTIVE` on any `CodeValue` carrying the same descriptor number.
+
+Not every valuation leaves the committee with a recommendation, and a valuation that reached `CONVENED` without one follows a distinct forward path. A forward from `CONVENED` is permitted when `recommendation_status` is `DEEMED_NOT_RECOMMENDED`, when `effective_date` is set and the logical clock is before it; it sets `forward_status` to `FORWARDED` and `status` to `FORWARDED`, upserts a `CodeValue` row for the valuation's descriptor using the published `recommended_work_rvu` as that code value's work component, and sets the code value's `value_status` to `ACTIVE`. This is what makes the reference-committee median a payable figure rather than a placeholder.
+
+A forwarded valuation can be recalled for reconsideration. The recall requires `payability_status` `PAYABLE_LOCKED`, a set `effective_date`, and a logical clock still before that date. It sets `status` back to `BEING_CONVENED`, sets `forward_status` to `RETAINED_FOR_RECONSIDERATION`, sets `payability_status` back to `NOT_PAYABLE`, and sets `value_status` to `RETAINED` on any `CodeValue` carrying the same descriptor number. A separate release path exists for circulating a held valuation's FAQ or data set before its effective date; it names a `release_kind` from a closed set of four permitted kinds, and a kind outside that set is rejected with `ERR_UNSUPPORTED_RELEASE` at 422. A valid release sets `forward_status` to `RETAINED_FOR_RECONSIDERATION` without disturbing payability.
+
+Turning RVUs into dollars is the arithmetic that connects valuation to payment, and it is done per code value against the geographic indices of the specialty that the code value names. Each component is adjusted first: the work component is multiplied by that specialty's `gpci_work`, both practice-expense components are multiplied by that specialty's `gpci_pe`, and the malpractice component is multiplied by that specialty's `gpci_mp`. Where the specialty row named by `specialty_id` does not exist, no geographic index is applied and every component is left at its national value — equivalent to a national geographic practice cost index of 1.0000 across all three components.
+
+Payment arithmetic proceeds in cents. The aggregate-rounded facility total multiplies the sum of the adjusted work, facility practice-expense and malpractice components by the conversion factor and then by 100, rounding the whole product once, half up, to a whole cent. The component-rounded facility total instead multiplies each of those three adjusted components by the conversion factor and by 100 separately, rounds each product half up to a whole cent, and then sums the three rounded figures. The facility payment stored on the row is the component-rounded total when `rounding_variant` is `COMPONENT_ROUNDING` and the aggregate-rounded total when it is `AGGREGATE_ROUNDING`; the default is `AGGREGATE_ROUNDING`. Because the two orders differ, an aggregate-rounded facility payment can sit one cent below the component-rounded total, and a component-rounded facility payment can sit one cent above the aggregate-rounded total. The nonfacility payment multiplies the sum of the adjusted work, nonfacility practice-expense and malpractice components by the conversion factor and by 100 and rounds that single product half up to a whole cent. The shortfall between the two rounded bases is recorded in `dollar_split_shortfall_cents`, computed as the nonfacility adjusted total minus the sum of the facility and nonfacility rounded components. Where a code value does not supply a conversion factor, the default of 32.99 applies.
+
+Code values can be created directly as well as derived from a valuation, and the values on the record are `code` along with the four components `work_rvu`, `facility_pe_rvu`, `nonfacility_pe_rvu` and `mp_rvu`, the `conversion_factor` (default 32.99), `specialty_id`, `rounding_variant`, and the links `change_id` and `release_id`, both of which are nullable when the value is not yet bound to a change or a cycle. A newly created code value is in `value_status` `DRAFT`. Its `effective_date` may be restamped, which re-derives its proration basis and recomputes its payment figures. A code value may also be marked superseded by a successor row named in `superseded_by_code_value_id`, which requires a `reason`, sets `value_status` to `SUPERSEDED`, and retains the original row rather than replacing it. A code value bound to a release cycle and later replaced is set to `RETAINED` when a valuation is recalled.
+
+### 3.8. Errata Correction and Its Review
+
+A published payment figure is not immutable, but the window for changing it is bounded and the correction is proportional. An `ErrataNotice` is proposed against a code value named by `code_value_id`, with an `errata_effective_date` that is never earlier than that code value's own `effective_date`, a `prior_facility_payment_cents` figure audited from before the correction, and a plain-language `reason`. The notice opens with `status` `PROPOSED` and its `published_at` instant empty.
+
+The proration figures are recomputed on the notice whenever it is created, published, withdrawn or reviewed. The denominator is the number of days from the code value's `effective_date` through December 31 of the release year, inclusive of both endpoints. The numerator is the number of days from the notice's `errata_effective_date` through the same December 31, inclusive of both endpoints. Where the notice's effective date equals the code value's effective date, no proration occurs at all and the corrected facility payment equals the audited prior figure exactly. Otherwise the corrected facility payment is the audited prior figure multiplied by the numerator and divided by the denominator, rounded half up to a whole cent. All of these figures are held as integer cents.
+
+Publication of an errata notice carries four conditions, all evaluated together. The notice's `errata_effective_date` must be on or after the effective date of the code value it names. That code value must be in `value_status` `ACTIVE`. The notice's effective date must be no later than the `errata_deadline` of the release cycle carrying that code value; a notice taking effect after the deadline is rejected with `ERR_ERRATA_WINDOW_CLOSED` at 409. And the logical clock must have reached the notice's effective date. A successful publication recomputes the corrected facility payment into `corrected_facility_payment_cents`, recomputes the numerator day count into `proration_numerator_days` and the denominator day count into `proration_denominator_days`, overwrites the named code value's `facility_payment_cents` with the corrected figure, stamps `published_at` and moves `status` to `PUBLISHED`.
+
+A proposed notice may instead be withdrawn by the editorial office, which is permitted while `status` is `PROPOSED`. Withdrawal does not discard the arithmetic: `corrected_facility_payment_cents`, `proration_numerator_days` and `proration_denominator_days` are recomputed and retained on the row for audit, and `status` moves to `WITHDRAWN`. A withdrawal that supplies a `reason` records the editorial office's explanation alongside the retained figures.
+
+A published notice can be challenged. A `ReviewErratum` is opened by the chair against the notice named in `original_notice_id`, declaring a `review_outcome` of `UPHELD` or `REVERSED`, with a replacement `corrected_proration_ratio` supplied when the outcome is a reversal. The row opens with `applied_status` `NONE` and `review_status` `OPEN`. A reversal must supply a corrected proration ratio — its absence, or a ratio that does not sit strictly between zero and one, is rejected with `ERR_CORRECTION_INVALID` at 422. The same rule and the same code apply both when the review is opened and when its outcome is decided.
+
+Deciding the outcome is the chair's act and closes the review; it is confirmed through a `confirmation` acknowledgment on the request. An upholding sets `applied_status` to `NOT_APPLICABLE` and leaves the underlying notice's figures alone. A reversal sets `applied_status` to `APPLIED` and recomputes the named notice's `corrected_facility_payment_cents` as the audited prior figure multiplied by the corrected proration ratio, rounded half up to a whole cent. Where the decision supplies an updated prior figure in `updated_prior_cents`, the notice's `prior_facility_payment_cents` is replaced with it. Deciding an outcome advances the review's version and stamps `reviewed_at`. The segregation of duties described in §2.1 applies here directly: the identity that published the notice may not be the identity that reverses it. The `ReviewErratum` family is self-referential in the sense that a review always points back at an existing `ErrataNotice` by `original_notice_id`, and a rejection outcome that does not reverse still leaves the notice's recomputed figures on record.
+
+### 3.9. Licensing, Territories and Distribution
+
+Licensing is the commercial layer, and it is governed by a `LicensingAgreement`. A licence declares the class of the licensee in `licensee_type` — `PAYER`, `VENDOR`, `PROVIDER` or `EDUCATOR` — the licensee's legal name in `licensee_name`, and a flat annual `base_fee_cents` before per-unit royalties. A payer licence carries a revenue tier in `payer_revenue_tier`, one of `TIER_1`, `TIER_2` or `TIER_3`. A vendor licence carries a `vendor_worldwide` flag, defaulting to false, declaring whether the licence covers worldwide distribution. Declared usage is carried in `expected_users`, defaulting to 0, and in `sales_unit_count`, defaulting to 0, which is the field the per-unit fee schedule reads. The licence also names its territory in `territory_id`, which is nullable until a territory is assigned. The licence's own `activated_at` instant is stamped on activation.
+
+Royalty fees follow one of two schedules, and which schedule applies depends on whether `payer_revenue_tier` is present. When the tier is absent — the vendor case — the three-band schedule applies and `vendor_worldwide` does not change the fee. Priced per billable unit, with `units` standing for the licence's `sales_unit_count`: for up to and including 500,000 units the fee is the unit count multiplied by 0.90, rounded half up to a whole cent; for units above 500,000 and up to and including 5,000,000 the fee is 450,000 cents plus the unit count above 500,000 multiplied by 0.55, rounded half up to a whole cent; and for units above 5,000,000 the fee is 450,000 cents plus 2,475,000 cents plus the unit count above 5,000,000 multiplied by 0.25, rounded half up to a whole cent. When `payer_revenue_tier` is present, the revenue-tier schedule replaces the band schedule entirely and `vendor_worldwide` is ignored: `TIER_1` yields 0.75 times `base_fee_cents`, `TIER_2` yields 1.15 times `base_fee_cents`, and `TIER_3` yields 1.50 times `base_fee_cents`, each rounded half up to 2 decimal places into `royalty_fee_cents`.
+
+A licence must clear a fee threshold before it can activate. The gate reads `sales_unit_count`: a count of at least 4 units yields `fee_threshold_gate_status` `PASS`, and a count below 4 yields `BELOW_MINIMUM`. Activation requires `territory_id` to be set and the gate to be `PASS`; activating a licence whose gate is `BELOW_MINIMUM` because its sales unit count is under 4 is rejected with `ERR_LICENSE_FEE_BELOW_MINIMUM` at 422. A licence whose method is `DISTRIBUTION` or `REPRINT` may also not activate while its territory's `territory_status` is `RESERVED`; that attempt is rejected with `ERR_LICENSE_TERRITORY_RESERVED` at 409. The two activation guards are ordered, with the fee threshold gate evaluated before the territory reservation guard: a licence that is both below the minimum sales unit count and pointed at a reserved territory reports `ERR_LICENSE_FEE_BELOW_MINIMUM`. Activation stamps `activated_at`, recomputes `royalty_fee_cents` and recomputes `distribution_scope`.
+
+Scope is derived from a score rather than declared. The score begins at 0, gains 1 when the licence's `agreement_status` is `ACTIVE`, gains a further 1 when `territory_id` is set and the named `DistributionTerritory` has `can_license` true, and gains a further 1 when the licence's `licensee_type` is `VENDOR` and its `vendor_worldwide` flag is true. A score of 0 yields `distribution_scope` `INTERNAL_ONLY`. A positive score yields `US_ONLY` when `vendor_worldwide` is false and `WORLDWIDE` when `vendor_worldwide` is true. Suspending an active licence recomputes the scope and then freezes it at its last value. Terminating a licence forces the scope to `INTERNAL_ONLY` regardless of score. The licence also returns `ancillary_publication_codes`, the ancillary item codes bundled with the licence; these are never entitled to a royalty fee, are not consulted by the scope score, and are not billed per unit.
+
+The licence lifecycle begins at `DRAFT`. Activation moves it to `ACTIVE`. Suspension moves an `ACTIVE` licence to `SUSPENDED`. Reactivation moves a `SUSPENDED` licence back to `ACTIVE` and requires the fee threshold gate to be `PASS`, recomputing the royalty fee. Termination is available from either `ACTIVE` or `SUSPENDED` and is terminal. Termination cascades broadly: every `ContentDeliveryOrder` carrying this licence with `delivery_status` `RELEASED` is set to `WITHDRAWN`; the licence's `distribution_scope` is recomputed and fixed at `INTERNAL_ONLY`; and the licensee's territory row has its `territory_status` set to `WITHDRAWN` and its `can_license` recomputed to false.
+
+Territories are the geographic and methodological unit of distribution. A `DistributionTerritory` carries a unique `territory_code` such as `US-NORTHEAST`, a `method` of `DISTRIBUTION`, `SITE` or `REPRINT`, an `edi_payer_network` flag defaulting to false that declares whether the territory is licensed into the EDI payer network, and a `metadata_schema_version` the territory requires, defaulting to `2026.1`. From those inputs the server derives the territory's operating characteristics: `can_license` is true for the `SITE` method and false for `DISTRIBUTION` and `REPRINT`; `distribution_channel` is `SITE` when the method is `SITE`, `EDI` when the method is not `SITE` and the territory is on the EDI payer network, and `PRINT_AND_ELECTRONIC` otherwise; `site_exception` is true when the `SITE` method is used, which suppresses EDI format requirements; and `transaction_set_required` is true only when `distribution_channel` is `EDI`. The territory also carries `activation_details`, a pair indicating whether electronic format and media are required, both of which are false when `site_exception` is true.
+
+Reserving a territory is what happens while its method is ineligible. A reservation is available while the territory's `method` is `DISTRIBUTION` or `REPRINT` and its `territory_status` is `OPEN`, and the request supplies the range bounds `reserved_start` and `reserved_end`. A reservation moves `territory_status` to `RESERVED`, allocates the next contiguous descriptor range into `reserved_range`, sets `can_license` to false, and stamps `reserved_at`. A reserved territory can be corrected onto the `SITE` method when `reserved_at` is set; the correction sets `method` to `SITE`, recomputes `can_license` to true and `site_exception` to true, and returns `territory_status` to `OPEN`. A reserved territory can also be withdrawn, which is available only from `RESERVED`; withdrawal clears `reserved_range`, sets `territory_status` to `WITHDRAWN`, and cascades to every `LicensingAgreement` carrying this territory, clearing each licence's `territory_id` and setting its `distribution_scope` to `INTERNAL_ONLY`.
+
+Two occupancy rules keep territories and docket slots from being over-committed. A distribution territory may be bound by at most one `LicensingAgreement` whose `agreement_status` is not `TERMINATED`, so the territory's occupancy interval ends only when that licence terminates; an attempt to bind a second live licence to an already-occupied territory is rejected with `ERR_TERRITORY_OCCUPIED` at 409. A `CodeChange` already carrying a non-null `meeting_id` likewise may not be docketed at another meeting while its current docket slot is open, and that attempt is rejected with `ERR_MEETING_SLOT_OCCUPIED` at 409.
+
+### 3.10. Content Delivery, Education and Interpretation
+
+Deliveries are how the licensed content actually moves. A `ContentDeliveryOrder` names its licence in `license_id` and the channel in `distribution_channel`, one of `EDI`, `PRINT_AND_ELECTRONIC` or `SITE`. It carries `format_params`, an object bundling `electronic_format`, `media`, `version_qualifier` and `payer_identifier_qualifier`, in which `version_qualifier` is mandatory for the EDI channel. It carries `payer_identifier`, required for EDI deliveries, and it must carry `expected_license_version`. The licence named must be `ACTIVE`, and where the channel is `EDI` the request must supply both a `version_qualifier` inside `format_params` and a `payer_identifier`; an EDI delivery missing either is rejected with `ERR_ELECTRONIC_MEDIA_REQUIRED` at 422. A SITE delivery is exempt from electronic format requirements. Separately, an electronic delivery omitting the version qualifier required by the 2026.1 or later metadata schema is rejected with `ERR_VERSION_QUALIFIER_REQUIRED` at 422.
+
+The version echo on a reservation is the concurrency contract described in §2.10: `expected_license_version` must match the named licence's current `version`, and a mismatch is rejected with `ERR_STALE_VERSION` at 412. A successful reservation sets `delivery_status` to `RESERVED`, computes `activation_mode` — `SITE`, `MEDIA` or `ELECTRONIC` as derived from the channel and format parameters — stamps `reserved_at`, and increments the named licence's `version` by one. That last cascade is exactly why a second reservation against the same licence needs a fresh version echo.
+
+The delivery guards are ordered. The EDI requirement for `payer_identifier` and a version qualifier is evaluated before the version qualifier's own minimum schema gate, so a delivery missing a qualifier altogether reports `ERR_ELECTRONIC_MEDIA_REQUIRED` while a delivery carrying an insufficiently recent one reports `ERR_VERSION_QUALIFIER_REQUIRED`. The single-slot occupancy check is evaluated after both.
+
+A licence may hold at most one delivery order in `RESERVED` or `READY` at a time. A second reservation while such an order exists is rejected with `ERR_DUPLICATE_DELIVERY_RESERVATION` at 409; the licence's reserved delivery slot stays occupied until the existing order is released or withdrawn, and the same restriction guards marking an order ready. Marking a reserved order ready is the editorial office's act and requires `format_params.media` to be present when the channel is `PRINT_AND_ELECTRONIC`; it sets `delivery_status` to `READY` and stamps `ready_at`, with the `media` value supplied in the request. Releasing a ready order requires the licence to be `ACTIVE` and requires the licence's territory, where one is set, to have a `territory_status` other than `RESERVED`; it sets `delivery_status` to `RELEASED`, stamps `released_at`, and increments the licence's version by one. A delivery on the EDI channel that omits `payer_identifier` or a well-formed version qualifier is refused with `ERR_ELECTRONIC_MEDIA_REQUIRED` at 422 at both reservation and release time. The licensee may also withdraw its own reserved order, which requires `delivery_status` `RESERVED`, sets the order to `WITHDRAWN`, and clears its `released_at`.
+
+Coding education is a licensed activity too. A `CodingEducationActivity` names its licence in `licensee_id`, carries a unique `activity_code`, and declares the instructional `clock_hours` delivered and an `assistant_targeted` flag, defaulting to false, marking whether the activity serves the CPT Assistant population. It advances from `REGISTERED` to `COMPLETED` only at completion; completing an activity from any other state is rejected with `ERR_EDUCATION_NOT_COMPLETED` at 409.
+
+Education credits follow a rule that differs from the monetary half-up convention and must be read carefully. Start with the clock hours divided by 2, rounded to one decimal place, half away from zero. If the clock hours are 1 or fewer, the credit is 0.5 regardless of what that division produces. If the clock hours are 6 or more, the derived credit carries through unadjusted at this stage. Then, in all cases, the derived credit is capped at 2.0 — a value above 2.0 is reduced to exactly 2.0. The capped figure is stored in `cea_credits_awarded` at one decimal place. The second field, `cea_credits_rounded`, rounds the awarded credit to the nearest whole credit, half up. The cap applies to the derived credit itself, and the raw clock-hours-over-two ratio is never published. Neither the activity's `assistant_targeted` flag nor its licensing agreement is consulted by the conversion. Completing an activity sets `activity_status` to `COMPLETED` and stamps `completed_at`.
+
+Interpretation requests close the licensing narrative. An `InterpretationRequest` names the requesting licence in `requesting_licensee_id`, the descriptor under question in `code`, and the text of the question in `question`. Its entitlement is derived, not declared: a request is entitled when the licence named by `requesting_licensee_id` is `ACTIVE`, and it is also entitled when that licence is an `EDUCATOR` licence in any non-terminated status. It is not entitled when the licence class is `PROVIDER`, and it is not entitled when the licence is `TERMINATED`. The outcome is stored in `entitlement_status` as `ENTITLED` or `NOT_ENTITLED`, and the request itself opens in `response_status` `PENDING`. Answering a request requires `entitlement_status` to be `ENTITLED`; an answer attempted against a not-entitled request is rejected with `ERR_NOT_ENTITLED` at 403. Answering is recorded with `answer_text` and also requires the requesting licence to be `ACTIVE` or `SUSPENDED`. A successful answer sets `response_status` to `ANSWERED`, stamps `answered_at`, and recomputes `entitlement_status` from the requesting licensee class.
+
+## 4. Endpoint Definitions
+
+Operations that create a new stand-alone resource, or that add a distinct new resource to a collection, return `201 Created`. Operations that modify an existing resource, including those that add data to a resource's internal collection or advance a state machine, return `200 OK`. A withdrawal performed through a delete verb is a modification of an existing record rather than a removal, and returns `200 OK` with the updated resource in the response body. The single test-driving clock endpoint returns `200 OK` with an empty `data` object.
+
+The table below lists the HTTP contract only. Request payloads, response shapes, preconditions and cascades are specified in §2 and §3 and are deliberately not repeated here.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/cpt/specialty-societies` | Register a specialty society | EditorialStaff |
+| GET | `/cpt/specialty-societies` | List specialty societies | EditorialStaff, EditorialPanelChair, CommitteeReviewer |
+| GET | `/cpt/specialty-societies/{id}` | Read one specialty society | EditorialStaff, EditorialPanelChair, CommitteeReviewer |
+| POST | `/cpt/specialty-societies/{id}/seat-assignments` | Set a society's editorial panel voting seats | EditorialStaff |
+| POST | `/cpt/applicants` | Register a stakeholder applicant | EditorialStaff |
+| GET | `/cpt/applicants` | List applicants | EditorialStaff, LicensingOfficer |
+| GET | `/cpt/applicants/{id}` | Read one applicant | EditorialStaff, LicensingOfficer |
+| GET | `/cpt/specialty-societies/{id}/applicants` | List applicants filed on behalf of a society | EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/code-changes` | File a code change application | EditorialStaff, ChangeApplicant |
+| GET | `/cpt/code-changes` | List code changes | EditorialStaff, EditorialPanelChair, CommitteeReviewer |
+| GET | `/cpt/code-changes/{id}` | Read one code change | EditorialStaff, EditorialPanelChair, CommitteeReviewer, ChangeApplicant |
+| GET | `/cpt/specialty-societies/{id}/code-changes` | List changes sponsored by a society | EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/code-changes/{id}/administrative-returns` | Return a posted change to administrative review | EditorialStaff |
+| POST | `/cpt/code-changes/{id}/postings` | Post a change for public comment | EditorialStaff |
+| POST | `/cpt/code-changes/{id}/returns` | Return a change to draft | EditorialStaff |
+| POST | `/cpt/code-changes/{id}/supplementary-reports` | Carry a referred change forward with a supplementary report | EditorialStaff |
+| POST | `/cpt/code-changes/{id}/referrals` | Refer a change to the June minutes without a determination | EditorialPanelChair |
+| POST | `/cpt/code-changes/{id}/determinations` | Record the panel disposition of a change | EditorialPanelChair |
+| POST | `/cpt/code-changes/{id}/revert-to-draft` | Reopen a June-referred or tabled change | EditorialStaff |
+| DELETE | `/cpt/code-changes/{id}` | Withdraw a change application | EditorialStaff, ChangeApplicant |
+| POST | `/cpt/advisory-committee-reviews` | Open an advisory committee review | CommitteeReviewer |
+| GET | `/cpt/advisory-committee-reviews` | List advisory committee reviews | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/advisory-committee-reviews/{id}` | Read one advisory committee review | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/code-changes/{id}/committee-reviews` | List the reviews recorded against a change | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/committee-reviews/{id}/decisions` | Close a review and record its recommendation | CommitteeReviewer |
+| GET | `/cpt/committee-reviews/{id}` | Read one advisory committee review by review id | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/meetings` | Schedule an editorial panel meeting | EditorialStaff |
+| GET | `/cpt/meetings` | List editorial panel meetings | EditorialStaff, EditorialPanelChair, CommitteeReviewer |
+| GET | `/cpt/meetings/{id}` | Read one meeting with its quorum derivation | EditorialStaff, EditorialPanelChair, CommitteeReviewer |
+| POST | `/cpt/meetings/{id}/agenda` | Set the meeting agenda and docket the named changes | EditorialStaff |
+| POST | `/cpt/meetings/{id}/comment-windows` | Open the meeting's public comment window | EditorialStaff |
+| POST | `/cpt/meetings/{id}/comment-closures` | Close the meeting's public comment window | EditorialStaff |
+| POST | `/cpt/meetings/{id}/comment-window-reversals` | Reopen a meeting whose comment window closed with no comments | EditorialStaff |
+| POST | `/cpt/meetings/{id}/openings` | Open the meeting for panel deliberation | EditorialPanelChair |
+| POST | `/cpt/meetings/{id}/recesses` | Recess the meeting and recompute its weighted tallies | EditorialPanelChair |
+| POST | `/cpt/meetings/{id}/reopenings` | Reopen a recessed meeting for addendum business | EditorialPanelChair |
+| POST | `/cpt/meetings/{id}/addenda` | Open the addendum agenda | EditorialStaff |
+| POST | `/cpt/meetings/{id}/addendum-closures` | Close the addendum agenda | EditorialStaff |
+| POST | `/cpt/meetings/{id}/closures` | Close the meeting and record its weighted tallies | EditorialPanelChair |
+| POST | `/cpt/public-comments` | File a public comment on a posted change | ChangeApplicant, Licensee |
+| POST | `/cpt/advisory-committee-reviews/{id}/comment-records` | Record the committee's consideration of public comments | CommitteeReviewer |
+| GET | `/cpt/public-comments` | List public comments | EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/public-comments/{id}` | Read one public comment | EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/public-comments/{id}/withdrawals` | Withdraw a public comment | ChangeApplicant |
+| POST | `/cpt/editorial-votes` | Cast a society's ballot on a docketed change | EditorialPanelChair |
+| GET | `/cpt/editorial-votes` | List editorial votes | EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/editorial-votes/{id}` | Read one editorial vote | EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/meetings/{id}/votes` | List the ballots cast at a meeting | EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/ruc-value-recommendations` | Open a valuation review for a code | CommitteeReviewer |
+| GET | `/cpt/ruc-value-recommendations` | List value recommendations | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/ruc-value-recommendations/{id}` | Read one value recommendation | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| GET | `/cpt/specialty-societies/{id}/value-recommendations` | List recommendations naming a society | CommitteeReviewer, EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/ruc-value-recommendations/{id}/votes` | Record the committee's ballot on a valuation | CommitteeReviewer |
+| POST | `/cpt/ruc-value-recommendations/{id}/recommendations` | Publish the recommended work RVU and create the code value | CommitteeReviewer |
+| POST | `/cpt/ruc-value-recommendations/{id}/refusals` | Record that the committee convened without a recommendation | CommitteeReviewer |
+| POST | `/cpt/ruc-value-recommendations/{id}/forwards` | Forward a recommendation to the payment systems | EditorialStaff |
+| POST | `/cpt/ruc-value-recommendations/{id}/releases` | Release a held valuation FAQ or data set | EditorialStaff |
+| POST | `/cpt/ruc-value-recommendations/{id}/reconsiderations` | Recall a forwarded valuation for reconsideration | EditorialStaff |
+| POST | `/cpt/code-values` | Create a code value record for a descriptor | LicensingOfficer |
+| GET | `/cpt/code-values` | List code values | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/code-values/{id}` | Read one code value | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/code-changes/{id}/code-values` | List the code values derived from a change | LicensingOfficer, EditorialStaff |
+| POST | `/cpt/code-values/{id}/effective-dates` | Restamp a code value's effective date | LicensingOfficer |
+| POST | `/cpt/code-values/{id}/supersessions` | Mark a code value superseded by a successor row | LicensingOfficer |
+| GET | `/cpt/release-cycles` | List release cycles | EditorialStaff, EditorialPanelChair, LicensingOfficer |
+| GET | `/cpt/release-cycles/{id}` | Read one release cycle with its pool allocation | EditorialStaff, EditorialPanelChair, LicensingOfficer |
+| POST | `/cpt/release-cycles` | Create an annual release cycle | EditorialStaff |
+| POST | `/cpt/release-cycles/{id}/submissions` | Submit changes into a cycle's descriptor pool | EditorialStaff |
+| POST | `/cpt/release-cycles/{id}/openings` | Open the cycle's public comment period | EditorialStaff |
+| POST | `/cpt/release-cycles/{id}/returns` | Return an unscheduled cycle to planning | EditorialStaff |
+| POST | `/cpt/release-cycles/{id}/closures` | Close the cycle once its descriptor budget clears the gate | EditorialStaff |
+| POST | `/cpt/release-cycles/{id}/releases` | Release the annual code set | EditorialStaff |
+| GET | `/cpt/release-cycles/{id}/code-changes` | List the changes bound to a release cycle | EditorialStaff, EditorialPanelChair |
+| POST | `/cpt/errata-notices` | Propose an errata correction to a published code value | EditorialStaff |
+| GET | `/cpt/errata-notices` | List errata notices | EditorialStaff, LicensingOfficer, EditorialPanelChair |
+| GET | `/cpt/errata-notices/{id}` | Read one errata notice with its proration figures | EditorialStaff, LicensingOfficer, EditorialPanelChair |
+| GET | `/cpt/code-values/{id}/errata-notices` | List the errata notices recorded against a code value | EditorialStaff, LicensingOfficer |
+| POST | `/cpt/errata-notices/{id}/publications` | Publish an errata correction and overwrite the affected figure | EditorialStaff |
+| POST | `/cpt/errata-notices/{id}/withdrawals` | Withdraw a proposed errata notice | EditorialStaff |
+| POST | `/cpt/errata-reviews` | Open a review of a published errata notice | EditorialPanelChair |
+| GET | `/cpt/errata-reviews` | List errata reviews | EditorialPanelChair, EditorialStaff |
+| GET | `/cpt/errata-reviews/{id}` | Read one errata review | EditorialPanelChair, EditorialStaff |
+| GET | `/cpt/errata-notices/{id}/reviews` | List the reviews recorded against an errata notice | EditorialPanelChair, EditorialStaff |
+| POST | `/cpt/errata-reviews/{id}/outcomes` | Decide whether the original errata notice is upheld or reversed | EditorialPanelChair |
+| POST | `/cpt/distribution-territories` | Create a licensing distribution territory | LicensingOfficer |
+| GET | `/cpt/distribution-territories` | List distribution territories | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/distribution-territories/{id}` | Read one distribution territory | LicensingOfficer, EditorialStaff, Licensee |
+| POST | `/cpt/distribution-territories/{id}/reservations` | Reserve a territory's descriptor range | LicensingOfficer |
+| POST | `/cpt/distribution-territories/{id}/method-corrections` | Correct a reserved territory to the site method | LicensingOfficer |
+| POST | `/cpt/distribution-territories/{id}/withdrawals` | Withdraw a reserved territory | LicensingOfficer |
+| POST | `/cpt/licensing-agreements` | Create a licence granting access to the code set | LicensingOfficer |
+| GET | `/cpt/licensing-agreements` | List licensing agreements | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/licensing-agreements/{id}` | Read one licensing agreement | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/distribution-territories/{id}/licensing-agreements` | List the licences bound to a territory | LicensingOfficer, EditorialStaff |
+| POST | `/cpt/licensing-agreements/{id}/activations` | Activate a licence | LicensingOfficer |
+| POST | `/cpt/licensing-agreements/{id}/suspensions` | Suspend an active licence | LicensingOfficer |
+| POST | `/cpt/licensing-agreements/{id}/reactivations` | Reactivate a suspended licence | LicensingOfficer |
+| POST | `/cpt/licensing-agreements/{id}/terminations` | Terminate a licence and cascade its consequences | LicensingOfficer |
+| POST | `/cpt/content-delivery-orders` | Reserve a content delivery slot under a licence | Licensee, LicensingOfficer |
+| GET | `/cpt/content-delivery-orders` | List content delivery orders | Licensee, LicensingOfficer, EditorialStaff |
+| GET | `/cpt/content-delivery-orders/{id}` | Read one content delivery order | Licensee, LicensingOfficer, EditorialStaff |
+| POST | `/cpt/content-delivery-orders/{id}/readiness` | Mark a reserved delivery ready for release | EditorialStaff |
+| POST | `/cpt/content-delivery-orders/{id}/releases` | Release a ready delivery | EditorialStaff |
+| POST | `/cpt/content-delivery-orders/{id}/withdrawals` | Withdraw a reserved delivery | Licensee |
+| GET | `/cpt/licensing-agreements/{id}/content-delivery-orders` | List the delivery orders filed under a licence | Licensee, LicensingOfficer, EditorialStaff |
+| POST | `/cpt/education-activities` | Register a coding education activity | LicensingOfficer |
+| GET | `/cpt/education-activities` | List coding education activities | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/education-activities/{id}` | Read one coding education activity | LicensingOfficer, EditorialStaff, Licensee |
+| GET | `/cpt/licensing-agreements/{id}/education-activities` | List the education activities delivered under a licence | LicensingOfficer, EditorialStaff, Licensee |
+| POST | `/cpt/education-activities/{id}/completions` | Complete an education activity and award its credits | LicensingOfficer |
+| POST | `/cpt/interpretation-requests` | File a request for a written code interpretation | LicensingOfficer |
+| GET | `/cpt/interpretation-requests` | List interpretation requests | EditorialStaff, LicensingOfficer, Licensee |
+| GET | `/cpt/interpretation-requests/{id}` | Read one interpretation request | EditorialStaff, LicensingOfficer, Licensee |
+| GET | `/cpt/licensing-agreements/{id}/interpretation-requests` | List the interpretation requests filed by a licensee | EditorialStaff, LicensingOfficer, Licensee |
+| POST | `/cpt/interpretation-requests/{id}/answers` | Answer an entitled interpretation request | EditorialStaff |
+| POST | `/cpt/_clock/set_current_utc` | Test-driving capability: set the server's logical clock | EditorialStaff |
+
+## 5. Error Code Catalogue
+
+The table below lists each error identifier with the HTTP status it carries. The condition that triggers each error is specified in the narrative section that governs the operation — §2 for the system-wide gates, or the relevant §3 workflow — and is deliberately not repeated here.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_NOT_ENTITLED` | 403 Forbidden |
+| `ERR_NOT_FOUND` | 404 Not Found |
+| `ERR_CODE_ALREADY_EXISTS` | 409 Conflict |
+| `ERR_ADVISORY_REVIEW_NOT_READY` | 409 Conflict |
+| `ERR_MEETING_NOT_OPEN` | 409 Conflict |
+| `ERR_NO_QUORUM` | 409 Conflict |
+| `ERR_ALREADY_REFERRED_TO_JUNE_MINUTES` | 409 Conflict |
+| `ERR_APPROVAL_PERCENT_TOO_LOW` | 409 Conflict |
+| `ERR_CHANGE_NOT_READY_FOR_PANEL` | 409 Conflict |
+| `ERR_INVALID_STATE` | 409 Conflict |
+| `ERR_ALREADY_TERMINAL` | 409 Conflict |
+| `ERR_LICENSE_TERRITORY_RESERVED` | 409 Conflict |
+| `ERR_ERRATA_WINDOW_CLOSED` | 409 Conflict |
+| `ERR_ADVISORY_REVIEW_INCOMPLETE` | 409 Conflict |
+| `ERR_VALUATION_NOT_FORWARDABLE` | 409 Conflict |
+| `ERR_EDUCATION_NOT_COMPLETED` | 409 Conflict |
+| `ERR_APPROVAL_SCOPE_EXCEEDED` | 409 Conflict |
+| `ERR_DUPLICATE_VOTE` | 409 Conflict |
+| `ERR_DUPLICATE_DELIVERY_RESERVATION` | 409 Conflict |
+| `ERR_TERRITORY_OCCUPIED` | 409 Conflict |
+| `ERR_MEETING_SLOT_OCCUPIED` | 409 Conflict |
+| `ERR_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_CODE_FORMAT_INVALID` | 422 Unprocessable Entity |
+| `ERR_EVIDENCE_INSUFFICIENT` | 422 Unprocessable Entity |
+| `ERR_CYCLE_LIMIT_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_COMMENT_PERIOD_TOO_SHORT` | 422 Unprocessable Entity |
+| `ERR_FREQUENT_FAMILY_EXEMPLAR_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_DELEGATION_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_EDITORIAL_BUDGET_EXHAUSTED` | 422 Unprocessable Entity |
+| `ERR_LICENSE_FEE_BELOW_MINIMUM` | 422 Unprocessable Entity |
+| `ERR_ELECTRONIC_MEDIA_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_VERSION_QUALIFIER_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_MISSING_DESCRIPTOR` | 422 Unprocessable Entity |
+| `ERR_NO_HOLD_KIND` | 422 Unprocessable Entity |
+| `ERR_CORRECTION_INVALID` | 422 Unprocessable Entity |
+| `ERR_UNSUPPORTED_RELEASE` | 422 Unprocessable Entity |
+| `ERR_SPONSOR_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_SUPPORT_DATA_REQUIRED` | 422 Unprocessable Entity |

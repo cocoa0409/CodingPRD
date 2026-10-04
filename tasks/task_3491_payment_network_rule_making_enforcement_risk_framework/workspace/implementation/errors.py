@@ -1,0 +1,51 @@
+"""Error catalog (PRD section 5) and the ApiError exception.
+
+Every error_id declared in the PRD exists here with its HTTP status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message):
+        self.error_id = error_id
+        self.http_status = ERROR_CATALOG[error_id]
+        self.message = message
+        super().__init__(message)
+
+
+ERROR_CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_DUPLICATE_RESOURCE": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_PARTICIPANT_NOT_ACTIVE": 409,
+    "ERR_ORIGINATOR_NOT_APPROVED": 409,
+    "ERR_ENTRY_NOT_SETTLED": 409,
+    "ERR_ACCOUNT_VALIDATION_REQUIRED": 422,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_AUTHORIZATION_REQUIREMENT_VIOLATION": 422,
+    "ERR_RETURN_PARTICIPANT_CONFLICT": 422,
+    "ERR_GUIDANCE_WINDOW_OVERLAP": 409,
+    "ERR_PROPOSAL_NOT_EFFECTIVE": 409,
+    "ERR_AUDIT_WINDOW_OVERLAP": 409,
+    "ERR_VOTE_UNCHANGED": 422,
+    "ERR_RETURN_WINDOW_EXPIRED": 409,
+    "ERR_COMMENT_PERIOD_TOO_SHORT": 422,
+    "ERR_BALLOT_PERIOD_NOT_CLOSED": 422,
+    "ERR_EFFECTIVE_DATE_NOT_REACHED": 422,
+    "ERR_WINDOW_NOT_CLOSED": 409,
+    "ERR_WINDOW_CUTOFF_PASSED": 422,
+    "ERR_RESPONSE_DEADLINE_NOT_PASSED": 409,
+    "ERR_SAME_DAY_ENTRY_LIMIT_EXCEEDED": 422,
+    "ERR_WINDOW_CAPACITY_EXCEEDED": 422,
+    "ERR_EXPOSURE_LIMIT_EXCEEDED": 422,
+    "ERR_UNRESOLVED_ENFORCEMENT": 422,
+    "ERR_AUDIT_REQUIRED": 422,
+    "ERR_AUDIT_NOT_STARTED": 422,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INTERNAL": 500,
+}
+
+
+def fail(error_id, message):
+    raise ApiError(error_id, message)

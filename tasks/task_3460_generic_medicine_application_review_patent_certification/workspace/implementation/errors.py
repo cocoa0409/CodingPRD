@@ -1,0 +1,63 @@
+"""Error catalog: every error id from SCAFFOLD Table 1.6 / PRD section 5."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+HTTP_STATUS = {
+    # auth
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    # existence
+    "ERR_APPLICANT_NOT_FOUND": 404,
+    "ERR_REFERENCE_PRODUCT_NOT_FOUND": 404,
+    "ERR_LISTED_PATENT_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_NOTICE_NOT_FOUND": 404,
+    "ERR_REVIEW_CYCLE_NOT_FOUND": 404,
+    "ERR_FACILITY_NOT_FOUND": 404,
+    "ERR_INSPECTION_NOT_FOUND": 404,
+    "ERR_SUPPLEMENT_NOT_FOUND": 404,
+    "ERR_EXCLUSIVITY_AWARD_NOT_FOUND": 404,
+    # input shape
+    "ERR_INVALID_REQUEST": 400,
+    # OCC
+    "ERR_STALE_VERSION": 412,
+    # state
+    "ERR_INVALID_STATE": 409,
+    "ERR_DEFICIENCY_RESPONSE_OPEN": 409,
+    "ERR_CERTIFICATION_NOT_AMENDABLE": 409,
+    "ERR_APPLICATION_NOT_APPROVED": 409,
+    "ERR_SUPPLEMENT_NOT_REVIEWABLE": 409,
+    # business: safety
+    "ERR_NO_ADEQUATE_BE_STUDY": 422,
+    "ERR_FACILITY_CLEARANCE_FAILED": 422,
+    "ERR_FOREIGN_FACILITY_WAIVER": 422,
+    # business: temporal
+    "ERR_NCE_SUBMISSION_BARRED": 422,
+    "ERR_INSPECTION_OVERLAP": 409,
+    "ERR_INDICATION_WINDOW_OVERLAP": 409,
+    # business: constraint
+    "ERR_LABEL_CARVE_OUT_INCOMPLETE": 422,
+    "ERR_CARVE_OUT_OF_UNPROTECTED": 422,
+    "ERR_CERTIFICATION_INCOMPLETE": 422,
+    "ERR_DUPLICATE_CERTIFICATION": 409,
+    "ERR_NOTICE_ALREADY_EXISTS": 409,
+    "ERR_P4_NOTICE_REQUIRED": 422,
+    "ERR_INVALID_PATHWAY_FOR_CHANGE": 422,
+    # business: referential
+    "ERR_PATENT_NOT_LISTED_FOR_REFERENCE_PRODUCT": 409,
+    "ERR_FACILITY_APPLICATION_MISMATCH": 409,
+    "ERR_INDICATION_NOT_ON_REFERENCE_PRODUCT": 422,
+}
+
+
+def fail(error_id, message):
+    raise ApiError(error_id, HTTP_STATUS[error_id], message)

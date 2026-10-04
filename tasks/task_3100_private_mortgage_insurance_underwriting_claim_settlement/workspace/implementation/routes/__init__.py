@@ -1,0 +1,1 @@
+"""Route blueprints for the private mortgage insurance API."""

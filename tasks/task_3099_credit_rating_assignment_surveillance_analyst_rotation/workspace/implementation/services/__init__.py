@@ -1,0 +1,1 @@
+"""Service layer: business calculations, state transitions and cascades."""

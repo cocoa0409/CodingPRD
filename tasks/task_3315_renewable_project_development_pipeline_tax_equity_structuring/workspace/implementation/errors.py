@@ -1,0 +1,50 @@
+"""Error classes and error ID constants."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+# Error ID -> HTTP status (from SCAFFOLD error catalog)
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_VALIDATION": 400,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_MILESTONE_EVIDENCE_REQUIRED": 400,
+    "ERR_MILESTONE_OUT_OF_ORDER": 409,
+    "ERR_COD_MILESTONE_PREREQUISITE": 409,
+    "ERR_PARCEL_OVERLAP": 409,
+    "ERR_OPTION_WINDOW_LAPSED": 409,
+    "ERR_STUDY_WINDOW_CONFLICT": 409,
+    "ERR_PHASE_STUDY_NOT_ACCEPTED": 409,
+    "ERR_UPGRADE_ALLOCATION_REQUIRED": 409,
+    "ERR_ACTIVE_OFFTAKE_EXISTS": 409,
+    "ERR_PRICE_FLOOR_BREACH": 422,
+    "ERR_OFFTAKE_REQUIRED": 409,
+    "ERR_INTERCONNECTION_NOT_EXECUTED": 409,
+    "ERR_SUPPLY_AGREEMENT_NOT_EXECUTED": 409,
+    "ERR_SAFE_HARBOR_WINDOW_LAPSED": 422,
+    "ERR_SAFE_HARBOR_TEST_FAILED": 422,
+    "ERR_SAFE_HARBOR_NOT_QUALIFIED": 409,
+    "ERR_CONTINUITY_LAPSED": 409,
+    "ERR_CURE_WINDOW_EXPIRED": 422,
+    "ERR_CREDIT_DISQUALIFIED": 409,
+    "ERR_CONTRIBUTION_EXCEEDS_COMMITMENT": 422,
+    "ERR_DISTRIBUTION_EXCEEDS_CASH": 422,
+    "ERR_TARGET_IRR_NOT_ACHIEVED": 409,
+    "ERR_DSCR_BELOW_MINIMUM": 422,
+    "ERR_DRAW_EXCEEDS_COMMITMENT": 422,
+    "ERR_AVAILABILITY_MEASUREMENT_REQUIRED": 400,
+}
+
+
+def raise_err(error_id, message):
+    raise ApiError(error_id, ERROR_STATUS[error_id], message)

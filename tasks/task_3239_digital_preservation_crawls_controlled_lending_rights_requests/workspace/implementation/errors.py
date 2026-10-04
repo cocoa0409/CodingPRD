@@ -1,0 +1,51 @@
+"""Error types and the scaffold error catalog."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_UNAUTHORIZED = ("ERR_UNAUTHORIZED", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_VALIDATION = ("ERR_VALIDATION", 400)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_SO_DUTY_VIOLATION = ("ERR_SO_DUTY_VIOLATION", 403)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_PATRON_SUSPENDED = ("ERR_PATRON_SUSPENDED", 403)
+ERR_WORK_UNAVAILABLE = ("ERR_WORK_UNAVAILABLE", 409)
+ERR_ITEM_NOT_LENDABLE = ("ERR_ITEM_NOT_LENDABLE", 409)
+ERR_WAITLIST_PRIORITY = ("ERR_WAITLIST_PRIORITY", 409)
+ERR_WORK_ALREADY_BORROWED = ("ERR_WORK_ALREADY_BORROWED", 409)
+ERR_LOAN_CAP_REACHED = ("ERR_LOAN_CAP_REACHED", 409)
+ERR_ACCESS_CREDENTIAL_REQUIRED = ("ERR_ACCESS_CREDENTIAL_REQUIRED", 403)
+ERR_SCHEDULE_NOT_DUE = ("ERR_SCHEDULE_NOT_DUE", 409)
+ERR_CRAWL_EXCLUDED = ("ERR_CRAWL_EXCLUDED", 409)
+ERR_OFFER_EXPIRED = ("ERR_OFFER_EXPIRED", 409)
+ERR_LOAN_NOT_RENEWABLE = ("ERR_LOAN_NOT_RENEWABLE", 409)
+ERR_RENEWAL_WINDOW_EXCEEDED = ("ERR_RENEWAL_WINDOW_EXCEEDED", 409)
+ERR_GRANT_EXHAUSTED = ("ERR_GRANT_EXHAUSTED", 409)
+ERR_LIBRARY_HAS_ACTIVE_LOANS = ("ERR_LIBRARY_HAS_ACTIVE_LOANS", 409)
+ERR_DUPLICATE = ("ERR_DUPLICATE", 409)
+ERR_SEAL_EMPTY_BATCH = ("ERR_SEAL_EMPTY_BATCH", 409)
+
+
+def raise_err(spec, message):
+    error_id, status = spec
+    raise ApiError(error_id, status, message)
+
+
+def not_found(message="Resource not found"):
+    raise_err(ERR_NOT_FOUND, message)
+
+
+def validation(message):
+    raise_err(ERR_VALIDATION, message)
+
+
+def invalid_state(message):
+    raise_err(ERR_INVALID_STATE, message)

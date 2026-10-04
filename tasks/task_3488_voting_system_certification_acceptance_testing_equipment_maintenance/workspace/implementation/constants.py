@@ -1,0 +1,82 @@
+"""Every numeric/enum constant, each defined exactly once from its PRD value.
+
+Sources: PRD section 2 (global specs) and section 3 (business logic).
+"""
+
+# --- Logical clock (PRD 2.4): the boot instant 2026-09-01T00:00:00Z lives in
+# store.py as the module-fresh clock value (single definition).
+
+# --- Pagination (PRD 2.3) ---
+PAGE_LIMIT_DEFAULT = 10
+PAGE_LIMIT_MIN = 1
+PAGE_LIMIT_MAX = 100
+PAGE_OFFSET_DEFAULT = 0
+
+# --- Certificates (PRD 3.3) ---
+CERT_TTL_DAYS = 730
+
+# --- Campaign conformity scoring (PRD 3.2) ---
+SCREEN_CRITICAL_WEIGHT = 1200
+SCREEN_MAJOR_WEIGHT = 300
+SCREEN_MINOR_WEIGHT = 75
+SCREEN_RESUBMISSION_PENALTY = 250
+FINAL_CRITICAL_WEIGHT = 1500
+FINAL_MAJOR_WEIGHT = 250
+FINAL_MINOR_WEIGHT = 50
+FINAL_RESUBMISSION_PENALTY = 400
+FINAL_AGING_BP_PER_WEEK = 10
+CONFORMITY_PASS_BP = 8000
+BP_SCALE = 10000
+
+# --- Test laboratories (PRD 3.1) ---
+LAB_DEFAULT_MAX_CONCURRENT = 3
+LAB_MAX_CONCURRENT_MIN = 1
+LAB_MAX_CONCURRENT_MAX = 10
+
+# --- Acceptance testing (PRD 3.4) ---
+ACCEPTANCE_INDEX_CAP = 100
+ACCEPTANCE_INDEX_MAX = 20
+W_HARDWARE = (25, 8, 2)      # HARDWARE_DIAGNOSTIC
+W_CALIBRATION = (30, 10, 3)  # BALLOT_SCAN_CALIBRATION
+W_LOGIC = (40, 12, 4)        # LOGIC_VERIFICATION
+
+# --- Ballot printing (PRD 3.5) ---
+REAM_SHEETS = 500
+TIER1_MAX_REAMS = 100
+TIER1_PRICE_CENTS = 4200
+TIER2_MAX_REAMS = 500
+TIER2_PRICE_CENTS = 3900
+TIER3_PRICE_CENTS = 3500
+
+# --- Election calendar (PRD 3.5) ---
+ELECTION_MIN_LEAD_DAYS = 30
+ELECTION_FREEZE_DAYS = 14
+
+# --- Logic & accuracy (PRD 3.6) ---
+LA_DISCREPANCY_MAX_BP = 50
+
+# --- Equipment fleet (PRD 3.7) ---
+BATTERY_CYCLE_MAX = 500  # deploy requires strictly below; exactly 500 rejected
+STORAGE_TEMP_MIN_C = 10
+STORAGE_TEMP_MAX_C = 35
+STORAGE_HUMIDITY_MIN_PCT = 20
+STORAGE_HUMIDITY_MAX_PCT = 70
+
+# --- Paper / scanner compatibility (PRD 3.5, 3.8) ---
+PAPER_WEIGHT_MIN_GSM = 80
+PAPER_WEIGHT_MAX_GSM = 120
+PAPER_THICKNESS_MIN_MICRONS = 60
+PAPER_THICKNESS_MAX_MICRONS = 250
+
+# --- Software modification lead time (PRD 3.9) ---
+MOD_BASE_LEAD_DAYS = 30
+MOD_SCOPE_TOUCHING_ADD_DAYS = 60
+MOD_FEDERAL_CERT_ADD_DAYS = 45
+SCOPE_TOUCHING_COMPONENTS = {"TABULATION_FIRMWARE", "BALLOT_LAYOUT_ENGINE"}
+COMPONENT_CODES = {
+    "BALLOT_LAYOUT_ENGINE",
+    "TABULATION_FIRMWARE",
+    "ELECTION_MANAGEMENT_UI",
+    "AUDIT_LOG_SERVICE",
+    "SECURITY_MODULE",
+}

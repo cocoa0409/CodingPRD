@@ -1,0 +1,354 @@
+# Merchant Acquiring Closed Loop Network API — Product Requirements Document
+
+## 1. Introduction
+
+A closed-loop card network sits on both sides of every transaction: it issues the card, it signs the merchant, and it carries the authorization and the money between them. That single-actor position is the product's greatest commercial advantage and its greatest operational hazard, because there is no counterparty network to absorb a pricing mistake, a reserve miscalculation, or a dispute that lands on the wrong merchant's ledger. This document specifies the acquiring-program and network-economics surface of such a network — the program under which merchants are signed, priced, funded, risk-managed, and eventually either grown or exited.
+
+The commercial spine of the program is merchant acceptance. An outlet enters as a `PROSPECT`, is accepted into the program, becomes `ACTIVE`, and may later fall `DORMANT` when it stops transacting or be `SUPPRESSED` outright when its risk profile deteriorates. Pricing is set by industry classification and by month-to-date billed volume, with carve-outs for large merchants that negotiate a rate below their industry's baseline. Coverage expansion is driven by evidence rather than sales guesswork: where card members present a card and are declined because the merchant does not accept the network, the network records the attempt and rolls the evidence into regional, industry-scoped acceptance gaps that steer prospecting effort back into the same outlet.
+
+Two further business lines ride on the same rails. Card-member spend data is packaged into merchant-funded offers, but only behind a privacy gate that forbids exposing an individual member's spending and permits only an aggregated rollup once the merchant has consented. Premium card fees fund a value pool that pays member rewards and lounge access, and that pool is reconciled by an append-only ledger rather than by mutating a balance in place. Underneath all of it sits the funding machinery: settlement capture, funding-batch finalization, high-risk reserve withholding, and chargeback handling in a network that must adjudicate disputes against itself.
+
+This document defines the entities, states, calculations, validations, and endpoints that a conforming implementation must provide. Persistence is server-managed and the API is mounted under the `/network` prefix.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers, and both are mandatory: `X-User-ID` identifies the caller and `X-User-Role` names the capacity in which the caller is acting. A request that omits `X-User-Role`, presents a role name that is not one of the nine declared roles, or presents an entity-backed role without an `X-User-ID` is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). This check runs before every other consideration on every endpoint, including the read-only collection endpoints.
+
+Nine roles exist. The network's own operator roles are `NetworkAcquirer` (onboards merchants, sets industry pricing, records declined attempts, runs acceptance-gap rollups and sweep generations), `NetworkSettlementOps` (captures settlements, finalizes funding batches, reverses postings, reinstates settlements), `NetworkCompliance` (suppresses merchants and reads rolling risk state; deliberately a different officer from the one who onboards them), `NetworkDataSteward` (authors spend-insight offers, governs the offer privacy machine, administers redemption pools and payouts), `NetworkDisputeOps` (adjudicates disputes), `NetworkService` (runs the acceptance complaint desk), and `NetworkIssuer` (registers members, sets spend figures, assesses premium fees, funds the value ledger, and owns the logical test clock). The two external roles are `Merchant` and `CardMember`.
+
+The operator roles — `NetworkAcquirer`, `NetworkSettlementOps`, `NetworkCompliance`, `NetworkDataSteward`, `NetworkDisputeOps`, `NetworkService`, and `NetworkIssuer` — each have an opaque identity: `X-User-ID` for these roles is an operator identifier that is not tied to any persisted entity, and the server never compares it to any row's `id`. It may be recorded where a transition writes it, but no ownership comparison is performed. The two external roles are entity-backed. When `X-User-Role` is `Merchant`, `X-User-ID` is the `id` of the acting `Merchant`; ownership checks on any resource that references a merchant compare the resource's merchant foreign-key field to `X-User-ID`. When `X-User-Role` is `CardMember`, `X-User-ID` is the `id` of the acting `CardMember`, and ownership checks on any member-owned resource compare the resource's member foreign-key field to `X-User-ID`.
+
+Authorization is a segregation-of-duties model: the role that onboards a merchant is not the role that suppresses it, and the role that authors an offer is not the role that consents to it. Presenting an authenticated role that is not permitted for the operation is rejected with `ERR_FORBIDDEN` (HTTP 403). For the entity-backed roles, an additional ownership condition applies to three operations: a merchant may suppress only a record it owns, a merchant may respond only to a dispute it originated, and a merchant may consent only to an offer it funds. A merchant that authenticated successfully but is addressing a resource belonging to a different merchant receives `ERR_FORBIDDEN`, not a not-found error.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination Contract
+
+List endpoints accept `limit` and `offset`. The `limit` parameter defaults to 10, and any value supplied must fall between a minimum of 1 and a maximum of 100 inclusive; a value outside that band is a malformed request. The `offset` parameter defaults to 0. Both are query-string parameters, and both appear alongside `acceptance_status`, `industry_category_id`, `privacy_state`, `merchant_id`, `settlement_status`, `cardmember_id`, `offer_id`, `complaint_status`, `qualified_status`, `region_code`, `decline_reason`, `merchant_status`, `funder`, `entry_kind`, `source_statement_id`, `suppression_flag`, `original_merchant_id`, `final_merchant_id`, and `dispute_status` on the endpoints that offer filtering — a list endpoint that accepts filters accepts them in addition to, not instead of, the pagination pair.
+
+Collection results are ordered by `created_at` ascending unless an endpoint's specification pins a different deterministic order. Four pagination fields are surfaced in the `meta` object of a list response: `limit`, `offset`, `total_count`, and `has_more`. `total_count` counts the full filtered result set, not the page, and `has_more` is true exactly when `offset` plus the number of items returned is still below `total_count`. Single-resource endpoints and mutation endpoints omit the pagination quartet from `meta`.
+
+### 2.4. Closed-Loop Resource Identity and Common Properties
+
+Every resource the API creates is addressed by an `id`, and that `id` is a server-minted UUID carrying no type prefix or domain hint. Timestamps follow one shape throughout: `created_at` records the instant a row was minted and `updated_at` records the instant it was last mutated, both rendered as ISO 8601 UTC with three fractional digits. Each mutable row also carries a `version` integer that begins at zero and increases by exactly one on every accepted mutation, and that integer is the only currency the concurrency mechanism in §2.6 trades in.
+
+Time itself is server-owned. The network does not consult wall-clock time anywhere; it maintains a single logical clock whose value before any administrative call is exactly `2026-09-01T00:00:00Z`, and an issuer-side test-driving capability advances that clock to a supplied `current_utc` instant. Advancing the clock causes every deadline and window rule in §3 to re-evaluate against the new instant — this is what makes the response-deadline and trailing-window behaviours reproducible.
+
+Two entities are deliberately exempt from that shape. `DeclinedAttempt` and `SweepIndexStamp` are append-only evidence records — a decline that happened and a sweep generation that was stamped — and each carries only `id` and `created_at`. Neither has an `updated_at` and neither has a `version`, because neither is ever modified after creation; the exemption is a property of the record's kind rather than something inferred from a field being absent, so these rows never carry the two fields, and an implementation that returns those two fields on these rows is contradicting the contract.
+
+Every merchant-scoped and offer-scoped row exposes the identifiers a client needs to link it to its parent, and those identifiers are returned on the resource itself. A `Merchant` carries `industry_category_id`, and a `Settlement`, `Dispute`, `Offer`, `AcceptanceComplaint`, and `MerchantRiskState` each carry a `merchant_id`. A `OfferAcceptance` carries both `offer_id` and `cardmember_id`. A `ValueFundLedgerEntry` carries `source_statement_id`. A `Dispute` additionally carries `original_merchant_id` and `final_merchant_id` so the two-sided liability relationship is inspectable, and its `chargeback_count_reserved` counter records how many chargebacks are presently attributed to the originating merchant.
+
+### 2.5. Basis-Point Precision and the Mandated Rounding Discipline
+
+Money is carried in integer cents and rates are carried in integer basis points, so that no monetary or pricing quantity is ever a floating-point value. Where a rate is applied to an amount and the result is not a whole number of cents or points, the network rounds half up — a trailing half cent rounds away from zero — and it does so **once**, at the single point each rule designates. Intermediate quantities are never rounded.
+
+This matters most where a total could be assembled in two orders. On the settlement funding path the network sums first and rounds second: the discount for a funding batch is computed by summing the batch's gross volume, applying the resolved rate to that sum, and rounding the single resulting figure half up to a whole cent. Rounding each settlement's discount individually and then adding the rounded pieces is a different and forbidden procedure — it drifts from the mandated total by up to one cent for every line beyond the first in the batch. `EPSILON_CENTS` is one cent, and that is the scale of the divergence the rule exists to eliminate.
+
+Basis points are integers throughout. The merchant discount rate is resolved and stored as a whole number of basis points with no intermediate rounding, and the rate table's half-up rounding applies only at the one documented step per variant. The same single-rounding discipline governs the premium value-fund share and the offer redemption payout: each is computed as an exact product divided by ten thousand and then rounded once, half up, to a whole cent.
+
+### 2.6. Optimistic Concurrency Control on Cyclic Writes
+
+Two writes in the system sit on cyclic state machines where a client's view of a parent resource can legitimately be superseded by another writer, and those two writes are guarded by optimistic concurrency control. Both take an expected-version field; nothing else in the API does. Endpoints that are not named here do not accept a version field, and sending one to them is a malformed request.
+
+The first guarded write is merchant acceptance into the program. That request must carry `expected_merchant_version`, the client's last-observed `version` of the target `Merchant`. If the merchant's current `version` no longer matches — because another writer has already driven the outlet forward through the acceptance cycle, legitimately superseding the state the client believed it was acting on — the request is refused with `ERR_STALE_VERSION` and HTTP 412. This is a staleness test, not an ordering test: it refuses any write issued against a superseded observation of the merchant, whether or not another request happened to be in flight.
+
+The second guarded write is a merchant's consent to a spend-insight offer. That request must carry `expected_offer_version`, the client's last-observed `version` of the target `Offer`. When the offer's `version` has moved — because the data steward has advanced the offer's privacy state since the merchant last read it — the consent is refused with `ERR_STALE_VERSION` and HTTP 412, so a merchant can never consent to an offer whose terms it has not observed. Both guarded operations reject on the same error identifier and the same status code.
+
+### 2.7. Hierarchical Addressing and Cascade Integrity
+
+Paths nest left to right, and a request is resolved in that same order: the outermost identifier is validated before the innermost, and every path identifier is validated before any identifier carried in the request body. A merchant-scoped path whose `merchant_id` does not resolve to a `Merchant` fails with `ERR_MERCHANT_NOT_FOUND` (HTTP 404) before the body is even inspected; a body that then names a further resource which does not exist fails with `ERR_NOT_FOUND` (HTTP 404). The two codes are not interchangeable, and the addressable identifiers include `industry_category_id`, `merchant_id`, `offer_id`, `acceptance_id`, `cardmember_id`, `statement_id`, `settlement_id`, `batch_seq`, `dispute_id`, `complaint_id`, `gap_id`, `declined_attempt_id`, `pool_id`, `risk_state_id`, and `entry_id`.
+
+Mutations cascade, and the cascade list is part of the contract rather than an implementation detail. Every accepted mutation of a resource bumps that resource's `version` by one and refreshes its `updated_at`; where a mutation also touches a parent or a sibling collection, that second resource's `version` and `updated_at` move as well. Suppressing a merchant is the largest cascade in the system: it terminates every offer the merchant funds that is not already terminated, reverses the merchant's in-flight settlements, and stamps the merchant's own terminal state. A partial cascade — terminating the offers but leaving settlements in flight, or vice versa — is a contract violation.
+
+### 2.8. The Spend-Data Privacy Boundary
+
+Card-member spend data is the network's most sensitive commercial asset, and the privacy rule is absolute: no member-spend figure may be shared with a merchant before that merchant has moved the offer to `MERCHANT_CONSENT`. An attempt to expose member spend at an earlier privacy state is rejected with `ERR_PRIVACY_VIOLATION` (HTTP 403). The same error identifier covers an audience that fails the privacy quorum, which is `AUDIENCE_QUORUM` — a single-member audience is never disclosed as an individual spend figure, and an offer whose audience is too small to be a rollup cannot proceed to consent.
+
+What a merchant is permitted to see is `aggregated_spend_cents`, the summed qualifying spend across the whole audience, and `audience_size`, the headcount. An individual member's `trailing_lowest_month_spend_cents` and a member's identity are never exposed to a merchant under any privacy state. Conversely, the member's own record carries `member_name`, which is personal data the network never shares with merchants at all, and the member record is readable only by the issuer side and by the member whose `id` matches `X-User-ID`.
+
+### 2.9. Risk-Tier Reserve Policy
+
+Only categories classified at the highest risk tier are subject to reserve withholding. A merchant whose `IndustryCategory.risk_tier` is `HIGH` must hold a security reserve; a merchant whose category is `LOW` or `MEDIUM` holds none at all, and its `reserve_required_cents` is zero regardless of volume. The reserve floor is five per cent of trailing settled volume — `RESERVE_FLOOR_BPS` is 500 basis points — and the required figure is the larger of that floor and whatever the merchant has previously been required to hold, so `reserve_required_cents` ratchets upward and never falls except when a settlement reversal reduces the underlying settled volume. `reserve_held_cents` is the amount actually withheld to date, and it rises only by the amount of an unwithheld shortfall and only while the shortfall is strictly positive.
+
+### 2.10. Validation Precedence
+
+When more than one rule could reject a request, the rejection is determined by a fixed precedence order, and the order is part of the contract because it decides which error identifier a client sees. The ordering runs as follows.
+
+First, authentication: a missing or unknown `X-User-Role`, or a missing `X-User-ID` for an entity-backed role, yields `ERR_UNAUTHENTICATED` (401) on every endpoint without exception. Second, authorization and ownership: a role not permitted for the operation, or an entity-backed caller addressing another party's resource, yields `ERR_FORBIDDEN` (403). This second check guards merchant suppression, dispute response, and offer consent specifically. Third, existence: a missing merchant yields `ERR_MERCHANT_NOT_FOUND` (404) and a missing offer, statement, settlement, dispute, complaint, or acceptance yields `ERR_NOT_FOUND` (404), with path identifiers resolved left to right ahead of body identifiers.
+
+Fourth, a dispute resolution that redirects liability onto a merchant with no risk-state row yields `ERR_NO_RISK_STATE` (409). Fifth, consuming a redemption pool that does not exist or whose balance cannot cover the redemption yields `ERR_POOL_INSUFFICIENT_RESERVE` (402). Sixth, a privacy breach — member spend surfaced before `MERCHANT_CONSENT`, or an audience below the privacy quorum — yields `ERR_PRIVACY_VIOLATION` (403). Seventh, a merchant that has crossed the unresolved-chargeback-count ceiling `UNRESOLVED_CB_CEILING` or the chargeback-ratio ceiling yields `ERR_MERCHANT_RISK_SUPPRESSED` (409) on activation, suppression, and settlement capture. Eighth, a resource not in the state its transition requires yields `ERR_INVALID_STATE` (409). Ninth, a funding batch finalized at or below the merchant's highest already-finalized batch sequence yields `ERR_BATCH_SEQ_NOT_MONOTONE` (409). Tenth, upholding a complaint against a merchant already enrolled as `PROSPECT` yields `ERR_COMPLAINT_ALREADY_ENROLLED` (409). Eleventh, a live window that violates the one-day clearance buffer yields `ERR_TEMPORAL_OVERLAP` (409). Suppressing an already-suppressed merchant yields `ERR_SUPPRESS_ALREADY_TERMINAL` (409), responding to a dispute below the response amount minimum yields `ERR_RESPOND_AMOUNT_TOO_LOW` (403), a stale expected-version yields `ERR_STALE_VERSION` (412) at the point the concurrency check runs, and any malformed body, unknown field, missing required field, or enum or range violation yields `ERR_INVALID_REQUEST` (400).
+
+## 3. Business Logic & Workflows
+
+### 3.1. Merchant Onboarding, Industry Pricing and the Acceptance Cycle
+
+The network's pricing catalog begins with the industry. An operator creates an `IndustryCategory` with a unique `industry_code`, a human-readable `industry_name`, a `risk_tier` drawn from `LOW`, `MEDIUM`, or `HIGH`, and a `base_discount_rate_bps` that is the baseline merchant discount rate in basis points before any volume turning. A `high_risk_flag` marks a category that is statutorily high-risk for chargebacks and defaults to false. The `industry_code` is immutable once the category exists, because settlement history is keyed to it.
+
+A merchant is then enrolled against that category. Creation takes an `industry_category_id`, a `merchant_name` that must be unique across the merchant population, a `region_code` describing the coarse acceptance region the outlet trades in, and an `acquisition_channel` of either `DIRECT` — the closed-loop relationship the network owns end to end — or `THIRD_PARTY`, the simplified program administered by a third-party acquirer. A `channel_partner` naming that acquirer is required when and only when the channel is `THIRD_PARTY`, and is null otherwise. A `negotiated_rate_bps` may be supplied at creation for a large merchant that has agreed a rate below its industry baseline; because such a rate sits below the industry base, a merchant created with one opens in the `LOW` tier at once, while a merchant created without one opens in the activity band.
+
+Creation lands the outlet in `PROSPECT` with a `status_version` of 0, a `billed_volume_mtd_cents` of 0, a `rolling_90d_billed_volume_cents` of 0, and a `reserve_required_cents` of 0, and it mints a `MerchantRiskState` row for the merchant with a `rolling_chargeback_count` of 0. Pricing is stamped immediately: `volume_tier` opens at `ACTIVITY` — or `LOW` when a negotiated rate below the industry base was supplied — and `applied_discount_rate_bps` resolves to the negotiated rate when one was supplied and to the industry's `base_discount_rate_bps` otherwise.
+
+The merchant acceptance machine is cyclic rather than linear, and its shape is `PROSPECT` → `ACCEPTED` → `ACTIVE` → `DORMANT`, with `DORMANT` able to re-enter `PROSPECT` and `SUPPRESSED` as the terminal exit.
+
+Acceptance by an acquiring operator moves a `PROSPECT` outlet to `ACCEPTED`. Three preconditions hold: the merchant must currently be `PROSPECT`; a `DIRECT` merchant must not be carrying a raised `suppression_flag` on its risk-state row; and a `THIRD_PARTY` merchant must have a non-null `channel_partner`. On success the merchant's `applied_discount_rate_bps` is recomputed against its current `volume_tier`, `status_version` advances by one, and `version` rises by one. This is the transition that first lifts a merchant off `status_version` 0.
+
+Activation moves `ACCEPTED` to `ACTIVE` and requires that the merchant be `ACCEPTED` and that its `suppression_flag` be false; it recomputes `reserve_required_cents` through the reserve rule, advances `status_version` by one, and bumps `version`. Every acceptance-status activation — the `PROSPECT` → `ACCEPTED` step and the `ACCEPTED` → `ACTIVE` step, but not the deactivation steps — advances `status_version` by exactly one and by no more.
+
+A live merchant can be taken out of rotation without being exited from the program: marking an `ACTIVE` outlet `DORMANT` requires only that it currently be `ACTIVE`, moves `acceptance_status` to `DORMANT`, and bumps `version`.
+
+### 3.2. Declined-Attempt Evidence, the Sweep Generation and Coverage Expansion
+
+Coverage expansion begins with a failure at a terminal. A declined card attempt records a `card_product` from `GREEN`, `GOLD`, `PLATINUM`, or `CENTURION`, an `attempted_amount_cents` that must exceed zero, a `decline_reason` from `MERCHANT_NOT_ACCEPTED`, `INSUFFICIENT_CREDIT`, `FRAUD_SUSPECT`, or `EXPIRED_CARD`, and the instant it occurred as `occurred_at`. Only one of those reasons is evidence of a coverage hole, and only that one feeds the acceptance-gap engine: a `MERCHANT_NOT_ACCEPTED` decline counts toward a gap, while the other three reasons are recorded but never counted.
+
+Gaps are measured over a declared window. A rollup takes a `region_code`, an `industry_category_id`, a `window_start`, a `window_end`, and a `window_days` of 30, 60, or 90. The `window_start` is inclusive and the `window_end` is exclusive. Counting walks the declines whose reason is `MERCHANT_NOT_ACCEPTED` and whose originating merchant trades in the rolled-up region and industry and whose `occurred_at` falls inside the half-open window; `decline_count` is how many such attempts there were and `declined_volume_cents` is the sum of their `attempted_amount_cents`. The volume figure carries a floor: it may never fall below `decline_count` multiplied by `MIN_DECLINED_CENTS`, which is fifty cents, so a gap with a large count of trivially small declines still reports a meaningful exposure.
+
+The gap's `qualified_status` then follows from the count and from the threshold `ACCEPTANCE_GAP_DECLINE_MIN`, which is three. A count of three or more qualifies the gap as `PROSPECTING` — the threshold is inclusive, so exactly three qualifies. A count of one or two lands the gap at `BELOW_THRESHOLD`, and a count of zero lands it at `DORMANT`. A gap that has never been swept reports `sweep_index` as 0.
+
+Windowed gaps merge under type-dependent rules, which is what makes the rollup an interval-merge operation rather than an append. A thirty-day window folds into an existing window when the two overlap by at least a day — that is, when the new `window_start` precedes the existing `window_end` and the new `window_end` follows the existing `window_start`. A sixty-day window is stricter: it folds in only when the two are edge-adjacent exactly, meaning the new `window_start` equals the existing `window_end`. A ninety-day window is a standalone measurement and does not merge.
+
+The sweep generation is what reopens closed outlets. An operator stamps a `SweepIndexStamp` with an explicit monotone `sweep_index`, which must be unique, and a `rolled_at` instant; the sweep index is supplied rather than derived so that two sweeps with different indexes are reproducible. When a later rollup recalculates a gap, the gap's `sweep_index` is set to the latest stamped generation.
+
+Re-enrolment is the cycle-closing hop of the merchant machine, and it is automatic. When a `MERCHANT_NOT_ACCEPTED` decline is recorded against a merchant that is currently `DORMANT`, the outlet returns to `PROSPECT` if and only if three conditions hold together: an `AcceptanceGap` exists for the merchant's region and industry with a `qualified_status` of `PROSPECTING`; the latest stamped sweep generation's `sweep_index` equals the merchant's `status_version`; and the merchant is in `DORMANT`. When the two indexes agree, the outlet re-enters as `PROSPECT`, the acceptance-gap engine reports it as newly uncovered, and `version` moves by one. When no stamped generation matches the merchant's `status_version`, the outlet stays `DORMANT` and the declined attempt only increments the gap counters — this is the intended outcome, and it is why the mismatch between the two counters matters.
+
+Exiting the program is the compliance officer's call, and it is terminal. Suppression moves a merchant from `PROSPECT`, `ACCEPTED`, or `ACTIVE` into `SUPPRESSED`, with `version` advancing by one. Its cascade depends on the origin state, and the cascade is mandatory in every case: all offers the merchant funds whose `privacy_state` is one of `DRAFT`, `PRIVACY_REVIEW`, `MERCHANT_CONSENT`, or `LIVE` are moved to `TERMINATED`; and where the merchant was `ACTIVE`, all its settlements that are `CAPTURED` or `IN_FUNDING` are moved to `REVERSED`. An operator archive is a softer route to the same terminal state, taking only the state precondition and imposing no risk-ceiling test, but it applies the same offer and settlement cascade and leaves the merchant row readable. A suppression attempted against a merchant already `SUPPRESSED` is refused with `ERR_SUPPRESS_ALREADY_TERMINAL` (HTTP 409).
+
+### 3.3. Settlement Capture, the Funding Batch and the Reserve Sweep
+
+Funding is organized into batches, and the ordering of a batch is stamped at capture time rather than inferred from timestamps. Capturing a settlement takes a `settlement_cycle` that is at least 1 and unique per merchant, a `gross_volume_cents`, and a `refund_volume_cents`, both non-negative. The row lands in `CAPTURED` with `post_refund_volume_cents` equal to the gross volume less the refund volume, a provisional `discount_fee_cents` of the gross volume times the merchant's `applied_discount_rate_bps` divided by ten thousand and rounded half up once, and a provisional `net_funding_cents` of the post-refund volume less that discount. The settlement is also assigned the merchant's next `funding_batch_seq`, a monotone counter that increments by one from a starting value of 1 and is the **only** ordering quantity permitted in arithmetic. `created_at` is expressly forbidden in arithmetic, because the capture of two adjacent batches can straddle a day boundary and would reorder them under a timestamp comparison.
+
+Finalizing a batch is the transition that seals money. It touches every settlement in that batch, moving each from `CAPTURED` to `IN_FUNDING`, provided the settlement is `CAPTURED`, its `funding_batch_seq` equals the batch being finalized, and the merchant's `acceptance_status` is `ACTIVE` — funding is released only to a live merchant. On that transition the sealed `final_discount_fee_cents` is the gross volume times the historical discount rate in force at that batch sequence, divided by ten thousand and rounded half up once; `finalized_at_batch_seq` records the batch that sealed it; `final_reserve_withholding_cents` is zero unless the merchant's category risk tier is `HIGH`, in which case it is the amount withheld by the reserve sweep; and `net_funding_cents` becomes the post-refund volume less the final discount less the final withholding. The merchant's `rolling_90d_billed_volume_cents` absorbs the settlement's post-refund volume, `reserve_required_cents` is recomputed, and both the settlement's and the merchant's `version` advance.
+
+Settlement is a temporal machine with a deliberate lag, and its maturation hop is driven by the next batch. A settlement sitting `IN_FUNDING` is promoted to `SETTLED` automatically when a later batch's finalization finds a strictly smaller `funding_batch_seq` already in `IN_FUNDING` for the same merchant — a settlement is thus promoted only by the finalize of a strictly later batch ordinal, never by another settlement in its own batch. Finalization iterates the batch's settlements in ascending `funding_batch_seq` order so that a merchant's finalize order reproduces its chronological settlement order. Promotion adds the settlement's post-refund volume to `billed_volume_mtd_cents`, re-derives the merchant's `volume_tier`, and re-resolves `applied_discount_rate_bps`, bumping both versions.
+
+That re-derived tier is what makes pricing two-sided. A merchant's `volume_tier` is `ACTIVITY` while `billed_volume_mtd_cents` sits below `VOLUME_THRESHOLD_CENTS`, which is fifty thousand dollars; it becomes `FIXED` once the month-to-date figure reaches that threshold; and it is `LOW` when the merchant's negotiated rate sits below its industry base. The quoted rate follows the tier directly: an `ACTIVITY` merchant is quoted the industry `base_discount_rate_bps`; a `FIXED` merchant is quoted three quarters of that base, rounded half up to a whole basis point; and a `LOW` merchant is quoted its `negotiated_rate_bps`. The billed rate is not the quoted rate. At finalization the network recomputes the trailing volume against what actually settled and returns the volume-weighted average across the negotiated tiers — the sum, over each tier, of that tier's rate multiplied by the volume settled in the tier, divided by the total settled volume, rounded half up once. The two figures diverge whenever settled volume crosses a tier boundary, and the divergence is intended.
+
+The batch total is reconciled on the merchant as well. Each finalization writes `last_batch_discount_fee_cents` as the sum of the batch's gross volumes multiplied by the resolved rate and divided by ten thousand, rounded half up exactly once over the whole batch. This figure is deliberately not the sum of per-settlement rounded discounts; the two differ by up to one cent per settlement beyond the first, and the sum-then-round value is the mandated one.
+
+Reversals move money back. A settlement that has reached `SETTLED` can be returned to `IN_FUNDING` by a posting reversal, which subtracts its post-refund volume from `billed_volume_mtd_cents` and recomputes the merchant's `volume_tier` and rate. Leaving `SETTLED` clears the batch position but retains the sealed figures. A settlement that was `REVERSED` can be reinstated to `CAPTURED`, and reinstatement clears the sealed final discount, final withholding, and net funding back to zero. Suppression while a settlement is `CAPTURED` or `IN_FUNDING` reverses it outright, clearing the same three sealed figures.
+
+Two trailing-volume figures are maintained in parallel, and they measure different things. `rolling_90d_billed_volume_cents` is the provisional, merchant-facing figure: the sum of post-refund volume over the trailing ninety-day window, counting settlements that are `CAPTURED`, `IN_FUNDING`, or `SETTLED`, so it includes captured charges that have not yet settled and therefore over-states coverage. `rolling_90d_settled_volume_cents` is the final, reconciliation figure: the same ninety-day window but counting only `SETTLED` settlements. The window runs from the current logical clock back ninety days, inclusive at both ends — it opens ninety days before the clock and closes at the clock instant itself, so a settlement posted at that instant lies inside it — and reversed settlements are excluded from both.
+
+The reserve sweep runs during batch finalization for high-risk merchants. The shortfall is `reserve_required_cents` less `reserve_held_cents`, and withholding applies strictly while that shortfall is above zero. The amount withheld is the smaller of the shortfall and the settlement's post-refund volume less its final discount fee, and it is added to `reserve_held_cents`. Because the required figure itself ratchets — it is the larger of five per cent of trailing settled volume and its own previous value — the reserve is order-sensitive and can only grow until a settlement reversal shrinks the volume beneath it.
+
+### 3.4. Spend-Insight Offers: Privacy Gates, Audience Aggregation and Merchant Consent
+
+An offer is how merchant money is turned into member rewards, and it is authored behind a privacy gate. The data steward creates an `Offer` against a funding merchant, choosing an `audience_segment` from `HIGH_SPEND`, `MEDIUM_SPEND`, `LOW_SPEND`, or `ALL_CARDMEMBERS`, a `min_segment_spend_cents` that must be non-negative, and a `reward_bps` that must be non-negative. Creation lands the offer in `DRAFT` with `audience_size` and `aggregated_spend_cents` both zero.
+
+The offer privacy machine is cyclic and reads `DRAFT` → `PRIVACY_REVIEW` → `MERCHANT_CONSENT` → `LIVE`, with `MERCHANT_CONSENT` able to fall back to `PRIVACY_REVIEW` and `PRIVACY_REVIEW` able to fall back to `DRAFT`.
+
+Submitting an offer for review moves `DRAFT` to `PRIVACY_REVIEW` and is the moment the audience is computed. The audience is the set of card members whose `member_status` is `ACTIVE` and whose `trailing_lowest_month_spend_cents` is at least the offer's `min_segment_spend_cents` — members that are `PENDING`, `DELINQUENT`, or `CLOSED` are excluded. `audience_size` is the headcount of that set and `aggregated_spend_cents` is the sum of those members' trailing lowest-month spend. The audience is a set, so both figures are order-invariant; where an ordering is used for reporting it pins trailing spend descending and `created_at` ascending, and it never orders by `id`. Only the aggregated rollup is ever exposed to a merchant, and a single-member audience is never surfaced as an individual spend figure — `AUDIENCE_QUORUM` is the floor that enforces this.
+
+Requesting consent moves `PRIVACY_REVIEW` to `MERCHANT_CONSENT`, and it is gated on the audience: the offer's `audience_size` must be at least `OFFER_AUDIENCE_MIN`. A request that would carry an audience below the privacy quorum is refused with `ERR_PRIVACY_VIOLATION` (HTTP 403), as is any attempt to surface member spend before the offer has reached `MERCHANT_CONSENT`.
+
+Consent is the merchant's act, and it is the only offer transition a merchant may drive. It moves `MERCHANT_CONSENT` to `LIVE` and it carries four preconditions beyond the state itself: the caller's `X-User-ID` must equal the offer's merchant, so a merchant cannot consent to an offer it does not fund; the funding merchant's `acceptance_status` must be `ACTIVE`, because a merchant that is not live on the network cannot launch a spend-insight offer; the request's `expected_offer_version`, when supplied, must equal the offer's current `version`, or the write is refused with `ERR_STALE_VERSION` (HTTP 412); and the requested window, supplied as `live_start_utc` and `live_end_utc`, must leave at least one full day of clearance from every existing live window funded by the same merchant. A window is refused with `ERR_TEMPORAL_OVERLAP` (HTTP 409) when it overlaps another, or when its `live_start_utc` precedes the existing window's `live_end_utc` plus one day and the existing window's `live_start_utc` is at or before the requested `live_end_utc` plus one day; a window that opens exactly one day after an existing window's exclusive end is permitted. The `live_start_utc` bound is inclusive and the `live_end_utc` bound is exclusive. On success both bounds are recorded from the request and `version` moves by one.
+
+Three further transitions round out the machine. Returning an offer from `PRIVACY_REVIEW` to `DRAFT` is permitted only when no member-spend data has been shared with the merchant, and it resets `audience_size` and `aggregated_spend_cents` to zero. Suspending a `LIVE` offer returns it to `MERCHANT_CONSENT`; acceptances already recorded stay `PENDING`, but no new acceptance may be recorded while the offer is suspended. And an offer reaches `TERMINATED` only as the downstream consequence of its funding merchant being suppressed or archived.
+
+### 3.5. Offer Redemption Pools, Member Payouts and the Reversal Backing
+
+Every offer's reward money is drawn from a funded pool rather than paid from an implicit budget. The steward opens an `OfferRedemptionPool` against an offer with a `funder` of either `MERCHANT` or `NETWORK` and an `initial_funded_cents` that must be non-negative; the pool's `balance_cents` opens at that figure, and `topup_total_cents` and `consumed_total_cents` both open at zero. A top-up adds its `amount_cents` to `balance_cents` and to `topup_total_cents` in the same step. Each offer has at most one pool.
+
+A card member accepts a live offer by supplying their own `cardmember_id` and a `trigger_amount_cents`. The acceptance lands in `PENDING` with `trigger_amount_cents` pinned from the member's trailing lowest-month spend at that instant and `reward_amount_cents` set to the approved backing — the trigger amount multiplied by the offer's `reward_bps`, divided by ten thousand, rounded half up once. The offer's `accepted_count` rises by one. No pool money moves at acceptance: acceptance alone is a recorded intent, and a `PENDING` acceptance contributes nothing to the pool.
+
+Approval is what draws on the pool, and it is the pool's insufficiency that can stop it. Moving a `PENDING` acceptance to `APPROVED` adds its reward to the offer's `consumed_total_cents` and subtracts the same amount from `balance_cents`. Because that draw is the load-bearing funded quantity, an approval that would consume a pool which does not exist, or whose `balance_cents` cannot cover the approved backing, is refused with `ERR_POOL_INSUFFICIENT_RESERVE` (HTTP 402). A `PENDING` acceptance may also be paid through to `PAID` once approved, and a redemption in either `APPROVED` or `PAID` may be reversed.
+
+Reversal must restore exactly what was funded, which is why it credits back the acceptance's own frozen backing — the `reward_amount_cents` the approval drew from the pool — rather than re-deriving a figure. Where that frozen backing is unavailable, the reversed amount falls back to the acceptance's pinned `trigger_amount_cents` multiplied by a provisional reward rate that is the offer's `reward_bps` halved with any fraction discarded — `PROVISIONAL_DIVISOR` is two — divided by ten thousand and rounded half up. Reversing moves the acceptance to `REVERSED`, subtracts that reversed backing from `consumed_total_cents`, and adds it back to `balance_cents`, so a matched approve-and-reverse pair returns the pool to the balance it held before the approval.
+
+### 3.6. Card-Member Premium Value: Registration, Fees, Rewards and Lounge Access
+
+The member record is the issuer's, and it begins in `PENDING`. Registration takes a `member_name` and a `card_product` of `GREEN`, `GOLD`, `PLATINUM`, or `CENTURION`; the row opens with `annual_fee_cents` set from the card product, `reward_points_balance` at zero, and `lounge_access_tier` at `NONE`.
+
+Activation moves `PENDING` to `ACTIVE` and does two things at once: it adds the product's membership reward points to `reward_points_balance`, and it derives `lounge_access_tier` from the card product together with the member's trailing spend, which may resolve to `STANDARD` or `UNLIMITED`. A member's trailing spend is set explicitly by the issuer through `trailing_lowest_month_spend_cents`, which is the member's lowest calendar-month spend over their trailing three months and which drives both lounge tiering and offer-audience qualification. Marking a member `DELINQUENT` from `ACTIVE` forces `lounge_access_tier` back to `NONE` for the duration. Only a `DELINQUENT` member may be closed, moving to the terminal `CLOSED` state.
+
+Premium fees fund the value pool through an append-only ledger, and the ledger — not the statement — is the source of truth. An `AnnualFeeStatement` is created for a member with a `statement_year` no earlier than 2026, a `principal_fee_cents`, an `authorised_user_count`, and a `per_user_fee_cents`, all of the monetary figures non-negative. The row opens in `DRAFT` with `gross_fee_assessed_cents` and `value_fund_allocation_cents` both zero, and `statement_status` then advances through `ASSESSED` to either `DISBURSED` or the terminal `VOIDED`.
+
+Assessment moves `DRAFT` to `ASSESSED` and computes the gross fee as the principal fee plus the authorised-user count multiplied by the per-user fee. It then takes the assessed allocation of the value fund, which applies the configured share — `VALUE_FUND_SHARE_BPS` is 4000 basis points, two fifths — to that full gross fee, rounded half up once to a whole cent. The allocated portion of `VALUE_FUND_SHARE_BPS` covers the whole assessed quantity including the principal portion.
+
+Disbursement is where the two figures diverge, and the divergence is deliberate. Moving `ASSESSED` to `DISBURSED` writes a `ValueFundLedgerEntry` of kind `FEE_ALLOCATION`, increases the value fund, and funds the member's `reward_points_balance` from it. The amount allocated on disbursement is **not** the assessed allocation: it applies the same two-fifths share to the per-authorised-user portion only, ignoring the principal fee entirely — the count of authorised users multiplied by the per-user fee times two fifths, rounded half up once — because the network retains the principal fee as its own revenue. The two variants therefore differ by exactly the principal fee times two fifths, rounded half up once.
+
+Voiding moves an assessed statement to the terminal `VOIDED` state and writes a `ValueFundLedgerEntry` of kind `FEE_ALLOCATION_REVERSAL` of equal magnitude to the entry the statement would have produced, decreasing the value fund by the same amount. The ledger's `entry_kind` is therefore one of `FEE_ALLOCATION`, `FEE_ALLOCATION_REVERSAL`, or `LOUNGE_PASS_GRANT`; the `amount_cents` it carries is signed, positive for an allocation, negative for a reversal, and zero for a lounge-pass grant. A lounge pass granted to a member writes an entry of kind `LOUNGE_PASS_GRANT` for the `pass_count` supplied — one entry per grant request rather than one per pass — and leaves the tier to be recomputed from the member's product and spend. Allocations exist only for statements that reached `ASSESSED`, so statements left in `DRAFT` contribute nothing to the fund and a `VOIDED` statement contributes its reversal rather than its allocation. Each ledger entry carries a monotone `created_seq` that is the deterministic replay order tie-break — the ordering never falls back to `id`. Passes are priced at `LOUNGE_PASS_COST_CENTS`, which is thirty-five dollars.
+
+### 3.7. Dispute Lifecycle in a Network That Holds Both Sides
+
+A dispute opens with a member naming the disputed `amount_cents`, which must exceed zero, together with a `cardmember_id`, an `original_merchant_id` for the outlet that processed the transaction, and a `final_merchant_id` for the outlet that will carry the chargeback at resolution — the two may be the same merchant or may differ. The row opens in `OPEN` with `representment_stage` at `NONE`, and its `priority` is set at creation and never changes thereafter: `HIGH` when the amount is at least fifty thousand cents, and `STANDARD` otherwise. Opening a dispute also raises the originating merchant's `unresolved_chargeback_count` by one on its risk-state row.
+
+The dispute machine branches from `OPEN` in three directions. The first is merchant response, moving `OPEN` to `MERCHANT_RESPONDED`; the responding merchant's `X-User-ID` must equal the dispute's `original_merchant_id`, so only the merchant that processed the transaction may respond to it, and the dispute's `amount_cents` must be at least fifty thousand cents. A response attempted on a dispute below that amount is refused with `ERR_RESPOND_AMOUNT_TOO_LOW` (HTTP 403), which is why only `HIGH`-priority disputes can be contested on the merits. The second is automatic acceptance: when the logical clock reaches the dispute's `occurred_at` plus `RESPONSE_WINDOW_DAYS`, an unanswered `OPEN` dispute moves to `AUTO_ACCEPTED` on its own, with no operator action. The third is withdrawal, moving `OPEN` to the terminal `WITHDRAWN`; only the member whose `id` matches the dispute's `cardmember_id` may withdraw it, and a withdrawal transfers no liability and accrues no risk.
+
+Adjudication is the dispute operator's act, and it runs on the responded and auto-accepted branches. The operator supplies an `outcome` naming which way the resolution falls; the same adjudication capability serves both branches, and the branch a dispute sits on determines which outcomes are reachable. Resolving a `MERCHANT_RESPONDED` dispute in the merchant's favour moves it to the terminal `WON`. A resolution reached on the merchant-favour outcome while also granting the member a credit is a distinct outcome — `MERCHANT_WIN_CARDMEMBER_CREDIT`, the counterpart of the against-merchant apology credit `LOST_WITH_MEMBER_CREDIT`: it also lands the terminal `WON`, and it credits the member the resolution points alone, with no merchant share deducted. The merchant-favour resolution is the liability-redirecting outcome: liability moves from the `original_merchant_id` to the `final_merchant_id`, the originating merchant's rolling chargeback count on both the acquirer liability ledger and its `MerchantRiskState` falls by one while the final merchant's rises by one, both merchants' `rolling_dispute_amount_cents` move by the dispute's amount, and the originating merchant's `unresolved_chargeback_count` falls by one because the dispute is no longer open. If the adjudication instead grants the member an apology credit, the member's `reward_points_balance` rises by one point for each whole dollar of the disputed amount — one point per dollar, with any remainder discarded. A resolution that would redirect liability onto a merchant with no `MerchantRiskState` row is refused with `ERR_NO_RISK_STATE` (HTTP 409).
+
+The points awarded on a resolution follow a pinned evaluation order, and the order is the contract. First, the dispute resolution points are the resolved amount divided by one hundred and rounded half up — one point per dollar. Second, the merchant share is the resolved amount multiplied by `MERCHANT_SHARE_BPS`, which is two fifths, divided by ten thousand and rounded half up, when the dispute was adjudicated against the merchant, and is zero otherwise. Third, the net points are the resolution points less the merchant share. Fourth, the member's balance is credited with the net points but never with a negative figure — `MIN_POINTS_FLOOR` is zero, so a net result below zero credits nothing. The rounding is applied to the gross resolution first and to the merchant share second; rounding the net directly — applying the complement of the share to the amount and rounding once — is the forbidden order and drifts by a point for amounts such as 60050 cents.
+
+Resolution against the merchant on the `MERCHANT_RESPONDED` branch produces the terminal `LOST` state and drives the representment axis, which exists precisely because the network is both issuer and acquirer. `representment_stage` is a separate axis from `dispute_status`, and it runs `NONE` → `FIRST_ROUND` → `CLOSED`. A `LOST` dispute whose stage is `NONE` advances to `FIRST_ROUND` and the network opens a re-presentment round against the merchant; a `LOST` dispute already at `FIRST_ROUND` advances to `CLOSED`. A dispute resolved `LOST` from the `AUTO_ACCEPTED` branch takes the same first hop: a `NONE` stage advances to `FIRST_ROUND`. Every `LOST` outcome also raises the final merchant's rolling chargeback count by one and lowers its `unresolved_chargeback_count` by one. Whether the loss came from a merchant response or from an unanswered auto-acceptance, the dispute's `network_settled_cents` accumulator decreases by the disputed amount.
+
+That accumulator is the closed-loop invariant. `network_settled_cents` tracks the amount the network has resolved out of the round, and it must return to zero when a round is opened and closed against the same merchant — an implementation whose accumulator drifts after a matched open-and-close has broken the invariant. The `chargeback_count_reserved` counter is the companion bookkeeping: it holds the chargebacks attributed to the originating merchant and is reseated onto the final merchant when a resolution moves the liability across.
+
+The rolling risk picture is assembled per merchant, exactly one row per merchant, and its counts are derived rather than stored opinions. `rolling_chargeback_count` counts the disputes attributed to the merchant — those whose `chargeback_count_reserved` is 1 and whose merchant of record is this merchant, where the merchant of record is the `final_merchant_id` when the dispute is `WON` and the `original_merchant_id` otherwise. `rolling_dispute_amount_cents` sums the disputed amounts attributed the same way. `unresolved_chargeback_count` counts the disputes still `OPEN` or `MERCHANT_RESPONDED` attributed to the merchant. And `suppression_flag` turns true when the merchant crosses either the unresolved-chargeback-count ceiling `UNRESOLVED_CB_CEILING` or the unfavourable chargeback ratio.
+
+### 3.8. Acceptance Complaints and the Suppression Feedback Loop
+
+The complaint desk is where a member's account of a bad acceptance experience becomes program evidence. A complaint is filed against a `merchant_id` by a `cardmember_id` with a `complaint_type` of `MERCHANT_NOT_ACCEPTED`, `STAFF_ATTITUDE`, `TERMINAL_TECHNICAL`, or `PRICING_SURCHARGE`, and it opens in `FILED`. Filing is open both to a card member and to the service desk.
+
+Taking the complaint up moves it from `FILED` to `UNDER_REVIEW`, and from there the desk has three ways forward. Upholding moves a complaint in `UNDER_REVIEW` to the terminal `UPHELD` state: it flags the merchant's acceptance record and opens a fresh acceptance gap keyed on the merchant's region and industry category with a thirty-day window width, through the same gap engine that consumes declined attempts — and the covered dormant merchant, if any, re-enters the prospecting state through that gap. Upholding a complaint against a merchant that is already `PROSPECT` is refused with `ERR_COMPLAINT_ALREADY_ENROLLED` (HTTP 409), because the merchant is already enrolled and the upheld complaint would double-count it. Dismissing moves a complaint in `UNDER_REVIEW` to the terminal `DISMISSED` state and records nothing further. Reopening returns the complaint from `UNDER_REVIEW` to `FILED`, so the desk can re-take it later.
+
+The complaint path is part of the network's risk feedback loop rather than a standalone service record. An upheld complaint feeds the same regional and industry gap that declined attempts feed, which means a merchant can be drawn back into prospecting either by evidence of declined transactions or by a member's upheld account of not being accepted — and the same suppression machinery in §3.7 then decides whether a merchant with a deteriorated chargeback record is allowed to be activated or suppressed at all. That is the closed loop the network's economics rest on: acceptance, coverage evidence, funding, disputes, and complaints all read and write the same merchant's risk state.
+
+## 4. Endpoint Definitions
+
+A successful request that creates a new resource returns HTTP 201 with the created resource in `data`; a successful request that modifies an existing resource, or that reads one, returns HTTP 200. Error responses use the codes catalogued in §5 and the envelope of §2.2. Path identifiers resolve left to right, and every endpoint requires the `X-User-ID` and `X-User-Role` headers described in §2.1. The table below lists the endpoint surface — method, path, purpose, and the roles permitted to call it. Request bodies, response shapes, state preconditions, and side effects are defined in §2 and §3 and are deliberately not repeated here.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/network/_clock/set_current_utc` | Advance the logical clock to a supplied instant | NetworkIssuer |
+| POST | `/network/industry-categories` | Create an industry category with its baseline discount rate and risk tier | NetworkAcquirer |
+| GET | `/network/industry-categories/{industry_category_id}` | Retrieve one industry category | NetworkAcquirer |
+| GET | `/network/industry-categories` | List industry categories | NetworkAcquirer |
+| POST | `/network/_sweep-index/stamp` | Stamp the next rollup sweep generation | NetworkAcquirer |
+| GET | `/network/sweep-index-stamps` | List sweep generation stamps | NetworkAcquirer |
+| POST | `/network/merchants` | Create a merchant, starting in the prospecting state | NetworkAcquirer |
+| GET | `/network/merchants/{merchant_id}` | Retrieve one merchant | NetworkAcquirer, NetworkCompliance, Merchant |
+| GET | `/network/merchants` | List merchants, filterable by acceptance status or industry | NetworkAcquirer, NetworkCompliance |
+| POST | `/network/merchants/{merchant_id}/accept` | Accept a prospecting merchant into the program | NetworkAcquirer |
+| POST | `/network/merchants/{merchant_id}/activate` | Activate an accepted merchant | NetworkAcquirer |
+| POST | `/network/merchants/{merchant_id}/mark-dormant` | Move an active merchant to dormant | NetworkAcquirer |
+| POST | `/network/merchants/{merchant_id}/suppress` | Suppress a merchant into the terminal state, with the full cascade | NetworkCompliance |
+| DELETE | `/network/merchants/{merchant_id}` | Operator archive: move a merchant to the terminal suppressed state | NetworkCompliance |
+| POST | `/network/merchants/{merchant_id}/declined-attempts` | Record a declined card attempt at a merchant | NetworkAcquirer |
+| GET | `/network/merchants/{merchant_id}/declined-attempts` | List declined attempts for a merchant | NetworkAcquirer |
+| GET | `/network/merchants/{merchant_id}/acceptance-gaps` | List acceptance gaps for a merchant | NetworkAcquirer |
+| POST | `/network/acceptance-gaps/rollup` | Roll up acceptance gaps for a region and industry over a window | NetworkAcquirer |
+| GET | `/network/acceptance-gaps` | List acceptance gaps, filterable by region or industry | NetworkAcquirer |
+| GET | `/network/acceptance-gaps/{gap_id}` | Retrieve one acceptance gap | NetworkAcquirer |
+| POST | `/network/offers` | Create a spend-insight offer, starting in draft | NetworkDataSteward |
+| GET | `/network/offers/{offer_id}` | Retrieve one offer | NetworkDataSteward, Merchant |
+| GET | `/network/offers` | List offers | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/submit-review` | Submit an offer for privacy review and compute its audience | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/request-consent` | Request merchant consent for a reviewed offer | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/consent` | Merchant consent to an offer, moving it live | Merchant |
+| POST | `/network/offers/{offer_id}/return-to-draft` | Return an offer to draft | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/suspend` | Suspend a live offer | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/accept` | Card member accepts a live offer | CardMember |
+| GET | `/network/offers/{offer_id}/acceptances` | List acceptances for an offer | NetworkDataSteward, Merchant |
+| GET | `/network/offer-acceptances/{acceptance_id}` | Retrieve one offer acceptance | NetworkDataSteward, CardMember |
+| GET | `/network/offer-acceptances` | List offer acceptances, filterable by member or offer | NetworkDataSteward, CardMember |
+| POST | `/network/offer-acceptances/{acceptance_id}/approve` | Approve a pending redemption and draw on the pool | NetworkDataSteward |
+| POST | `/network/offer-acceptances/{acceptance_id}/pay` | Pay an approved redemption | NetworkDataSteward |
+| POST | `/network/offer-acceptances/{acceptance_id}/reverse` | Reverse an approved or paid redemption | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/redemption-pool` | Create the funded redemption pool for an offer | NetworkDataSteward |
+| POST | `/network/offers/{offer_id}/redemption-pool/topup` | Top up an offer's funded redemption pool | NetworkDataSteward |
+| GET | `/network/offers/{offer_id}/redemption-pool` | Retrieve an offer's redemption pool | NetworkDataSteward, Merchant |
+| POST | `/network/cardmembers` | Register a card member, starting in the pending state | NetworkIssuer |
+| GET | `/network/cardmembers/{cardmember_id}` | Retrieve one card member | NetworkIssuer, CardMember |
+| GET | `/network/cardmembers` | List card members | NetworkIssuer |
+| POST | `/network/cardmembers/{cardmember_id}/activate` | Activate a card member and derive reward and lounge entitlements | NetworkIssuer |
+| POST | `/network/cardmembers/{cardmember_id}/set-monthly-spend` | Set the member's trailing lowest calendar-month spend | NetworkIssuer |
+| POST | `/network/cardmembers/{cardmember_id}/grant-lounge-access` | Grant lounge passes to a member | NetworkIssuer |
+| POST | `/network/cardmembers/{cardmember_id}/mark-delinquent` | Mark an active member delinquent | NetworkIssuer |
+| POST | `/network/cardmembers/{cardmember_id}/close` | Close a delinquent member | NetworkIssuer |
+| POST | `/network/annual-fee-statements` | Create an annual fee statement, starting in draft | NetworkIssuer |
+| GET | `/network/annual-fee-statements/{statement_id}` | Retrieve one annual fee statement | NetworkIssuer |
+| GET | `/network/annual-fee-statements` | List annual fee statements, filterable by member | NetworkIssuer |
+| POST | `/network/annual-fee-statements/{statement_id}/assess` | Assess the premium fee and compute the assessed allocation | NetworkIssuer |
+| POST | `/network/annual-fee-statements/{statement_id}/disburse` | Disburse the value-fund share into the ledger | NetworkIssuer |
+| POST | `/network/annual-fee-statements/{statement_id}/void` | Void an assessed statement and reverse its allocation | NetworkIssuer |
+| GET | `/network/value-fund/ledger` | List value-fund ledger entries in deterministic order | NetworkIssuer |
+| POST | `/network/merchants/{merchant_id}/settlements` | Capture a settlement and assign the next funding batch sequence | NetworkSettlementOps |
+| GET | `/network/merchants/{merchant_id}/settlements` | List settlements for a merchant | NetworkSettlementOps, Merchant |
+| GET | `/network/settlements/{settlement_id}` | Retrieve one settlement | NetworkSettlementOps, Merchant |
+| POST | `/network/merchants/{merchant_id}/funding/batches/{batch_seq}/finalize` | Finalize a funding batch, seal final figures and release funding | NetworkSettlementOps |
+| POST | `/network/settlements/{settlement_id}/posting-reversal` | Reverse a settled posting | NetworkSettlementOps |
+| POST | `/network/settlements/{settlement_id}/reinstate` | Reinstate a reversed settlement | NetworkSettlementOps |
+| POST | `/network/disputes` | Open a dispute, with priority derived from the amount | CardMember |
+| GET | `/network/disputes/{dispute_id}` | Retrieve one dispute | NetworkDisputeOps, CardMember, Merchant |
+| GET | `/network/disputes` | List disputes, filterable by originating merchant, final merchant or member | NetworkDisputeOps, Merchant |
+| POST | `/network/disputes/{dispute_id}/respond` | Merchant responds to a dispute it originated | Merchant |
+| POST | `/network/disputes/{dispute_id}/resolve` | Adjudicate a responded or auto-accepted dispute | NetworkDisputeOps |
+| POST | `/network/disputes/{dispute_id}/withdraw` | Card member withdraws an open dispute | CardMember |
+| POST | `/network/complaints` | File an acceptance complaint | CardMember, NetworkService |
+| GET | `/network/complaints/{complaint_id}` | Retrieve one acceptance complaint | NetworkService |
+| GET | `/network/complaints` | List acceptance complaints, filterable by merchant or member | NetworkService |
+| POST | `/network/complaints/{complaint_id}/take-up` | Take a filed complaint under review | NetworkService |
+| POST | `/network/complaints/{complaint_id}/uphold` | Uphold a complaint and open an acceptance gap | NetworkService |
+| POST | `/network/complaints/{complaint_id}/dismiss` | Dismiss a complaint | NetworkService |
+| POST | `/network/complaints/{complaint_id}/reopen` | Reopen a complaint under review | NetworkService |
+| GET | `/network/declined-attempts` | List declined card attempts, filterable by merchant | NetworkAcquirer |
+| GET | `/network/declined-attempts/{declined_attempt_id}` | Retrieve one declined card attempt | NetworkAcquirer |
+| GET | `/network/settlements` | List settlements, filterable by merchant | NetworkSettlementOps, Merchant |
+| GET | `/network/redemption-pools/{pool_id}` | Retrieve one offer redemption pool | NetworkDataSteward, Merchant |
+| GET | `/network/redemption-pools` | List offer redemption pools, filterable by offer | NetworkDataSteward, Merchant |
+| GET | `/network/merchant-risk-states/{risk_state_id}` | Retrieve one merchant risk-state row | NetworkCompliance, NetworkAcquirer |
+| GET | `/network/merchant-risk-states` | List merchant risk-state rows, filterable by merchant | NetworkCompliance, NetworkAcquirer |
+| GET | `/network/merchants/{merchant_id}/risk-state` | Retrieve the rolling risk state for a merchant | NetworkCompliance, NetworkAcquirer |
+| GET | `/network/value-fund-ledger-entries/{entry_id}` | Retrieve one value-fund ledger entry | NetworkIssuer |
+| GET | `/network/value-fund-ledger-entries` | List value-fund ledger entries, filterable by source statement | NetworkIssuer |
+
+## 5. Error Code Catalogue
+
+The identifiers below are the complete set of machine-readable error codes the API returns. Each is carried in the `error_id` field of the standard error envelope. The conditions that trigger them are specified in §2 and §3 next to the rule each guards.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN` | 403 |
+| `ERR_RESPOND_AMOUNT_TOO_LOW` | 403 |
+| `ERR_NOT_FOUND` | 404 |
+| `ERR_MERCHANT_NOT_FOUND` | 404 |
+| `ERR_NO_RISK_STATE` | 409 |
+| `ERR_POOL_INSUFFICIENT_RESERVE` | 402 |
+| `ERR_PRIVACY_VIOLATION` | 403 |
+| `ERR_MERCHANT_RISK_SUPPRESSED` | 409 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_SUPPRESS_ALREADY_TERMINAL` | 409 |
+| `ERR_BATCH_SEQ_NOT_MONOTONE` | 409 |
+| `ERR_COMPLAINT_ALREADY_ENROLLED` | 409 |
+| `ERR_TEMPORAL_OVERLAP` | 409 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_INVALID_REQUEST` | 400 |

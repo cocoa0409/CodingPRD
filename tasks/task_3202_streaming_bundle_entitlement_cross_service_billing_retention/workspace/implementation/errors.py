@@ -1,0 +1,47 @@
+"""Error types and the full error catalog."""
+
+HTTP_BY_ERROR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_NOT_OWNER": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_REFERENCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ACCOUNT_NOT_ACTIVE": 409,
+    "ERR_ACCOUNT_CLOSED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_DUPLICATE_PROFILE": 409,
+    "ERR_DUPLICATE_WATCHLIST_ITEM": 409,
+    "ERR_DUPLICATE_ACTIVE_SUBSCRIPTION": 409,
+    "ERR_DUPLICATE_BILLING_ACCOUNT": 409,
+    "ERR_MATURITY_RATING_EXCEEDED": 422,
+    "ERR_INVALID_PLAN_SHAPE": 422,
+    "ERR_INVALID_PRICING": 422,
+    "ERR_BILLER_PLAN_NOT_ALLOWED": 422,
+    "ERR_BILLER_UPGRADE_PATH_BLOCKED": 422,
+    "ERR_IMMEDIATE_CANCEL_NOT_ALLOWED": 422,
+    "ERR_MIGRATION_SHAPE": 422,
+    "ERR_MIGRATION_WINDOW_CLOSED": 422,
+    "ERR_MIGRATION_SOURCE_NOT_ACTIVE": 409,
+    "ERR_RETENTION_NOT_ELIGIBLE": 422,
+    "ERR_GRACE_WINDOW_CLOSED": 422,
+    "ERR_ACTIVE_SUBSCRIPTIONS_REMAIN": 409,
+    "ERR_PROFILE_HAS_ACTIVE_ENTITLEMENTS": 409,
+    "ERR_CLOCK_REGRESSION": 422,
+    "ERR_RENEWAL_NOT_DUE": 422,
+    "ERR_DUPLICATE_EMAIL": 409,
+    "ERR_PLAN_LEGACY_ONLY": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = HTTP_BY_ERROR[error_id]
+        self.message = message or error_id
+        super().__init__(self.message)
+
+
+def err(error_id, message=None):
+    raise ApiError(error_id, message)

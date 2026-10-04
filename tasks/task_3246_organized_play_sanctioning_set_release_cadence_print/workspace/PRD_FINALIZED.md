@@ -1,0 +1,414 @@
+# Organized Play Sanctioning API — Product Requirements Document
+
+## 1. Introduction
+
+The Organized Play Sanctioning API is the back-office system of record for a trading-card publisher's organized play program. It carries the full commercial and competitive lifecycle of the program: retail stores enroll and are held to a reporting discipline, stores submit sanctioning applications for events that must be placed on a competitive ladder running from local play up through qualifying and championship tiers, prize support is allocated in tournament points and drawn down as prizes are awarded, and the results of every closed event must be reported back inside a deadline that the program enforces. Running alongside all of that, the same system governs the product calendar — when a set is announced, when its prerelease weekend opens, when it becomes street-legal, when its card pool rotates out of a format, and whether a card is permitted to be reprinted at all given secondary-market expectations.
+
+Two pressures shape the requirements. The first is that the program is a ledger of scarce resources: tournament points in a prize pool, units in a print run, and slots in a store's event calendar are all finite, all contested, and all subject to reversal when a store is suspended, a format rotates, or a set is retired. Every one of those reversals has to leave the ledger in a state an auditor can defend. The second is that the program is temporal: almost nothing in it can be evaluated against wall-clock time. Street dates, prerelease windows, reporting deadlines, the reprint review date and the print-publication cut-off are all judged against a logical clock that the operator sets explicitly, so that any sequence of events can be replayed and reasoned about deterministically.
+
+This document specifies the API in the order a reader needs it: first the system-wide contracts that every request obeys, then the business workflows that drive the state machines, and finally the endpoint and error catalogues that tie the two together.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the rules that apply identically to every endpoint, every resource and every role in the API. The organized-play program is mounted under the top-level path prefix `/op`.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers. `X-User-Role` names the caller's operational capacity, and `X-User-ID` identifies the acting principal. The program recognizes exactly four roles, spelled as follows: `OpsAdmin`, `StoreOrganizer`, `Judge`, and `Distributor`.
+
+The two headers are interpreted differently depending on the role named in `X-User-Role`. When `X-User-Role` is `StoreOrganizer`, `X-User-ID` is the `id` of the acting `Store`; ownership checks on any resource that references a `Store` compare the resource's foreign-key field to `X-User-ID`, so a `StoreOrganizer` may only touch applications, prize distributions and reports that belong to their own store. When `X-User-Role` is `Judge`, `X-User-ID` is the `id` of the acting `JudgeCertification`; any resource that references a `JudgeCertification` is ownership-checked against it. When `X-User-Role` is `OpsAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it but never compares it to an entity's `id`. When `X-User-Role` is `Distributor`, `X-User-ID` is likewise opaque and is not compared to any entity's `id`.
+
+A request whose `X-User-Role` header is absent, or which names a role outside the four above, or which omits `X-User-ID` for one of the two entity-backed roles, is rejected with `ERR_UNAUTHENTICATED`. A request that is properly authenticated but whose role is not among the roles authorized for the operation being invoked is rejected with `ERR_UNAUTHORIZED`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp, rendered at whole-second precision.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept a `limit` query parameter that caps the number of rows returned and an `offset` query parameter that skips that many rows from the front of the result. When `limit` is omitted it defaults to 10; the smallest value the server accepts is 1 and the largest is 100. When `offset` is omitted it defaults to 0. Unless a listing is described otherwise, rows come back ordered by their creation timestamp in ascending order, oldest first.
+
+Every list response carries four pagination values in the `meta` object of the envelope: `limit`, `offset`, `total_count`, and `has_more`. `total_count` reports the size of the full filtered result set, not the size of the page, and `has_more` reports whether any rows remain beyond the current page.
+
+### 2.4. The Conserved Prize-Pool Ledger
+
+Prize support is not a pile of independent numbers; it is a ledger. Each approved event application gives rise to a prize pool whose whole purpose is to move tournament points in and out while remaining explainable. A pool records three figures at all times. `base_tp` is the total number of tournament points the pool was created with, computed when the application was approved. `total_drawn_tp` is the materialized sum of everything that has been paid out of the pool — the quantities on every prize distribution that has passed, plus the points consumed by physical prize grants that have actually been disbursed. `total_restored_tp` is the materialized sum of everything that has come back — the quantities on every distribution that has been voided, the unclaimed points declared on every report filed against the pool, and the same physical grants counted on the restore side. The pool's live balance, `remaining_tp`, is `base_tp` minus `total_drawn_tp` plus `total_restored_tp`, and that same figure is the conserved allocation invariant the program treats as its audit anchor.
+
+Because the counters are materialized rather than recomputed from scratch on every read, the server must keep them honest at every mutation. A draw and its compensating restore are one movement, not two: a distribution that is passed raises `total_drawn_tp`, and if it is later voided, `total_restored_tp` rises by the identical amount so that the invariant is exactly what it was before the distribution passed. That symmetry is why the same quantity can be moved out of a pool and back again without the pool appearing to have changed.
+
+Two settlement invariants constrain the automated transitions. When a set release reaches its street date, settlement performs no draw-down on anything: `total_drawn_tp` stays at zero and every allocation created before that moment still satisfies the condition that `remaining_tp` equals `base_tp`. When a set release is retired, retirement synthesizes restores only and never draws: `total_drawn_tp` is left untouched and `total_restored_tp` increases by the sum of the unclaimed points on the reports the retirement synthesized.
+
+### 2.5. Set Release Cadence and the Sanctioning Clock
+
+Nothing in this API is evaluated against real wall-clock time. The server maintains a logical clock which, at startup, reads exactly `2026-09-01T00:00:00Z` and never falls back to the machine's real time. The clock only moves when an operator advances it explicitly, and when it moves the server re-evaluates the calendar consequences: it re-checks the prerelease and street-date system transitions of every `SetRelease`, and it re-derives the reporting deadlines of every non-`LOCAL` approved event application.
+
+Each set release carries a prerelease weekend, bounded by `prerelease_start_date` and `prerelease_end_date`, and a `street_date` at which the set becomes legal for sale and for constructed play. The prerelease window sits strictly before the street date: a release whose `street_date` falls before its `prerelease_end_date` is rejected outright, and a release that is still only `ANNOUNCED` or `PRERELEASE` is not yet a usable foundation for a sanctioned event.
+
+The clock is also the arbiter of the program's hard review dates. Distribution reversals are locked at `2026-10-15T00:00:00Z`, the format rotation date; a reprint plan may not be published once the clock reaches `2026-12-01T00:00:00Z`; and an approved application may not be marked complete until at least seven days have passed since the set's street date.
+
+### 2.6. Format Legality, Rotation Epochs, and the Banned and Restricted Lists
+
+Every constructed format carries a `rotation_policy`, which is either `FIXED` or `ROLLING`, together with a `current_epoch` counter that begins at 0 and moves only when an operator runs a rotation. The state of a format is expressed as an epoch state: the format's starting pool is the epoch-zero state `EPOCH_0`, and the machine admits an unbounded ladder of further epoch states — `EPOCH_1` after the first rotation, `EPOCH_N` for the state at any epoch value N once the format has left its starting pool, and `EPOCH_N_PLUS_1` for the state one rotation further on — so there is no fixed number of rotations a format may undergo. Rotation is also gated by the calendar — no rotation may run before the clock reaches `2026-10-15T00:00:00Z`, and no rotation may run on a format that has never had a card pool to rotate, meaning at least one set release must already have reached `RELEASED`.
+
+Card legality is tracked on two separate lists. `banned_card_refs` holds the card references that are forbidden in the format and `restricted_card_refs` holds those that are merely constrained; both begin empty for a newly registered format and both are edited by the same operator action that names a `card_ref` and a `list_kind`. Appending to either list does not advance `current_epoch` — a list update is a self-loop on the epoch axis. What a list update does do is severe: every approved event application citing that format is denied, because an event can no longer be run under a format whose legality has changed underneath it.
+
+Rotation and ban updates are not free-standing either. An approved reprint plan that cites a format is voided the moment that format rotates, on the reasoning that the market context the plan was approved against has moved past its review point. And the rotation that legalizes a newly released set is the same event that closes out any completed event still sitting unreported under it, so that a rotation can never leave a completed event permanently unaccounted for.
+
+### 2.7. Store Enrollment and the Reporting Discipline
+
+A retail store joins the program by supplying its legal `name` along with a `region_code`, a `daily_event_capacity`, and an `event_space_capacity`. The two capacity figures are the store's commitments to the program: the first bounds how many competitive-tier events the store may crowd onto a single UTC calendar day, and the second bounds how many buffered event occupancies may cover any one instant in the store's event space. Enrollment initializes the store's `status` to `ACTIVE` and its `reporting_tier` to `STANDARD`.
+
+The `reporting_tier` is not set by the store; it is derived from the store's demonstrated reporting behaviour and takes one of exactly two values, `STANDARD` or `ENHANCED`. The derivation counts the applications belonging to the store that have reached the final `REPORTED` status — applications still in `SUBMITTED`, `APPROVED`, `DENIED`, `WITHDRAWN` or `COMPLETED` are not counted, so a store cannot climb the reporting tiers by filing events it has not yet closed out. Once the count reaches five reported events, the store moves to `ENHANCED`, and it does so on that same fifth report and never before it. The derivation runs when an event application is reported and again whenever a rotation synthesizes a report on the store's behalf.
+
+Two further figures are rolled up onto the store and must stay live. The store's `tp_balance` is the sum of `remaining_tp` across every prize allocation the store owns, so it falls as prizes are drawn and rises again as points are restored. The store's `reporting_violation_points` is the sum of `current_points` across every rules enforcement case whose associated event application belongs to the store — and because cases that have been closed or reduced keep contributing their `current_points`, a store's violation total does not silently improve just because an investigation has concluded.
+
+A store's `status` moves between `ACTIVE` and `SUSPENDED`, and the move into `SUSPENDED` is the single most destructive cascade in the system. Every event application belonging to the store that is still in `SUBMITTED`, `APPROVED` or `COMPLETED` is denied outright, and each of those applications has its `prizing_report_status` frozen at whatever value it held, so the denial cannot later be mistaken for a clean close-out. Every still-open prize allocation the store owns is released. Every distribution that had passed under those allocations is voided, and the store's restitution is computed authoritatively rather than incrementally: the allocation's `total_restored_tp` is re-derived from the full set of voided distributions together with all submitted reports, so the conserved invariant returns to the figure it held before the first draw, and for a released allocation that figure is zero unless a physical grant had previously been disbursed. Restoring a suspended store to `ACTIVE` reverses none of this — reinstatement is not an undo, and no allocation and no application is re-opened by it. Every store transition advances the store's `version` by one.
+
+### 2.8. Common Resource Properties
+
+Every top-level resource in this API — stores, set releases, formats, event applications, prize allocations, prize distributions, prize reports, rules enforcement cases, code redemptions, product configurations, allocation orders, judge certifications and reprint plans — carries the same four system-managed fields.
+
+- **`id`** is the resource's unique, server-minted identifier, formatted as a UUID with no type prefix and no embedded entity name.
+- **`created_at`** is an ISO 8601 timestamp in UTC recording when the resource was first created, rendered at whole-second precision.
+- **`updated_at`** is an ISO 8601 UTC timestamp recording when the resource was last modified, at the same whole-second precision. Any change to any property of the resource refreshes it.
+- **`version`** is a system-managed integer that starts at the resource's creation value and increments by one on every modification, including modifications performed by the server on the client's behalf rather than by a direct client request.
+
+There are no immutable or write-once resources in this API: all thirteen entity types carry `updated_at` and `version` in addition to `id` and `created_at`. A derived field such as a store's `tp_balance` or a product configuration's `units_available` is not a stored column but a recomputed figure, and reading it never mutates the resource; writing it never happens directly, only as a consequence of the action that caused the underlying change.
+
+### 2.9. Integer Arithmetic and Rounding Discipline
+
+Tournament points and print-run units are whole quantities, and every derived figure in this API is computed at integer precision. Where a calculation involves a division, the result is floored to a whole number at one single, named point in the computation, and the floored value is then carried forward — the arithmetic is never re-rounded at a later step, and it is never the case that several unrounded values are summed and the total floored afterwards. Where a calculation chains several additions, all additions are performed at integer precision and summed before any rounding step is applied, so no intermediate rounding can accumulate error into the final figure.
+
+The stored balances reflect that discipline. A prize pool's `remaining_tp` is computed once from two integer sums and is never itself rounded. A physical prize grant's point value is floored exactly once for that grant and only then added into the allocation's counters. A reduced enforcement penalty is floored once before it is summed into a store's violation total. Deadlines, by contrast, are not rounded at all: a reporting deadline is computed to whole-second precision in UTC, and every calendar instant the API carries — deadlines, street dates, prerelease bounds and scheduled dates alike — is rendered as a whole-second ISO 8601 UTC string. Monetary-style decimal precision plays no part in this domain — no value in the API is expressed to two decimal places or rounded half-up.
+
+### 2.10. Optimistic Concurrency Control
+
+Two write operations in this API carry an explicit concurrency guard, and both reject with `ERR_STALE_VERSION` at HTTP status 412 when the guard fires. The first is the approval of an event application, which must be submitted with `expected_store_version`, the client's last observed `version` of the `Store` the event belongs to. The second is the fulfilment of a distributor allocation order, which must be submitted with `expected_product_configuration_version`, the client's last observed `version` of the `ProductConfiguration` being drawn against.
+
+In both cases the supplied value is compared with the parent's current `version`, and a mismatch is rejected with `ERR_STALE_VERSION`. The guard exists because both operations consume headroom the client may no longer have: a store's eligibility posture can change when it is suspended, and a configuration's remaining units can shrink when an earlier order draws the print run down. Requiring the client to present the version it observed forces it to have seen the current state of the parent before committing. A reprint plan sits outside this mechanism for a subtler reason: its own `verdict` is computed for it by the server rather than supplied by the client, and no client-supplied version guard applies to reprint plans at all. No other write operation in this API accepts a client-supplied version field, and a request to any other operation that carries one is rejected as an undeclared field.
+
+### 2.11. Reference Resolution and Nested Retrieval
+
+Requests that name other resources resolve those references in a fixed order, and the order matters because it determines which error a request with several problems receives. Path resources are validated first, left to right along the URL; only then are the foreign keys carried in the request body resolved, in the order `store_id`, `set_release_id`, `format_id`, `event_application_id`, `prize_allocation_id`, `product_configuration_id`. The first reference that does not resolve to an existing row ends the request with `ERR_NOT_FOUND`; references later in the order are never reached.
+
+Reads that reach a sub-resource through its parent follow the same discipline: the parent named in the path is resolved and checked before the sub-resource is considered, so a request that would be rejected on the parent is never evaluated at the child. One resource in this API is addressed by a caller-supplied identifier rather than by a server-minted `id`: a judge certification is looked up by the `ref` value supplied when the judge was registered, which is why judge routes carry that reference in place of an identifier. A redemption code is a special case of reference resolution: because a printed code is presented by value rather than by identifier, the code supplied when redeeming against an event must match exactly one existing code redemption row, and a code that matches none or matches more than one is rejected with `ERR_INVALID_REDEMPTION_CODE`.
+
+### 2.12. Validation Precedence
+
+Validation runs as a ladder, and the rung that fires first determines the response. Identity comes first: a request without a valid `X-User-Role`, or naming an undeclared role, or missing `X-User-ID` for an entity-backed role, is rejected with `ERR_UNAUTHENTICATED`. Role permission comes next: an authenticated caller whose role is not authorized for the operation is rejected with `ERR_UNAUTHORIZED`. Only then is the request's own shape examined — every required body field present, no undeclared body field supplied, every value conforming to its declared type and enumerated domain — with any violation rejected as `ERR_INVALID_REQUEST`. Reference resolution follows, and finally the state and business rules specific to the operation.
+
+The consequences of that ladder are worth stating plainly. A caller who is forbidden to perform an operation receives `ERR_UNAUTHORIZED` even if the request body is also malformed, and a correctly shaped request that names a non-existent resource receives `ERR_NOT_FOUND` before any state check is attempted. Within the state-and-business band, the state rungs fire before the business rungs: an operation attempted from the wrong starting state is rejected as `ERR_INVALID_STATE` rather than being evaluated against the commercial constraints that would also have blocked it. Where a single operation is guarded by several business rules, those rules fire in a fixed relative order, and the operator sees the error of the first rule that fails rather than a later one that also would have failed. Those per-operation orders are stated alongside the relevant workflows in the next section.
+
+## 3. Business Logic & Workflows
+
+Section 2 fixed the system-wide contracts. What follows is the business narrative: how stores enter the program, how events are sanctioned and reported, how prize points move, how the product calendar is governed, and how enforcement and legal compliance sit across all of it. The subsections are ordered by program lifecycle rather than by entity, and a rule is stated wherever it most naturally arises in the story rather than once in a concentrated block.
+
+### 3.1. Enrolling a Store and the Reporting Discipline It Signs Up To
+
+An `OpsAdmin` enrolls a retail store by supplying its legal `name`, its organized-play `region_code`, a `daily_event_capacity` and an `event_space_capacity`. The store enters the program `ACTIVE` and `STANDARD`. Both capacity figures are promises the store makes about its own event space. `daily_event_capacity` is the ceiling on how many competitive events — those at `QUALIFIER` or `CHAMPIONSHIP` tier — the store may squeeze onto one UTC calendar day. `event_space_capacity` is the ceiling on how many buffered event occupancies may cover any single instant in the store's event space, which is a stricter statement than it first appears because each occupancy is padded by half an hour on both sides.
+
+The store's `reporting_tier` is earned rather than chosen, and the earning rule rewards closure rather than volume. Only applications that have reached the final `REPORTED` status count toward the store's reported-event tally; applications parked in `SUBMITTED`, `APPROVED`, `COMPLETED`, `DENIED` or `WITHDRAWN` do not count at all. When the tally reaches five, the store moves to the enhanced reporting tier, and the move happens on the fifth report itself — a store with four reported events is still `STANDARD`, and a store that is one report away is exactly one report away. The tier is re-derived at the moment an event is reported and again whenever a rotation files a report on the store's behalf.
+
+Two running totals are kept on the store and must be maintained live. The store's `tp_balance` is the sum of `remaining_tp` over all of its prize allocations, so it is drawn down by prize awards and replenished by reversals and returned prizes. The store's `reporting_violation_points` is the sum of `current_points` across all rules enforcement cases arising from the store's events, and it aggregates closed and reduced cases as well as live ones — a store's violation record is cumulative, not a snapshot of open investigations.
+
+Store lifecycle changes are driven by naming the transition to run in an `action` field. A store transition may also carry an optional `reason` recording why the change was made; the reason is kept for audit and does not alter what the transition does.
+
+Suspension is the program's nuclear option and its cascade is total. When a store is suspended, every application of that store still standing in `SUBMITTED`, `APPROVED` or `COMPLETED` is denied, and — importantly — each such application keeps whatever `prizing_report_status` it already had rather than being reset. Every still-open allocation of the store is released, and every distribution that had passed under those allocations is voided, with each affected allocation's `total_restored_tp` re-derived from the voided distributions and the submitted reports rather than incremented, so the conserved invariant lands back on the figure it held before the allocation's first draw. For an allocation released this way the invariant returns to zero, unless a physical grant had already been disbursed, in which case that grant's value remains counted on both sides. Reinstating a suspended store restores nothing: no application and no allocation is re-opened, and the store simply resumes from `ACTIVE` with its history intact.
+
+### 3.2. Placing an Event Application on the Competitive Ladder
+
+A `StoreOrganizer` submits an application carrying the `store_id` it belongs to, the `set_release_id` it is tied to, the `format_id` and the matching `format_code` it will be run under, the `tier` it is asking for, the `scheduled_date` it wants, and its `expected_headcount`. The application enters life in `SUBMITTED` with no reporting obligation attached yet: `prizing_report_status` is `NOT_DUE` and `reporting_due_by` is null.
+
+The `tier` is drawn from exactly three rungs — `LOCAL`, `QUALIFIER` or `CHAMPIONSHIP` — and the rung has consequences far beyond labelling. Capacity governs only the two competitive rungs: a `LOCAL` event never consumes a store's daily competitive slot. Reporting obligations attach only to the two competitive rungs: a `LOCAL` event carries no deadline at all, while a `QUALIFIER` or `CHAMPIONSHIP` event acquires a deadline of the cited set release's street date plus eighteen days. And invitation requirements attach only to the top rung.
+
+Before sanctioning is granted, a store may correct its own submission: the `expected_headcount` and the `scheduled_date` remain editable on a submitted application, and an edit advances the application's `version` by one. If the application has already been approved, correcting either field re-derives the reporting deadline, so a rescheduled competitive event does not keep a deadline computed from its original date.
+
+A `StoreOrganizer` may also withdraw a submitted application, which closes it out as `WITHDRAWN` without any allocation ever being created; withdrawal is available only while the application is still `SUBMITTED`.
+
+### 3.3. Sanctioning: the Approval Decision and Its Capacity Gate
+
+Approval is the moment an application is admitted into the sanctioned program and is the most heavily guarded operation in the API. It is also the operation that creates downstream work, so its checks must all pass before any allocation exists.
+
+The first guarantee the operator needs is that the view of the event they are approving against is current. Approval therefore requires the client to present `expected_store_version`, the `version` of the `Store` the event belongs to as the client last observed it. If the store's version has moved on since then, the approval is rejected with `ERR_STALE_VERSION` and no state advances. This is the guard that stops an operator from sanctioning an event against a store view that predates a suspension or a prior approval.
+
+Once the store's state is confirmed current, the approval walks a fixed ladder of rules, and the operator receives the error of the first rung that fails.
+
+The store itself must be `ACTIVE`; a suspended store cannot sanction anything. The application's own `prizing_report_status` must be `NOT_DUE` at the moment of approval, so an application that has already been opted into the reporting window cannot be approved — that rejection is `ERR_REPORTING_WINDOW_OPEN`. The set release the event cites must have reached `RELEASED`; an event tied to a set that is still `ANNOUNCED` or merely in its `PRERELEASE` window is not yet legal to run and is rejected with `ERR_SET_NOT_STREET_LEGAL`.
+
+The competitive-tier gates come next, and they are deliberately unforgiving because they protect the quality of the program. A `CHAMPIONSHIP` event additionally requires an invitation already in hand — an unredeemed `DIGITAL` code redemption whose `status` is `AVAILABLE` and which is bound to this specific application. An approval attempted without one is rejected with `ERR_INVITATION_REQUIRED`.
+
+Then come the three calendar rules, in order of scope. The daily tier-slot rule asks whether the store already holds at least its `daily_event_capacity` worth of other applications counted together across `SUBMITTED` and `APPROVED` whose tier is `QUALIFIER` or `CHAMPIONSHIP`, whose `scheduled_date` falls on the same UTC calendar day as this application's own; the application being approved is itself excluded from that count, since at this instant it is the event being placed rather than one the store already holds, so a store with a capacity of one may run one competitive event on a day and is refused on the second — any two events sharing that calendar day collide once the store's capacity is reached, and the rejection is `ERR_TIER_SLOT_CONFLICT`. The event-space rule asks whether any single instant in the store's event space would be covered by more than `event_space_capacity` buffered occupancy intervals drawn from the store's non-terminal applications, where each interval runs from thirty minutes before the event's `scheduled_date` to thirty minutes after an event-length window of six hours that starts at the `scheduled_date`; the rejection is `ERR_EVENT_SPACE_CAPACITY`. The pairwise rule asks whether another non-terminal application of the same store has an occupancy window running from its `scheduled_date` for six hours that overlaps this application's own window, where the windows are half-open, so a prior event that ends at exactly the instant this one is scheduled to begin does not overlap and the pair is legal; the rejection is `ERR_EVENT_WINDOW_OVERLAP`. Note the deliberate asymmetry between the last two rules: a pair of events that is legal under the pairwise rule can still be illegal under the buffered aggregate rule, because the padding added on either side makes the two occupancies cover an instant in common.
+
+Finally, the format cited must be legal for the event. The supplied `format_code` must equal the `format_code` carried by the format named by `format_id`, and that format must not have rotated past the epoch in which the cited set release was legalized; a mismatch or a rotated-past format is rejected with `ERR_FORMAT_CODE_NOT_LEGAL`. This same rule also guards the submission of the application itself, so an application cannot even be filed citing a format code that does not belong to the format it names.
+
+A `StoreOrganizer` may give up on a submitted application by denying it, which leaves the application in `DENIED` and creates no allocation at all.
+
+### 3.4. What Approval Creates, and the State the Event Moves Through
+
+Approval is generative. It creates a prize allocation for the event and records that allocation's identifier on the application as `prize_allocation_id`; the new allocation opens in `OPEN`, copies the application's `tier`, starts with `total_drawn_tp` and `total_restored_tp` at zero, and takes its `base_tp` from the tier prize support calculation described later in this section. The approval also sets the application's deadline and its reporting column together: a `LOCAL` event has `reporting_due_by` left null and keeps `prizing_report_status` at `NOT_DUE`, because a `LOCAL` event carries no reporting window that could open; a `QUALIFIER` or `CHAMPIONSHIP` event gets the cited set release's street date plus eighteen days as its deadline and is left at `prizing_report_status` `DUE`, because sanctioning is legal only on a set release that has already reached `RELEASED`, so the street date — and with it the moment the reporting window opens on its own — has necessarily passed by the time the event is approved. The approval advances the application's `version` and the store's `version` by one each.
+
+The reporting-column question is not left open by approval for a competitive event. Because the cited set release has already reached its street date at the moment of approval, the same rule that opens the window "the moment the cited set release reaches its street date" has already applied, and a competitive application is therefore approved straight into the open window rather than being left for a later clock advance to open. The approval guard on `ERR_REPORTING_WINDOW_OPEN` remains observable precisely because the store can move the column on its own before sanctioning: a store may opt into the reporting window while its application is still only `SUBMITTED`, and if it does, the approval that would otherwise have succeeded is refused.
+
+An approved event then runs. To be closed out, it is completed, which is available only from `APPROVED` and only once the logical clock has reached at least seven days past the set's street date. Completion mutates nothing else: its entire purpose is to unlock reporting. From `COMPLETED` the event goes to `REPORTED` when the store files its results, which is the only way a `QUALIFIER` or `CHAMPIONSHIP` event's obligation is discharged in the ordinary course.
+
+The store may also opt into and out of its reporting window independently of where the application sits in its sanctioning lifecycle. Opting in moves `prizing_report_status` to `DUE` and is allowed from `SUBMITTED`, `APPROVED` or `COMPLETED`; opting out moves it back to `NOT_DUE` from the same three states. Neither option touches any allocation. The window also opens on its own: the moment the cited set release reaches its street date, every approved competitive application on that release that is still `NOT_DUE` is moved to `DUE`.
+
+### 3.5. Prize Support: Pool Sizing, Draw-Down and Restoration
+
+Every approved event comes with tournament points attached, and the size of that pool is determined at the instant of approval by the tier the event was sanctioned at. The pool starts from a tier base: a `LOCAL` event's pool begins at sixteen points, a `QUALIFIER` event's at forty-eight, and a `CHAMPIONSHIP` event's at ninety-six.
+
+On top of that base sits a supplement driven by how many players have already redeemed a digital code against this event. The server counts the code redemptions bound to this application that are in the `REDEEMED` status and were redeemed as a `DIGITAL` entitlement; redemptions still in `AVAILABLE`, redemptions that were `DECLINED`, and every redemption of kind `PHYSICAL` are excluded from the count entirely. The count is taken fresh at each approval and is never revisited afterwards, so a player redeeming a code after the event has been sanctioned does not enlarge an allocation that already exists.
+
+How the supplement is applied depends on the `pool_mode` the store selects when it approves; a store that runs more than one pool variant may also name the variant it wants in `pool_variant`, and the choice is a genuine fork with different economics. Under `BUNDLED` mode, the first four redeemed digital members are absorbed by the tier base and add nothing; only the fifth and each member after it adds a per-member bundle value for the tier — three points at `LOCAL`, six at `QUALIFIER`, and twelve at `CHAMPIONSHIP`. Under `UNBUNDLED` mode, every redeemed digital member adds four points, including the first four, so for any event with at least one redeemed digital member the unbundled pool is strictly larger than the bundled pool for identical inputs, and an event with no redeemed digital members gets the same pool under either mode. All of these additions are performed as whole-number arithmetic and summed before any rounding step is taken; no intermediate value is rounded on the way.
+
+Drawn points leave a pool by one route and return by three, and the accounting is deliberately kept in two materialized counters rather than recomputed lazily. A prize distribution attached to a pool begins `PROPOSED` and draws nothing until it passes; each proposed distribution names the `recipient_ref` of the player or organizer receiving it and the `quantity` it will draw, and proposing it advances nothing until an operator acts on it. Passing it is permitted only while the pool is still `OPEN` and only when the quantity being drawn does not exceed the pool's current `remaining_tp` — a draw of exactly the whole remaining balance is legal and leaves the balance at zero, while anything larger is rejected with `ERR_INSUFFICIENT_POOL`. A successful pass moves the distribution to `PASSED`, raises the pool's `total_drawn_tp` by the distribution's quantity, and re-derives `remaining_tp` from `base_tp`, the drawn total and the restored total.
+
+Points come back by voiding a passed distribution, by filing a report that declares unclaimed prizes, and by disbursing a physical prize grant. Voiding a distribution that has reached `PASSED` moves it to `VOIDED` and adds its quantity to the pool's `total_restored_tp`; the action is available only while the logical clock is still earlier than `2026-10-15T00:00:00Z`, because distributions lock at the reprint policy review date, and only if that distribution has not already been offset once. Attempting to void a distribution that is already `VOIDED` is rejected with `ERR_INVALID_STATE`, since the first void already performed its compensating restore and a second one would double-count the movement.
+
+Reporting declares unclaimed points: filing a prize report adds the report's `unclaimed_tp` to the pool's `total_restored_tp`, raising the conserved invariant by exactly that amount. Physical grants are the third route and the most peculiar, because a disbursed physical grant is counted on both sides at once — its point value is added to `total_drawn_tp` and the identical amount is added to `total_restored_tp`, so the conserved invariant is unchanged by the grant even though both counters have moved. That is what makes a physical grant a value transfer rather than a net draw on the pool.
+
+The order in which these movements occur is observable, and the program treats the two orderings as distinct. If a passed distribution is voided and then passed again, the void first raises `total_restored_tp` by the quantity and the later pass raises `total_drawn_tp` by the same quantity, so the balance returns to precisely the figure it held before the void. If instead a report is filed before the distribution it offsets is voided, the report's unclaimed points enter `total_restored_tp` first and still stand when the distribution is voided afterwards — so for identical inputs the balance ends exactly one distribution-quantity higher than it would under the void-first ordering. Neither ordering is preferred by the system; both are legal, and they are simply not interchangeable.
+
+A pool's own lifecycle is short. It opens in `OPEN` when the event is approved. It moves to `CLOSED` when the format the event cited takes an update that denies the parent application, or when the cited set release is retired; closing a pool voids every distribution that had passed under it and re-derives the restored total so the invariant returns to the figure it held before the close. It moves to `RELEASED` when its owning store is suspended, which voids the passed distributions and re-derives the restored total to zero unless a physical grant was previously disbursed. There is exactly one re-opening cycle available: a closed pool may be re-opened, but only when the cited set release has already been retired and the parent application's `prizing_report_status` is `DUE` or `SUBMITTED`. Re-opening re-derives `remaining_tp` from the restored quantities and re-opens the reporting window; because re-opening neither draws nor restores anything, the re-derivation can lift `remaining_tp` above any figure previously observed on that pool while the conserved invariant is left exactly as it was. Re-opening is the mechanism by which a late-arriving unclaimed-prize report is reconciled.
+
+Finally, an operator may enlarge a pool without any of the above by adding tournament points to it directly. The amount to add is supplied as `additional_tp`, and the addition lands on `base_tp`, after which `remaining_tp` is recomputed from the enlarged base. Every movement described in this subsection advances the pool's `version` by one.
+
+### 3.6. Reporting Results and the Deadline That Enforces It
+
+A `StoreOrganizer` closes out a completed event by filing its prize and attendance report against the application. The report carries the `prize_allocation_id` of the pool being restored against, the `unclaimed_tp` that was not awarded at the event, and the `reported_headcount` that actually attended.
+
+Filing is permitted only from a narrow set of conditions. The application must have reached `COMPLETED`, and its `prizing_report_status` must be `DUE` — an event that has not been opted into its reporting window cannot be reported. The `prize_allocation_id` supplied in the body must be the same identifier the application recorded for itself when it was approved, so a store cannot restore one event's unclaimed prizes into another event's pool. And the filing must happen while the logical clock is still at or before the application's `reporting_due_by`, whenever that deadline is non-null; a filing attempted after the deadline has passed is rejected with `ERR_REPORT_WINDOW_CLOSED`. Filing a second report against an application that already has one is rejected with `ERR_PRIZE_REPORT_ALREADY_FILED`, which is a permanent condition rather than a transient one.
+
+A successful filing is a multi-entity transaction. It creates the report in `FILED` status and records its identifier on the application as `prize_report_id`; it adds the report's `unclaimed_tp` to the parent pool's `total_restored_tp`, which lifts the conserved invariant by exactly that amount; it advances the application from `COMPLETED` to `REPORTED`; it moves the application's `prizing_report_status` to `SUBMITTED`; and it re-derives the store's `reporting_tier`, which is the moment a store's fifth closed event promotes it to `ENHANCED`.
+
+Because a reported event is the unit of the reporting discipline, filing a report is also the trigger that opens the door to the store's final accounting on that event — reporting is the ordinary route from `COMPLETED` to `REPORTED`, and it is the only route a store controls directly.
+
+Deadlines lapse quietly rather than dramatically. When the logical clock is advanced past an application's `reporting_due_by` while the application's `prizing_report_status` is still `NOT_DUE` or `DUE`, the application's own reporting dimension is left exactly as it was — the obligation is not silently erased. Instead the overdue condition is recorded on the report row itself: any report already filed against that application that is still in `FILED` status is marked `OVERDUE`. A report marked overdue is still a filed report, so it keeps contributing its `unclaimed_tp` to the pool's restored total; the mark exists so that a late report remains visible without the application's reporting dimension being rewritten underneath it.
+
+One structural point about how a report can come into existence: the ordinary route is the store filing it, and the ordinary route from `DUE` to the fully submitted column runs through it with `COMPLETED` as the required starting state. There is exactly one path that skips the store entirely — the rotation path described in the next subsection — and it exists so that rotation can never leave a completed event permanently unreported. In that path the application's `prizing_report_status` moves directly from `NOT_DUE` to `SUBMITTED`, which is the only way that column can be reached without first passing through `DUE`.
+
+### 3.7. The Product Calendar: Announcement, Prerelease, Street Date and Retirement
+
+A set release is announced by an `OpsAdmin` supplying a globally unique `set_code`, the bounds of its prerelease weekend as `prerelease_start_date` and `prerelease_end_date`, and its `street_date`. The release enters `ANNOUNCED`. A release whose `street_date` falls before its `prerelease_end_date` is rejected with `ERR_STREET_DATE_BEFORE_PRERELEASE`, and a release whose `set_code` collides with an existing release is rejected with `ERR_DUPLICATE_SET_CODE`.
+
+From `ANNOUNCED` the release opens its prerelease weekend on its own, as a system event: once the logical clock has reached `prerelease_start_date` but has not yet reached `prerelease_end_date`, the release moves to `PRERELEASE`. The window merely opens; no other resource is touched by that transition.
+
+The street date is the most consequential transition in the whole product calendar, because a set becoming legal reshapes the competitive landscape at once. When the logical clock reaches the `street_date`, the release moves from `PRERELEASE` to `RELEASED`, and four things happen together. Every `ACTIVE` format gains an epoch entry for this set release, moving the release to legal status in all of them. Every event application whose `set_release_id` names this release becomes eligible for approval, which is the gate the sanctioning workflow described earlier depends on. Every approved application on this release at `QUALIFIER` or `CHAMPIONSHIP` tier has its `reporting_due_by` set to the street date plus eighteen days. And every approved application on this release whose `prizing_report_status` is still `NOT_DUE` is moved to `DUE`, opening its reporting window. As established in section 2, this settlement performs no draw-down at all: nothing is taken from any pool, and every allocation created before the street date still satisfies the condition that its `remaining_tp` equals its `base_tp`.
+
+The final step is retirement, run by an `OpsAdmin` once the set has been on the street. A release may be retired only from `RELEASED`, and retirement moves it to `RETIRED` and closes out everything still hanging on it. Any event application on this release still in `SUBMITTED` or `APPROVED` is moved to `COMPLETED`, and any application on the release whose `prizing_report_status` is `DUE` or `NOT_DUE` is moved to `SUBMITTED` and given a synthesized prize report carrying `unclaimed_tp` of zero and a `reported_headcount` of zero. As established in section 2, retirement synthesizes restores only and never draws: the retired release's allocations are left with their drawn totals untouched while their restored totals absorb the synthesized reports, which carry nothing to restore, so the operation is a clean closing rather than a settlement.
+
+Retirement is also one of the two events that close a prize pool. A pool whose event cites a retiring set release is moved to `CLOSED`, and closing it voids the passed distributions under it and re-derives the restored total so the invariant returns to the pre-close figure. The other closing event is a format update that denies the parent application, and it behaves identically. Retirement additionally closes the reprint review: a reprint plan whose cited set release has already been retired cannot be transitioned at all, and such an attempt is rejected with `ERR_REPRINT_REVIEW_CLOSED`.
+
+### 3.8. Format Registration, Epoch Rotation and the Banned and Restricted Lists
+
+Formats are registered by an `OpsAdmin` with a globally unique `name`, a globally unique `format_code` that will be carried on every sanctioned event run under the format, and a `rotation_policy` of either `FIXED` or `ROLLING`. A new format starts at epoch zero with both `banned_card_refs` and `restricted_card_refs` empty.
+
+Rotation is an operator action available only on or after `2026-10-15T00:00:00Z` and only to a format that has a card pool to rotate, meaning at least one set release has already reached `RELEASED`. The two epoch transitions are really one mechanism with a first-step special case: from the initial epoch the counter moves from zero to one, and from any later epoch it advances by one more. In each case the move is not free of consequences for the product plan: every reprint plan citing this format that has been approved is rejected on the spot, because the market context that plan was approved against has moved past the review point and the approval cannot be carried forward.
+
+A rotation is also one of the few operations that reaches into the reporting discipline. When a format rotates past a completed event application that is still sitting at `NOT_DUE`, that application is pulled straight to `SUBMITTED` and `REPORTED` and given a synthesized prize report with `unclaimed_tp` of zero and `reported_headcount` of zero, and the owning store's `reporting_tier` is re-derived as a result. The synthesized report is a closure device rather than a settlement: it declares no unclaimed prizes, but it does move the event out of the unreported column, which is the only way a rotation can guarantee that no completed event is left permanently unreported.
+
+Ban and restriction updates travel on the same operator action but behave quite differently, because a list update is a self-loop on the epoch axis rather than a step along it. The action names the `card_ref` to act on and the `list_kind` that decides which of the two lists receives it; the reference is appended to `banned_card_refs` or to `restricted_card_refs` accordingly, and `current_epoch` is left exactly where it was. What such an update does do is deny every approved event application that cites the format, since the legality of the format has changed underneath an event that was already sanctioned — and each of those denied applications has its still-open prize pool closed. The update is not a dead end for the store, however: the applications it denies remain reachable by a reverse lookup, so an operator can find every application that was denied this way once the store has cleared the offending card reference and re-submit it.
+
+### 3.9. Reprint Policy and the Accessibility Ceiling
+
+A reprint plan begins as an operator's question about whether a card may be brought back into print. An `OpsAdmin` files it with the card's `card_name`, the `set_release_id` the reprint would ship in, the `format_id` whose legality and market context is being evaluated, a `secondary_market_index` expressed in whole currency units, and a `first_print_index` for the same card from its original printing. The plan enters `DRAFT` with a verdict computed at filing time.
+
+The verdict turns on a single comparison. The plan's secondary-market index is first adjusted upward by a market-context addendum: the index is multiplied by sixty-four, that product is divided by one hundred and thirty-seven, the result is floored once to a whole number, and that whole number is added to the original index. The addendum is computed once and floored once, and the comparison that follows does not re-round either operand. The filing is then compared against a ceiling index of forty-two: a plan whose addendum-adjusted index is strictly greater than forty-two yields a `REPRINT_DENIED` verdict, and a plan at or below the ceiling yields `REPRINT_ALLOWED`. The consequence of the addendum is easy to underestimate. A card whose raw secondary-market index is exactly forty-two sits precisely on the ceiling, and with the addendum in force that index lifts to sixty-one, which is above the ceiling and therefore denied; only when the addendum is suppressed for an accessibility audit does an index of exactly forty-two clear. The `first_print_index` the operator supplies does not enter the verdict at all — it is recorded so that the market context of the decision can be audited afterwards.
+
+An approved plan does not go quietly into the world. Once a plan's verdict is a green light, it may be approved by an operator, moving it out of `DRAFT`. Approving a plan whose verdict is a denial is rejected with `ERR_REPRINT_MARKET_FLOOR`. The other gate on approval is temporal and closes with the format: a plan citing a set release that has already been retired can never be approved, because the review window for that release is closed.
+
+An approved plan is fragile for exactly one reason: it was approved against a format's market context, and if that format later rotates, the approval is voided in place and the plan is moved to `REJECTED` without any client action. That is a system-driven rejection rather than an operator's decision, and it is not reversible — the plan cannot be walked forward from `REJECTED`. An approved plan that keeps its footing may be published, which is the plan's terminal success and moves it to `PUBLISHED`, and which also records the plan under its set release. Publication carries its own hard calendar gate: it is available only while the logical clock is still strictly earlier than `2026-12-01T00:00:00Z`. Once that date is reached, approval is moot, because a plan that can no longer be published cannot be acted on.
+
+### 3.10. Rules Enforcement, Penalty Scoring and Judge Certification
+
+Judges are the program's enforcement officers, and they are themselves credentialed by the program. An `OpsAdmin` registers a judge with a globally unique `judge_ref`, a display `name`, and a certification `level` of `LEVEL_1`, `LEVEL_2` or `LEVEL_3`. A registration whose `judge_ref` collides with an existing certification is rejected with `ERR_DUPLICATE_JUDGE_REF`. The certification enters `ACTIVE` with a `practice_events` counter of zero.
+
+A judge files a rules enforcement case against a player at a sanctioned event, supplying the `event_application_id` the infraction occurred at, an opaque `player_ref` identifying the subject, an opaque `judge_ref` identifying the filing judge, the `offense_class` of the infraction, and the `rules_enforcement_level` the event was run at. The case enters `FILED`. The `offense_class` is `MINOR`, `MAJOR` or `SEVERE`, and the `rules_enforcement_level` is `REGULAR`, `COMPETITIVE` or `PROFESSIONAL`. The case also carries a `repeated_offense` flag recording whether this player already has an enforcement case on this same event application; the flag may be supplied at filing and defaults to false when it is omitted, which matters because it is the sole input that selects between the two escalation branches described below.
+
+A case carries two distinct point figures, and keeping them apart is the whole point of the design. The first is `penalty_points`, the underlying severity of the infraction, computed once when the case is filed as the offense class's base points multiplied by the enforcement level's multiplier. The base points are two for a `MINOR` offense, five for a `MAJOR` offense and eleven for a `SEVERE` one; the multiplier is one at `REGULAR`, two at `COMPETITIVE` and three at `PROFESSIONAL`. The multiplication is whole-number arithmetic with no rounding. The second figure is `current_points`, the case's working penalty, which moves as the case progresses while `penalty_points` never moves again — a later action on the case never recomputes the underlying severity, it only re-derives the working figure from it.
+
+The action that sets `current_points` determines its value, and each action has exactly one rule. Filing the case sets `current_points` equal to `penalty_points`. Escalating the case moves it to `ESCALATED` and is the one branch that consults the case's `repeated_offense` flag: if the flag is set — meaning this player already carries an enforcement case on this same event application — the working penalty becomes the underlying penalty multiplied by three; if the flag is not set, the working penalty becomes the underlying penalty plus four points. Closing the case moves it to `CLOSED` and resets the working penalty back to the underlying penalty. Reducing the case moves it to `REDUCED` and halves the underlying penalty, floored to a whole number. The escalation branch is submitted by an operator and carries the `repeated_offense` value the case was filed with; because the multiplier branch is so much harsher than the increment branch, the same underlying infraction can produce a working penalty three times its severity or merely four points above it depending on whether the flag was set. Reducing a case is not a full exoneration: it moves the case to `REDUCED` with a working penalty that still counts against the store.
+
+Every one of these movements re-derives the owning store's `reporting_violation_points`, which sums the `current_points` of all cases arising from that store's events. Because closed and reduced cases continue to contribute their working penalty, a store's violation total reflects the full history of enforcement at its events rather than only the cases still open, and reducing a case lowers the total without erasing the infraction.
+
+Judge certification moves along its own track. A certified judge accumulates `practice_events` by working lower-tier events, and the counter is advanced by recording a practice event against a specific event application. The recording is narrow by design: it advances the counter only when the judge's level is exactly `LEVEL_2` and the cited application is both `LOCAL` tier and already `REPORTED`. Recording a practice event does not move the certification's `status`; it is a self-loop on the status axis that touches the counter and nothing else. The payoff is a derived flag: a judge is marked `promotion_eligible` exactly when their level is `LEVEL_2` and their `practice_events` count has reached five, and is not promotion-eligible otherwise. A judge at `LEVEL_1` or `LEVEL_3` is never promotion-eligible, and neither is a `LEVEL_2` judge with four practice events.
+
+Certification also ends. A judge may be decertified, moving the certification from `ACTIVE` to `DECERTIFIED`, and decertification is not an operator's free choice: it is permitted only when the judge is the subject of an enforcement case that has been escalated. Decertification is terminal, and a decertified judge cannot be returned to `ACTIVE`.
+
+### 3.11. Code Redemption, Digital Entitlement and Physical Prize Support
+
+Printed code cards are the bridge between the physical product and the program's two other accounting worlds, and a single card is redeemed down one of two paths that must not be confused with one another.
+
+An operator mints a code card ahead of time, binding it to a specific sanctioned event by supplying the `redemption_code` printed on it, the `code_kind`, and the `event_application_id` it belongs to. The card enters `AVAILABLE` with a `physical_grant_status` of `NOT_APPLICABLE`. The code itself must be globally unique across all minted cards, and a duplicate is rejected with `ERR_DUPLICATE_REDEMPTION_CODE`.
+
+A `StoreOrganizer` then redeems the card against the event, presenting the `redemption_code` and the `code_kind`. The code must match exactly one existing card. Redemption is available only while the card is still `AVAILABLE` and the cited application is in `SUBMITTED` or `APPROVED` status. A successful redemption assigns the card a `redemption_seq` from the global monotonic sequence and moves it to `REDEEMED`, and from that point the two paths diverge.
+
+A `DIGITAL` card is the route by which a championship invitation is honoured: a `DIGITAL` code redemption bound to an application, while that redemption's `status` is still `AVAILABLE`, is precisely what satisfies that application's championship invitation requirement at approval time, so an invitation in hand is an unredeemed digital card rather than a redeemed one. A digital card carries no physical fulfilment dimension at all — its `physical_grant_status` stays `NOT_APPLICABLE` whether it is redeemed or not. The points a redeemed digital card contributes to a prize pool are the supplement described in the prize support subsection, counted as redeemed digital members at the moment the event is approved.
+
+A card redeemed as `PHYSICAL` prize support works differently on both counts. Its redemption sets `physical_grant_status` to `RESERVED`, which opens a second dimension that does not exist for digital cards. That dimension advances later, when an operator disburses the grant, moving `physical_grant_status` from `RESERVED` to `DISBURSED`, and disbursement is available only when the card has actually been redeemed and the event application it was redeemed against has reached `COMPLETED`. Disbursement records the application's prize pool onto the card as `prize_allocation_id` and then moves tournament points in both directions at once. The grant's point value is the number of packs for the pool's tier multiplied by the pack value ratio of twenty-seven over four, floored once to a whole number; the pack count is six for a `LOCAL` pool, twelve for a `QUALIFIER` pool and twenty-four for a `CHAMPIONSHIP` pool. That single floored figure is then added to the pool's `total_drawn_tp` and, in the same transaction, added to the pool's `total_restored_tp`, and the pool's `remaining_tp` is re-derived. The floored figure is computed once for the grant and used for both sides — the grant's two counter movements are bit-for-bit identical, so the conserved invariant over the pool is exactly what it was before the disbursement. Disbursement is terminal for the grant dimension.
+
+A card may instead be declined rather than redeemed, and declining is available only to a card of kind `PHYSICAL` that is still `AVAILABLE`. Declining sets the card's `physical_grant_status` to `NOT_APPLICABLE` and draws nothing from any pool, because no allocation is ever reached by a declined card. The practical effect is that a declined card can no longer serve as a championship invitation, since a card that has been declined is no longer in the `AVAILABLE` state that the approval precondition demands.
+
+Finally, a store can always see the prize activity that its event generated: the distributions attached to an event are readable by looking up every distribution drawn on the pool that event was approved with, which is a reverse lookup from the application to its allocation and then forward to the allocation's distributions. The same reverse lookup is the mechanism that makes an automatically denied event application discoverable after a format list update, as described in the format subsection.
+
+### 3.12. Print Runs, Distributor Allocation and the Approval Queue
+
+Collector product is finite, and the whole of this subsection is about deciding who gets the boxes. An `OpsAdmin` defines a collector configuration by naming the `set_release_id` it belongs to, the `configuration_kind` — one of `DRAFT_BOOSTER`, `COLLECTOR_BOOSTER` or `BUNDLE` — the `pack_count` per unit of the configuration, and the `print_run_units` the print run will produce. The configuration starts with nothing allocated and its availability is always derived rather than stored: `units_available` is `print_run_units` minus `units_allocated`, and `units_allocated` is the sum of `fulfilled_qty` over the configuration's orders whose status is `APPROVED` or `PARTIALLY_FULFILLED`, which begins at zero.
+
+A `Distributor` places an allocation order against a configuration, supplying its own `distributor_name`, the `product_configuration_id` it is drawing against, and the `quantity` it is requesting. Each order is stamped at creation with a `submitted_seq` drawn from the global monotonic sequence, and that sequence number is the sole tie-break the program uses when orders compete for the same units. The order enters `PENDING` with `fulfilled_qty` at zero and with an `approval_rank` computed for it. Rank is a queue position rather than a score: it is assigned over the candidate orders for that configuration — those in `PENDING` or `PARTIALLY_FULFILLED` whose requested quantity is greater than the configuration's current `units_available`, meaning those that cannot be satisfied in full right now — ordered by `submitted_seq` ascending. An order whose requested quantity fits inside current availability is not a candidate for demotion and does not appear in the queue at all.
+
+An operator then acts on a pending order, and the three actions are strictly complementary. Approving it is available only when the requested quantity does not exceed the configuration's `units_available`; the order's `fulfilled_qty` is set to the full requested quantity and the configuration's `units_allocated` rises by that quantity. Requesting a partial fulfilment is available only when the requested quantity exceeds current availability and availability is nevertheless greater than zero; the order's `fulfilled_qty` is set to whatever `units_available` stood at when the partial fulfilment was called, and `units_allocated` rises by that amount, leaving the order in `PARTIALLY_FULFILLED` with a shortfall it still hopes to close. Denying the order is available only when availability has fallen all the way to zero; denial allocates nothing. An approval attempted when the requested quantity exceeds availability is rejected with `ERR_PRINT_RUN_EXHAUSTED`, and the rejection is specifically the approve path's — a partial fulfilment request in the same situation is not an error, it is the intended response.
+
+Fulfilment carries the same currency guarantee as event approval, and for the same reason. The operator must present `expected_product_configuration_version`, the `version` of the configuration as the client last observed it; a configuration whose version has moved on — for instance because a prior order already drew the print run down — rejects the call with `ERR_STALE_VERSION`. Without that guard a distributor's stale view of availability would allow the same units to be promised twice.
+
+The one thing that rescues a partially fulfilled order is an enlargement of the print run. An operator may add units to a configuration, supplying the number to add as `additional_units`; the addition raises `print_run_units` directly and advances the configuration's `version` by one. Enlarging the print run also re-ranks the queue: any order whose low `approval_rank` came from a shortfall the new availability now covers loses its demotion, and the queue is recomputed over the remaining candidates. And if the enlargement covers a specific partially fulfilled order's shortfall, that order is promoted on the spot to `APPROVED` — its `fulfilled_qty` is raised to its full requested quantity and the configuration's `units_allocated` rises by the difference between the requested quantity and what had already been allocated to it. A partial fulfilment that the print run never grows to cover simply stays partial, holding the units it already received.
+
+### 3.13. Computed Reads and the Operator's Clock
+
+Two operations in this API exist to make the system's internal state legible without mutating anything, and one exists to drive time.
+
+The simplest is the application's prizing summary, a computed read returned for a single event application. It reports the application's reporting deadline as `reporting_due_by`; a `reporting_due_status` drawn from exactly three values, `NOT_SCHEDULED` when no deadline applies, `OPEN` while the logical clock is at or before the deadline, and `PAST_DUE` once the clock has passed it; a `qualified_headcount` boolean; the pool's live balance as `prize_pool_remaining_tp`; a `report_status` that is `NOT_FILED` or `FILED`; and a `headcount_gate_error` which is null unless the headcount gate fails, in which case it carries `ERR_HEADCOUNT_BELOW_THRESHOLD`. This read is non-fatal in a way the rest of the API is not: the gate failure is reported as a flag on a successful read, so an operator can observe an under-attended event without the read itself being refused.
+
+The headcount gate is a threshold comparison rather than an error. It evaluates the `reported_headcount` declared on the most recent submitted report for the application against a threshold of twenty-four attendees. A headcount of exactly twenty-four qualifies — the comparison admits equality — and a headcount of zero is a perfectly well-formed report describing an event nobody attended, which simply fails the gate. Applications that have no submitted report at all are not evaluated against the gate: they surface as `NOT_FILED` in the read's report status rather than as a gate failure. Tier also matters, and it matters asymmetrically: a `LOCAL` event is never subject to the gate and its gate error is always null, while a `QUALIFIER` or `CHAMPIONSHIP` event that clears the threshold also produces a null gate error and one that misses it produces `ERR_HEADCOUNT_BELOW_THRESHOLD`.
+
+The clock capability is admin-only and exists so that the temporal rules of this API can be exercised deliberately. It takes a `current_utc` value and sets the logical clock to it. As established in section 2, the clock's startup value is exactly `2026-09-01T00:00:00Z` and it never falls back to the machine's real time under any circumstances. Advancing it is not a passive operation: setting the clock re-evaluates the prerelease and street-date system transitions of every set release, so a clock set past a street date will settle the releases whose windows it has crossed, and it re-evaluates the reporting deadlines of every non-`LOCAL` approved application, so a clock set past a deadline will mark that application's filed reports overdue as described in the reporting subsection. Because so much of this API — rotation eligibility, reprint publication, distribution locks, event completion, reporting windows — is judged against the clock, the clock is in practice the lever that drives the entire benchmark's temporal behaviour.
+
+## 4. Endpoint Definitions
+
+Two status-code rules apply throughout. An operation that creates a new, stand-alone resource — enrolling a store, announcing a set release, registering a format, submitting an event application, filing a prize report, minting or redeeming a code card, defining a product configuration, placing an allocation order, filing a reprint plan, registering a judge, or filing an enforcement case — responds with `201 Created`. An operation that modifies an existing resource, including every transition endpoint and the edit of an application's mutable fields, responds with `200 OK`. Every response body follows the envelope format defined in §2.2.
+
+The table below lists the HTTP contract only. The request payloads, the state transitions performed, and the side effects each operation carries are specified in §3; an implementer should reconstruct them from the workflows there rather than from this table.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/op/_clock/set_current_utc` | Test-driving logical clock; startup default is exactly `2026-09-01T00:00:00Z` and the server never falls back to wall-clock time | OpsAdmin |
+| POST | `/op/stores` | Enroll a retail store in the organized-play program | OpsAdmin |
+| GET | `/op/stores` | List stores with pagination | OpsAdmin, StoreOrganizer, Judge, Distributor |
+| POST | `/op/stores/{id}/transition` | Single action endpoint driving Store state transitions (SUSPEND, REINSTATE) | OpsAdmin |
+| POST | `/op/set-releases` | Announce a set release with its prerelease weekend and street date | OpsAdmin |
+| GET | `/op/set-releases` | List set releases with pagination | OpsAdmin, StoreOrganizer, Judge, Distributor |
+| POST | `/op/set-releases/{id}/transition` | Single action endpoint driving SetRelease state transitions (RETIRE) | OpsAdmin |
+| POST | `/op/formats` | Register a constructed format | OpsAdmin |
+| GET | `/op/formats` | List formats with pagination | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/formats/{id}/transition` | Single action endpoint driving Format epoch and list updates (ROTATE, BAN_CARD, RESTRICT_CARD) | OpsAdmin |
+| POST | `/op/event-applications` | Submit an organized-play event sanctioning application | StoreOrganizer |
+| GET | `/op/event-applications` | List event applications; filterable by store, set release, format, tier and status | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/event-applications/{id}` | Retrieve one event application | OpsAdmin, StoreOrganizer, Judge |
+| PATCH | `/op/event-applications/{id}` | Edit a submitted application's mutable fields before sanctioning | OpsAdmin, StoreOrganizer |
+| POST | `/op/event-applications/{id}/transition` | Single action endpoint driving every EventApplication state transition and prizing_report_status option (APPROVE, DENY, WITHDRAW, COMPLETE, OPTION_IN, OPTION_OUT) | OpsAdmin, StoreOrganizer |
+| GET | `/op/event-applications/{id}/prizing-summary` | Computed read: the application's deadline, pool state and headcount gate outcome | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/event-applications/{id}/prize-reports` | File the event's prize and attendance report against the application | StoreOrganizer |
+| POST | `/op/event-applications/{id}/code-redemption` | Redeem a printed code card against the event as a digital entitlement or physical prize support | StoreOrganizer |
+| GET | `/op/event-applications/{id}/prize-distributions` | Reverse-reachability read: every PrizeDistribution whose `prize_allocation_id` equals this application's `prize_allocation_id` | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/prize-allocations` | List prize allocations; filterable by store and by originating application | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/prize-allocations/{id}` | Retrieve one prize allocation including its draw-down aggregate | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/prize-allocations/{id}/transition` | Single action endpoint driving PrizeAllocation transitions and pool adjustments (REOPEN, INCREASE_REPRINT_RUN) | OpsAdmin |
+| POST | `/op/prize-distributions` | Propose a prize distribution drawn on a pool | StoreOrganizer |
+| GET | `/op/prize-distributions` | List prize distributions; filterable by pool and by status | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/prize-distributions/{id}` | Retrieve one prize distribution | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/prize-distributions/{id}/transition` | Single action endpoint driving PrizeDistribution state transitions (PASS, VOID) | OpsAdmin, StoreOrganizer |
+| GET | `/op/prize-reports` | List prize reports; filterable by application and by allocation | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/prize-reports/{id}` | Retrieve one prize report | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/enforcement-cases` | File a rules enforcement case against a player at a sanctioned event | Judge |
+| GET | `/op/enforcement-cases` | List enforcement cases; filterable by event application and by status | OpsAdmin, Judge |
+| GET | `/op/enforcement-cases/{id}` | Retrieve one enforcement case | OpsAdmin, Judge |
+| POST | `/op/enforcement-cases/{id}/transition` | Single action endpoint driving RulesEnforcementCase transitions (ESCALATE, CLOSE, REDUCE) | OpsAdmin |
+| POST | `/op/code-redemptions` | Mint an unredeemed invitation or prize code card pre-bound to a sanctioned event application | OpsAdmin |
+| POST | `/op/code-redemptions/{id}/transition` | Single action endpoint driving CodeRedemption disbursement (DISBURSE); draws and restores prize points in one transaction | OpsAdmin |
+| GET | `/op/code-redemptions` | List code redemptions; filterable by originating application | OpsAdmin, StoreOrganizer, Judge |
+| GET | `/op/code-redemptions/{id}` | Retrieve one code redemption | OpsAdmin, StoreOrganizer, Judge |
+| POST | `/op/product-configurations` | Define a collector product configuration and its print run | OpsAdmin |
+| GET | `/op/product-configurations` | List collector product configurations; filterable by set release | OpsAdmin, Distributor, StoreOrganizer |
+| GET | `/op/product-configurations/{id}` | Retrieve one collector product configuration with its derived `units_available` | OpsAdmin, Distributor, StoreOrganizer |
+| POST | `/op/product-configurations/{id}/transition` | Single action endpoint driving ProductConfiguration changes (INCREASE_REPRINT_RUN); re-ranks the pending allocation queue | OpsAdmin |
+| POST | `/op/allocation-orders` | Place a distributor allocation order against a collector configuration | Distributor |
+| GET | `/op/allocation-orders` | List allocation orders; filterable by product configuration and by status | OpsAdmin, Distributor |
+| GET | `/op/allocation-orders/{id}` | Retrieve one allocation order with its `approval_rank` and `fulfilled_qty` | OpsAdmin, Distributor |
+| POST | `/op/allocation-orders/{id}/transition` | Single action endpoint driving AllocationOrder state transitions (APPROVE, FULFILL_PARTIAL, DENY) | OpsAdmin |
+| POST | `/op/reprint-plans` | File a reprint policy plan for a card and compute its market verdict | OpsAdmin |
+| GET | `/op/reprint-plans` | List reprint plans; filterable by format and by set release | OpsAdmin |
+| GET | `/op/reprint-plans/{id}` | Retrieve one reprint plan with its verdict | OpsAdmin |
+| POST | `/op/reprint-plans/{id}/transition` | Single action endpoint driving ReprintPlan state transitions (APPROVE, PUBLISH) | OpsAdmin |
+| POST | `/op/judges` | Register a certified judge | OpsAdmin |
+| GET | `/op/judges` | List judge certifications with pagination | OpsAdmin, Judge |
+| GET | `/op/judges/{ref}` | Retrieve one judge certification with its derived `promotion_eligible` flag | OpsAdmin, Judge |
+| POST | `/op/judges/{ref}/transition` | Single action endpoint driving JudgeCertification changes (RECORD_PRACTICE_EVENT, DECERTIFY) | OpsAdmin |
+
+## 5. Error Code Catalogue
+
+The table below lists every error identifier the API can return together with its HTTP status code. The conditions that trigger each one are specified where the rule they enforce is described, in §2 and §3; they are not repeated here.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_INSUFFICIENT_POOL` | 402 Payment Required |
+| `ERR_PRINT_RUN_EXHAUSTED` | 402 Payment Required |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_NOT_FOUND` | 404 Not Found |
+| `ERR_INVALID_REDEMPTION_CODE` | 404 Not Found |
+| `ERR_INVALID_STATE` | 409 Conflict |
+| `ERR_REPORTING_WINDOW_OPEN` | 409 Conflict |
+| `ERR_SET_NOT_STREET_LEGAL` | 409 Conflict |
+| `ERR_PRIZE_REPORT_ALREADY_FILED` | 409 Conflict |
+| `ERR_REPRINT_REVIEW_CLOSED` | 409 Conflict |
+| `ERR_DUPLICATE_SET_CODE` | 409 Conflict |
+| `ERR_DUPLICATE_JUDGE_REF` | 409 Conflict |
+| `ERR_DUPLICATE_REDEMPTION_CODE` | 409 Conflict |
+| `ERR_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_INVITATION_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_TIER_SLOT_CONFLICT` | 422 Unprocessable Entity |
+| `ERR_EVENT_WINDOW_OVERLAP` | 422 Unprocessable Entity |
+| `ERR_EVENT_SPACE_CAPACITY` | 422 Unprocessable Entity |
+| `ERR_FORMAT_CODE_NOT_LEGAL` | 422 Unprocessable Entity |
+| `ERR_REPRINT_MARKET_FLOOR` | 422 Unprocessable Entity |
+| `ERR_REPORT_WINDOW_CLOSED` | 422 Unprocessable Entity |
+| `ERR_STREET_DATE_BEFORE_PRERELEASE` | 422 Unprocessable Entity |
+| `ERR_HEADCOUNT_BELOW_THRESHOLD` | 200 OK |

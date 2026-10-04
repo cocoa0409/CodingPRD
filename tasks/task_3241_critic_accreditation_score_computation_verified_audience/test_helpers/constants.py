@@ -1,0 +1,32 @@
+"""Domain thresholds — numeric constants from the PRD's score rules."""
+
+THRESHOLDS = {
+    # certification gates
+    "MIN_REVIEWS_CERTIFIED": 5,
+    "MIN_TOP_CRITIC_REVIEWS": 2,
+    "CERTIFIED_FRESH_PCT": 75,
+    "CERTIFIED_ROTTEN_PCT": 60,
+    # audience score
+    "POSITIVE_STAR_THRESHOLD": 4,
+    # bombing detection
+    "DETECTION_WINDOW_HOURS": 24,
+    "VELOCITY_WEIGHT": 20,
+    "NEW_ACCOUNT_WEIGHT": 40,
+    "NEG_SKEW_WEIGHT": 30,
+    "NEGATIVE_STAR_MAX": 2,
+    "BOMBING_THRESHOLD_BPS": 6000,
+    # standing score
+    "DISPUTE_PENALTY_BPS": 1500,
+    "PENDING_PENALTY_BPS": 500,
+    "STANDING_BASE_BPS": 10000,
+}
+
+TEST_DEFAULTS = {
+    "CLOCK_START": "2026-09-01T00:00:00Z",
+    "WINDOW_START": "2026-09-01T00:00:00Z",
+    "WINDOW_END": "2026-10-01T00:00:00Z",
+    "EMBARGO_LIFTED": "2026-09-01T00:00:00Z",
+    "EMBARGO_LATE": "2026-09-10T00:00:00Z",
+    "REVIEW_PERIOD_START": "2026-08-01T00:00:00Z",
+    "REVIEW_PERIOD_END": "2026-09-01T00:00:00Z",
+}

@@ -1,0 +1,50 @@
+"""Error types and catalog."""
+
+ERRORS = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_TEAM_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_DEPLOYMENT_NOT_FOUND": 404,
+    "ERR_DOMAIN_NOT_FOUND": 404,
+    "ERR_CERTIFICATE_NOT_FOUND": 404,
+    "ERR_ENV_VAR_NOT_FOUND": 404,
+    "ERR_REDIRECT_NOT_FOUND": 404,
+    "ERR_USAGE_PERIOD_NOT_FOUND": 404,
+    "ERR_ALERT_RULE_NOT_FOUND": 404,
+    "ERR_SPEND_CAP_NOT_FOUND": 404,
+    "ERR_MEMBER_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_PROJECT_ARCHIVED": 409,
+    "ERR_PROJECT_SUSPENDED": 409,
+    "ERR_USAGE_PERIOD_CLOSED": 409,
+    "ERR_USAGE_PERIOD_OVERLAP": 409,
+    "ERR_INVALID_PERIOD_RANGE": 422,
+    "ERR_USAGE_EVENT_SHAPE": 422,
+    "ERR_ENV_SCOPE_OVERLAP": 409,
+    "ERR_DOMAIN_ALREADY_ASSIGNED": 409,
+    "ERR_SPEND_CAP_EXISTS": 409,
+    "ERR_MEMBER_ALREADY_EXISTS": 409,
+    "ERR_REDIRECT_PRIORITY_CONFLICT": 409,
+    "ERR_SEAT_LIMIT_EXCEEDED": 422,
+    "ERR_BUILD_MINUTES_EXHAUSTED": 402,
+    "ERR_BUILD_CONCURRENCY_EXCEEDED": 409,
+    "ERR_NO_PRIOR_DEPLOYMENT": 409,
+    "ERR_CANNOT_CANCEL_PRODUCTION": 409,
+    "ERR_SPEND_CAP_STILL_TRIPPED": 409,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = ERRORS[error_id]
+        self.message = message or error_id
+        super().__init__(self.message)
+
+
+def err(error_id, message=None):
+    raise ApiError(error_id, message)

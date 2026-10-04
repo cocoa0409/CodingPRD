@@ -1,0 +1,104 @@
+"""Domain thresholds — the numeric constants stated in the PRD.
+
+Every value here is echoed by PRD prose in a business context (§3.2–§3.9);
+nothing is inferred from a symbol that the PRD only names.
+"""
+
+# Streak day boundary (§3.3)
+DAY_SECONDS = 86400
+STREAK_DAY_CLOSE_BUFFER_SECONDS = 3600
+
+# Hearts and energy (§3.4)
+FREE_HEARTS_PER_DAY = 5
+ENERGY_START_UNITS = 10
+ENERGY_CAP = 30
+ENERGY_REGEN_SECONDS = 900
+ENERGY_UNITS_PER_INTERVAL = 5
+
+# Experience award (§3.4)
+FAST_MS = 3000
+MEDIUM_MS = 8000
+BASE_XP_BY_STATE = {
+    "UNLOCKED": 10,
+    "BRONZE": 8,
+    "SILVER": 6,
+    "GOLD": 4,
+    "LEGENDARY": 2,
+    "DECAYED": 2,
+    "LOCKED": 0,
+}
+
+# Skill decay and spaced review (§3.2)
+DECAY_GRACE_DAYS = 2
+DECAY_POINTS_PER_TIER = 5
+DECAY_LEVEL_FLOOR = 4
+MAX_REVIEW_DEPTH_DAYS = 10
+REVIEW_INTERVAL_DAYS_BY_STATE = {
+    "UNLOCKED": 1,
+    "BRONZE": 1,
+    "SILVER": 2,
+    "GOLD": 3,
+    "LEGENDARY": 5,
+}
+
+# Anti-cheat screen (§3.1, §3.7)
+CHEAT_REF_THRESHOLD = 8
+FAST_ANSWER_MS = 800
+AGGRESSION_MIN = 2000
+
+# Streak repair pricing (§3.3)
+TIER_RATE_GEMS = [1, 2, 4, 6, 8]
+LENGTH_BONUS_RATE = 0.05
+REPAIR_INFLATION_RATE = 0.5
+MONTHLY_REPAIR_CAP_GEMS = 20
+MONTHLY_REPAIR_CAP = 3
+REPAIR_WINDOW_DAYS = 1
+
+# Placement (§3.6)
+SUBSCORE_DIVISOR = 40
+ITEMS_PER_UNIT = 5
+PLACEMENT_MAX_UNIT_INDEX = 12
+BAND_CUTOFFS = {"C1": 180, "B2": 140, "B1": 100, "A2": 60}
+MIN_TOTAL_ITEMS = 5
+MAX_TOTAL_ITEMS = 50
+
+# Leagues (§3.7)
+LEAGUE_WEEK_DAYS = 7
+PROMOTION_CUTOFF_RANK = 3
+DEMOTION_SPAN = 3
+LEAGUE_SIZE = 10
+
+# Certification (§3.8)
+CERT_BAND_CUTOFFS = {"DISTINCTION": 85, "STRONG_PASS": 75, "PASS": 60}
+ONE_STEP_DEMOTION_PENALTY = -10
+PROCTOR_WINDOW_HOURS = 24
+
+# Conversion pricing and notification cadence (§3.9)
+BASE_DISCOUNT_PCT = 10
+MAX_DISCOUNT_PCT = 40
+STREAK_BONUS_STEP_PCT = 2
+STREAK_BONUS_CAP_PCT = 10
+MILESTONE_DISCOUNT = {
+    "STREAK_7": 5,
+    "STREAK_30": 15,
+    "PLACEMENT_SKIP": 10,
+    "LEAGUE_PROMOTION": 10,
+    "HEART_DEPLETION": 20,
+}
+BASE_MONTHLY_FEE_CENTS = 6999
+NOTIFY_BASE_DAILY_CAP = 3
+NOTIFY_FATIGUE_CAP = 3
+
+# The server's startup logical clock reading (§2.8)
+DEFAULT_LOGICAL_CLOCK = "2026-09-01T00:00:00Z"
+
+# Frequently reused scenario values
+TEST_DEFAULTS = {
+    "DISPLAY_NAME": "Ada",
+    "TIMEZONE_UTC": "Etc/UTC",
+    "OFFSET_UTC": 0,
+    "DISPLAY_NAME_BEA": "Bea",
+    "DISPLAY_NAME_CAL": "Cal",
+    "UNIT_TITLE": "Unit 1",
+    "MONTHLY_FEE_CENTS": BASE_MONTHLY_FEE_CENTS,
+}
